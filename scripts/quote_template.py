@@ -37,6 +37,12 @@ POINTS_PER_MM = 72 / 25.4
 # files; Carlito and Liberation Sans, which LibreOffice prints with, have the same widths.
 DIGIT_EM = {"Calibri": 1038 / 2048, "Arial": 1139 / 2048}
 PIXELS_PER_POINT = 96 / 72
+# Excel lays a sheet out in whole pixels of the display it runs on: Windows' scaling presets from
+# 100 % to 350 %. It prints rows up to one 96-dpi pixel taller than their set height at 100 % (16 pt
+# rows measured 16.3 pt apart), and it cannot shrink a sheet below 10 % to fit the page width.
+DISPLAY_DPIS = (96, 120, 144, 168, 192, 216, 240, 288, 336)
+PRINTED_ROW_ALLOWANCE_POINTS = 72 / 96
+MIN_PRINT_SCALE = 0.10
 EMU_PER_MM = 36_000
 EMU_PER_POINT = 12_700
 EMU_PER_PIXEL = 9525
@@ -392,14 +398,23 @@ def _visible_width_units(grid: dict[str, Any], first: int, span: int) -> float:
 
 
 def width_unit_points(theme: dict[str, Any]) -> float:
-    """Printed width of one grid width unit, in points, for this theme's font and size.
+    """Narrowest printed width of one grid width unit, in points, for this theme's font and size.
 
-    LibreOffice uses the digit's exact width; Excel rounds it to whole pixels at 96 dpi. The smaller of
-    the two gives the larger print scale, so a layout that fits with it fits in both.
+    LibreOffice uses the digit's exact width; Excel rounds it to whole pixels of its display. The
+    smallest of these gives the largest print scale, so a layout that fits with it fits in each.
     """
     exact = DIGIT_EM[theme["font"]] * theme["size_pt"]
-    whole_pixels = math.floor(exact * PIXELS_PER_POINT + 0.5) / PIXELS_PER_POINT
-    return min(exact, whole_pixels)
+    whole_pixels = (math.floor(exact * dpi / 72 + 0.5) * 72 / dpi for dpi in DISPLAY_DPIS)
+    return min(exact, *whole_pixels)
+
+
+def print_scale(page: dict[str, Any], grid: dict[str, Any], theme: dict[str, Any]) -> float:
+    """Largest scale the sheet prints at: printable width over the visible width, at most 1."""
+    paper_width = A4_MM[0] if page["orientation"] == "portrait" else A4_MM[1]
+    margins = page["margins_mm"]
+    printable_width = (paper_width - margins["left"] - margins["right"]) * POINTS_PER_MM
+    visible_width = _visible_width_units(grid, 1, len(grid["columns"])) * width_unit_points(theme)
+    return min(1.0, printable_width / visible_width)
 
 
 def grid_column_pixels(width: float) -> int:
@@ -427,18 +442,17 @@ def _check_company_box(page: dict[str, Any], grid: dict[str, Any], theme: dict[s
 
 
 def printable_rows_per_page(page: dict[str, Any], grid: dict[str, Any], theme: dict[str, Any]) -> int:
-    """Most rows one page of this layout can print.
+    """Most rows one A4 page of this layout can print.
 
-    The sheet prints fit to one page wide: its scale is the printable width over the visible width,
-    at most 1, and each row prints at row_height_pt times that scale.
+    The sheet prints fit to one page wide (print_scale), and each row takes its set height plus
+    Excel's one-pixel allowance, times that scale. Excel rounds its zoom down to a whole percent,
+    which only makes rows shorter.
     """
-    paper_width, paper_height = A4_MM if page["orientation"] == "portrait" else A4_MM[::-1]
+    paper_height = A4_MM[1] if page["orientation"] == "portrait" else A4_MM[0]
     margins = page["margins_mm"]
-    printable_width = (paper_width - margins["left"] - margins["right"]) * POINTS_PER_MM
     printable_height = (paper_height - margins["top"] - margins["bottom"]) * POINTS_PER_MM
-    visible_width = _visible_width_units(grid, 1, len(grid["columns"])) * width_unit_points(theme)
-    scale = min(1.0, printable_width / visible_width)
-    return math.floor(printable_height / (page["row_height_pt"] * scale) + 1e-9)
+    printed_row = (page["row_height_pt"] + PRINTED_ROW_ALLOWANCE_POINTS) * print_scale(page, grid, theme)
+    return math.floor(printable_height / printed_row + 1e-9)
 
 
 def _check_page_fit(
@@ -455,6 +469,8 @@ def _check_page_fit(
                     f"blocks[{table_index}].columns[{index}]",
                     f"the description needs at least {MIN_DESCRIPTION_WIDTH_UNITS} visible width units, not {width:g}",
                 )
+    if print_scale(page, grid, theme) < MIN_PRINT_SCALE:
+        _refuse("grid.columns", "are too wide to shrink onto one page width (Excel prints at 10 % or more)")
     rows_fit = printable_rows_per_page(page, grid, theme)
     for key in ("first_page_rows", "page_rows"):
         if page[key] > rows_fit:

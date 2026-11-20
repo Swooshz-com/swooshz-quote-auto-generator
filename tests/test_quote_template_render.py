@@ -251,7 +251,7 @@ def small_font_template():
     """Standard at Calibri 9 with both page lengths at the largest the reader accepts for that font."""
     definition = copy.deepcopy(STANDARD_RAW)
     definition["theme"]["size_pt"] = 9
-    definition["page"].update({"first_page_rows": 45, "page_rows": 45})
+    definition["page"].update({"first_page_rows": 43, "page_rows": 43})
     return definition
 
 
@@ -662,8 +662,10 @@ class TemplateRenderTest(unittest.TestCase):
 
     def test_landscape_orientation_and_margins_are_written(self):
         definition = custom_template()
-        # Landscape prints 31 rows of 16 pt on this paper and margin set; 30 and 31 fit with room for items.
-        definition["page"].update({"orientation": "landscape", "first_page_rows": 30, "page_rows": 31})
+        # Landscape holds 30 rows of 16 pt (printed 16.75 pt) on this paper and margin set, with room for items.
+        definition["page"].update({"orientation": "landscape", "first_page_rows": 29, "page_rows": 30})
+        with self.assertRaisesRegex(qt.QuoteTemplateError, r"page\.page_rows"):
+            qt.read_quote_template(with_rows(definition, 31, first_page_rows=29))
         _, path = self.summary(definition)
         setup, margins = page_setup_and_margins(path)
         self.assertEqual(setup.get("orientation"), "landscape")
@@ -758,9 +760,9 @@ class CompanyBoxRoomTest(unittest.TestCase):
         self.assert_reader_refuses(narrow_company_column({"left_mm": 10, "top_mm": 0, "right_mm": 10}))
 
     def test_reader_uses_the_printed_width_of_a_small_font(self):
-        # At Calibri 10 the same 8 units print as 8 x 5.07 pt = 14.3 mm, narrower than the 16.1 mm placement width.
-        self.assert_reader_refuses(narrow_company_column({"left_mm": 7.5, "top_mm": 0, "right_mm": 7.5}, size_pt=10))
-        qt.read_quote_template(narrow_company_column({"left_mm": 7, "top_mm": 0, "right_mm": 7}, size_pt=10))
+        # At Calibri 11 the same 8 units print as 8 x 5.25 pt = 14.8 mm, narrower than the 16.1 mm placement width.
+        self.assert_reader_refuses(narrow_company_column({"left_mm": 7.5, "top_mm": 0, "right_mm": 7.5}, size_pt=11))
+        qt.read_quote_template(narrow_company_column({"left_mm": 7, "top_mm": 0, "right_mm": 7}, size_pt=11))
 
     def test_reader_refuses_a_top_margin_below_the_block(self):
         def one_row(top):
@@ -780,6 +782,69 @@ class CompanyBoxRoomTest(unittest.TestCase):
             self.assertFalse((Path(tmp) / "quotation.xlsx").exists())
 
 
+def compact_template(font, size):
+    """The custom layout with a 74-unit grid, which prints at 100 % for every allowed font up to 13 pt."""
+    definition = custom_template()
+    definition["theme"].update({"font": font, "size_pt": size})
+    for column, width in zip(definition["grid"]["columns"], (30, 6, 6, 9, 10, 5, 8)):
+        column["width"] = width
+    return definition
+
+
+def with_rows(definition, rows, **page):
+    definition = copy.deepcopy(definition)
+    definition["page"].update({"first_page_rows": rows, "page_rows": rows, **page})
+    return definition
+
+
+class PrintedRowFitTest(unittest.TestCase):
+    """At 100 % Excel prints rows taller than their set height (16 pt rows land 16.3 pt apart), so the
+    reader budgets one 96-dpi pixel (0.75 pt) more a row. Each refused count below adds automatic page
+    breaks in Excel's A4 page break view; each accepted count adds none."""
+
+    def assert_rows_limit(self, definition, rows):
+        qt.read_quote_template(with_rows(definition, rows))
+        with self.assertRaises(qt.QuoteTemplateError) as caught:
+            qt.read_quote_template(with_rows(definition, rows + 1))
+        self.assertEqual(caught.exception.path, "page.first_page_rows")
+
+    def test_a_compact_grid_at_full_size_holds_rows_at_their_printed_height(self):
+        # 267 mm (756.9 pt) of 16 pt rows: 47 at the set height, 45 at 16.75 pt.
+        for font, size in (("Calibri", 11), ("Arial", 10)):
+            with self.subTest(font=font, size=size):
+                self.assert_rows_limit(compact_template(font, size), 45)
+                with self.assertRaises(qt.QuoteTemplateError):
+                    qt.read_quote_template(with_rows(compact_template(font, size), 47))
+
+    def test_a_small_font_at_full_size_holds_rows_at_their_printed_height(self):
+        # Calibri 7 prints the custom layout's 104 units at 100 %: 45 rows of 16 pt; with 19 mm margins
+        # (734.2 pt) and 18.7 pt rows, 37 rows (39 at the set height).
+        calibri7 = custom_template()
+        calibri7["theme"].update({"font": "Calibri", "size_pt": 7})
+        self.assert_rows_limit(calibri7, 45)
+        for font, size in (("Calibri", 7), ("Calibri", 8), ("Arial", 7)):
+            definition = custom_template()
+            definition["theme"].update({"font": font, "size_pt": size})
+            definition["page"].update({"row_height_pt": 18.7, "margins_mm": {**definition["page"]["margins_mm"], "top": 19, "bottom": 19}})
+            with self.subTest(font=font, size=size):
+                self.assert_rows_limit(definition, 37)
+
+    def test_columns_too_wide_for_excel_to_shrink_are_refused(self):
+        # Excel prints at 10 % or more: 9 columns of 60 units at Arial 20 (11 pt a unit) need 6 % on a
+        # 130 mm wide page; at Calibri 7 (3.4 pt a unit) they need 20 %.
+        def wide(font, size):
+            definition = copy.deepcopy(STANDARD_RAW)
+            definition["theme"].update({"font": font, "size_pt": size})
+            definition["page"]["margins_mm"].update({"left": 40, "right": 40})
+            for column in definition["grid"]["columns"]:
+                column["width"] = 60
+            return definition
+        with self.assertRaises(qt.QuoteTemplateError) as caught:
+            qt.read_quote_template(wide("Arial", 20))
+        self.assertEqual(caught.exception.path, "grid.columns")
+        qt.read_quote_template(wide("Calibri", 7))
+
+
 class TemplatePdfSmokeTest(unittest.TestCase):
     """LibreOffice prints both layouts on the expected pages with nothing pushed off the page."""
 
@@ -795,7 +860,7 @@ class TemplatePdfSmokeTest(unittest.TestCase):
         layouts = {
             "standard": (qt.load_standard_quote_template(), ["Estimate", "Total including GST", "We accept the quotation"]),
             "custom": (custom_template(), ["Rate", "Subtotal", "We accept the quotation"]),
-            # A small font at the most rows the reader accepts for it (Calibri 9: 45 rows of 18.7 pt).
+            # A small font at the most rows the reader accepts for it (Calibri 9: 43 rows of 18.7 pt).
             "small font": (small_font_template(), ["Estimate", "Total including GST", "We accept the quotation"]),
         }
         for name, (definition, phrases) in layouts.items():
@@ -811,6 +876,9 @@ class TemplatePdfSmokeTest(unittest.TestCase):
                     text = ""
                     for page in document:
                         width, height = page.get_size()
+                        # The sheet's A4 paper is what the reader's row limit is worked out for.
+                        self.assertAlmostEqual(min(width, height), 595.3, delta=1)
+                        self.assertAlmostEqual(max(width, height), 841.9, delta=1)
                         textpage = page.get_textpage()
                         page_text = textpage.get_text_range() or ""
                         self.assertTrue(page_text.strip(), "blank page")

@@ -66,20 +66,26 @@ larger than the top or bottom margin). `row_height_pt` is 12 to 40.
 and on each later page; `continuation_top_rows` (0 to 10, default 2) is the gap
 above the repeated item-table header on later pages.
 
-The reader refuses a layout its pages cannot hold (paths `page.first_page_rows`,
-`page.page_rows`). The sheet prints fit to one page wide: the scale is the
-printable width over the visible columns' width (at most 1), and each row takes
-`row_height_pt` times that scale. Printable height is A4 height less the top and
-bottom margins, and the paper is landscape-swapped when `orientation` is
-`landscape`. A width unit is the widest digit of the sheet's Normal font, which
+The reader refuses a layout whose A4 pages cannot hold their rows in Excel or
+LibreOffice (paths `page.first_page_rows`, `page.page_rows`). The sheet prints fit
+to one page wide: the scale is the printable width over the visible columns' width
+(at most 1). Each row is counted at `row_height_pt` plus 0.75 pt (one 96-dpi
+pixel), times that scale, because Excel prints rows taller than their set height
+at 100 % (16 pt rows land 16.3 pt apart). Printable height is A4 height less the
+top and bottom margins, and the paper is landscape-swapped when `orientation` is
+`landscape`. Excel rounds its zoom down to a whole percent, which only shortens
+rows, and cannot print below 10 %, so columns that would need less are refused at
+`grid.columns`. A width unit is the widest digit of the sheet's Normal font, which
 the renderer sets to `theme.font` at `theme.size_pt`, so a smaller or narrower
 font holds fewer rows (`width_unit_points` in `scripts/quote_template.py`). The
 digit is 1038/2048 em in Calibri (Carlito) and 1139/2048 em in Arial (Liberation
-Sans); the reader takes the smaller of that exact width (LibreOffice) and Excel's
-whole-pixel width at 96 dpi. Standard (Calibri 13: 6.59 pt exact, 9 px in Excel)
-holds 66 rows of 18.7 pt; at Calibri 11 (7 px, 5.25 pt) it would hold 52. The
-CI PDF smoke prints Standard, a custom layout and Standard at Calibri 9 at its
-45-row limit. Rows left for items: at least 20 on the first page after the header
+Sans); the reader takes the smallest of that exact width (LibreOffice) and Excel's
+whole-pixel width at each Windows display scaling from 96 to 336 dpi. Standard
+(Calibri 13: 6.59 pt exact, 15 px at 168 dpi = 6.43 pt) holds 62 rows of 18.7 pt;
+at Calibri 11 (7 px at 96 dpi, 5.25 pt) it would hold 50. The CI PDF smoke prints
+Standard, a custom layout and Standard at Calibri 9 at its 43-row limit, and
+checks the pages are A4. A printer that maps A4 sheets onto Letter paper is not
+covered. Rows left for items: at least 20 on the first page after the header
 and table header (`header.rows`), and at least 20 on a later page after the
 continuation rows and table header (`page.continuation_top_rows`). The
 description column must span at least 30 visible width units (`blocks[i].columns[j]`).

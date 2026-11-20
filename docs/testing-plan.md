@@ -731,8 +731,10 @@ the owner-approved CI lane.
   header blocks, fonts and colours, logo size, place and repeat, and the totals
   formulas follow the template; that template and quote text never becomes a
   live formula; and the `--quote-template` option of `scripts/generate_quote.py`.
-  Its LibreOffice PDF smoke prints Standard, the changed template and Standard
-  at Calibri 9 at its largest accepted row count on the expected number of pages with all text inside the page; it skips locally
+  Page-fit tests at 100 % scale (a compact grid and small fonts) check rows at
+  Excel's printed height. Its LibreOffice PDF smoke prints Standard, the changed
+  template and Standard at Calibri 9 at its largest accepted row count on the
+  expected number of A4 pages with all text inside the page; it skips locally
   without LibreOffice and fails in CI if LibreOffice is missing. Changes to the
   legacy layout path also run `tests.test_generate_quote`,
   `tests.test_profile_layout_safety` and `tests.test_quote_exclusions`.
