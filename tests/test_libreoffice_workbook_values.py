@@ -65,6 +65,10 @@ def computed_amounts(data, rows, rate):
                    if ref.startswith(column) and ref[len(column):].isdigit() and text == label]
         assert len(indices) == 1, 'Missing or ambiguous recalculated row'
         text, kind = cells['E' + indices[0]]
+        if expected == 'Included':
+            # An Included row reads the word as text (owner decision INT-SQAG-202611200003).
+            assert kind in ('s', 'inlineStr', 'str') and text == 'Included', 'Included row does not read Included: E' + indices[0]
+            return
         assert kind not in ('s', 'inlineStr', 'str', 'e') and text is not None, 'Missing recalculated numeric amount'
         assert Decimal(text) == expected, 'Recalculated amount differs in its own row: E' + indices[0]
 
@@ -72,7 +76,7 @@ def computed_amounts(data, rows, rate):
     subtotal = Decimal(0)
     for row in rows:
         value = Decimal(0) if row['price_mode'] == 'Included' else money(Decimal(str(row['quantity'])) * Decimal(str(row['unit_price'])))
-        amount('C', row['description'], value)
+        amount('C', row['description'], 'Included' if row['price_mode'] == 'Included' else value)
         subtotal += value
     tax = money(subtotal * Decimal(str(rate)))
     amount('D', 'Total', subtotal)

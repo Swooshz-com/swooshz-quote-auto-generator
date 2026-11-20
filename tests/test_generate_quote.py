@@ -2111,6 +2111,11 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             )
             for index in range(1, 46)
         ]
+        # An Included line prints the word Included in the Estimate column of the rendered PDF (#363).
+        lines.insert(0, quote.QuoteLine(
+            "Graphics", 1, "lot", "Rendered coordination service", "", "Included", None, 0.0,
+            "included", [], price_mode="Included",
+        ))
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2248,8 +2253,10 @@ class GenerateQuoteRowsTest(unittest.TestCase):
 
             first_page = first_pages[0]
             self.assertIn("Rendered Fidelity Co", first_page["text"])
-            for expected in ("Quantity", "Service", "Estimate", "2 sqm"):
+            for expected in ("Quantity", "Service", "Estimate", "2 sqm", "Rendered coordination service"):
                 self.assertIn(expected, first_page["text"])
+            # The Included line prints the word in its own row's Estimate cell, not 0.00.
+            self.assertIn("Rendered coordination service Included", first_page["text"])
             self.assertIsNotNone(first_page["logo_bbox"])
             self.assertIsNotNone(first_page["header_bbox"])
             self.assertTrue(first_page["header_fonts"])
@@ -3155,7 +3162,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertAlmostEqual(float(cell_value(sheet, f"E{tax_row}")), 24.66)
         self.assertAlmostEqual(float(cell_value(sheet, f"E{grand_row}")), 298.66)
         included_row = quote.parse_cell_ref(find_cell_ref(sheet, "Saved included item"))[0]
-        self.assertAlmostEqual(float(cell_value(sheet, f"E{included_row}")), 0.0)
+        self.assertEqual(cell_value(sheet, f"E{included_row}"), "Included")
 
     def test_recovered_explicit_price_edit_reaches_xlsx_and_pdf_everywhere(self):
         brief = commercial_test_brief({
@@ -6452,3 +6459,85 @@ class QuantityLayoutTest(unittest.TestCase):
                 break
 
         self.assertTrue(found, "PDF text extraction did not contain the complete 11.5 quantity token.")
+
+
+class IncludedAmountTextTest(unittest.TestCase):
+    """A line priced as Included shows the word Included in the Estimate column; totals still ignore it."""
+
+    def setUp(self):
+        self.brief = commercial_test_brief()
+        self.priced = quote.QuoteLine(
+            "Graphics", 2, "sqm", "Synthetic priced graphics", "", "", None, 200, "matched", [],
+        )
+        self.included = quote.QuoteLine(
+            "Graphics", 1, "lot", "Synthetic included coordination", "", "Included", None, 0.0,
+            "included", [], price_mode="Included",
+        )
+
+    def test_included_amount_cell_is_text_and_totals_ignore_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            priced_only_path = Path(tmp) / "priced-only.xlsx"
+            mixed_path = Path(tmp) / "mixed.xlsx"
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, priced_only_path, self.brief, [self.priced])
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, mixed_path, self.brief, [self.priced, self.included])
+            with zipfile.ZipFile(priced_only_path) as zf:
+                priced_only = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
+            with zipfile.ZipFile(mixed_path) as zf:
+                mixed = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
+
+        included_row = quote.parse_cell_ref(find_cell_ref(mixed, "Synthetic included coordination"))[0]
+        priced_row = quote.parse_cell_ref(find_cell_ref(mixed, "Synthetic priced graphics"))[0]
+        amount_cell = cell(mixed, f"E{included_row}")
+        self.assertEqual(amount_cell.attrib.get("t"), "inlineStr")
+        self.assertIsNone(amount_cell.find(f"{NS_MAIN}f"))
+        self.assertEqual(cell_value(mixed, f"E{included_row}"), "Included")
+        self.assertEqual(amount_cell.attrib.get("s"), cell(mixed, f"E{priced_row}").attrib.get("s"))
+        self.assertAlmostEqual(float(cell_value(mixed, f"E{priced_row}")), 274.0)
+
+        for sheet in (priced_only, mixed):
+            total_row = quote.parse_cell_ref(find_cell_ref(sheet, "Total"))[0]
+            tax_row = total_row + 1
+            grand_row = total_row + 2
+            self.assertEqual(worksheet_formulas(sheet), [
+                f"SUM(E22:E{total_row - 1})",
+                f"ROUND(E{total_row}*0.090000,2)",
+                f"SUM(E{total_row}:E{tax_row})",
+            ])
+            self.assertAlmostEqual(float(cell_value(sheet, f"E{total_row}")), 274.0)
+            self.assertAlmostEqual(float(cell_value(sheet, f"E{tax_row}")), 24.66)
+            self.assertAlmostEqual(float(cell_value(sheet, f"E{grand_row}")), 298.66)
+        self.assertLess(included_row, quote.parse_cell_ref(find_cell_ref(mixed, "Total"))[0])
+
+    def test_included_amount_reads_included_in_text_and_cell_map_outputs(self):
+        lines = [self.priced, self.included]
+        rows = quote.build_quote_rows(self.brief, lines)
+        included_rows = [row for row in rows if any("Synthetic included coordination" in str(value) for value in row)]
+        self.assertEqual(len(included_rows), 1)
+        self.assertEqual(included_rows[0][-1], "Included")
+        self.assertTrue(any(
+            "Synthetic included coordination" in line and line.endswith("Included")
+            for line in quote.build_pdf_lines(rows)
+        ))
+
+        cells = quote.build_pdf_cell_map(self.brief, lines)
+        included_cell_rows = [
+            row for (row, col), value in cells.items()
+            if col == 3 and value == "Synthetic included coordination"
+        ]
+        self.assertEqual(len(included_cell_rows), 1)
+        self.assertEqual(cells[(included_cell_rows[0], 5)], "Included")
+        self.assertAlmostEqual(cells[(92, 5)], 274.0)
+
+    def test_diagnostic_csv_keeps_zero_amount_for_included_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pricing_matches.csv"
+            quote.write_match_csv(path, [self.included])
+            with path.open(encoding="utf-8", newline="") as f:
+                header, row = list(csv.reader(f))
+        self.assertEqual(row[header.index("amount")], "0.00")
+
+    def test_lump_sum_section_item_keeps_no_amount_for_included_line(self):
+        entries = quote.render_quote_entries([self.included], {"section_pricing": {"Graphics": "section_total"}})
+        self.assertEqual(entries[1]["kind"], "item")
+        self.assertIsNone(entries[1]["amount"])
+        self.assertEqual(entries[0]["amount"], 0.0)

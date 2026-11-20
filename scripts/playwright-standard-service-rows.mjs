@@ -61,14 +61,37 @@ replaceOnce('  result.basisLines = draftLines.length;', `  result.basisLines = d
       assert((await row.locator("[data-basis-quantity-edit]").innerText()).trim().startsWith("1 nos"), "standard row quantity is not 1 nos", id);
     }
 
-    // 2. Tick includes it at zero (Included); X leaves it out. Reset and Re-Analyse keep both decisions.
-    await (await basisControl(page, PM, "[data-basis-tag='Include']")).click();
-    await (await basisControl(page, WASTE, '[data-basis-tag="Exclude"]')).click();
-    await expectRows("Include", "Exclude", "tick or X did not apply");
+    // 2. Tick includes it at zero (Included); X leaves it out.
+    const tickAndX = async (label) => {
+      await (await basisControl(page, PM, "[data-basis-tag='Include']")).click();
+      await (await basisControl(page, WASTE, '[data-basis-tag="Exclude"]')).click();
+      await expectRows("Include", "Exclude", label);
+    };
+    await tickAndX("tick or X did not apply");
     assert(/Included/.test(await (await rowOf(PM)).innerText()), "ticked standard row is not shown as Included", await (await rowOf(PM)).innerText());
-    await page.locator("#resetQuoteBasisButton").click();
-    await idle();
-    await expectRows("Include", "Exclude", "Reset lost the standard row decisions");
+    const resetDraft = async (label) => {
+      await page.locator("#resetQuoteBasisButton").click();
+      await idle();
+      await expectRows("Confirm", "Confirm", label);
+    };
+
+    // 3. The owner's path (INT-SQAG-202611200003): Dashboard, back with Modify, then Reset Draft without
+    // Re-Analyse returns both rows to Confirm, as it does every other line.
+    const roundTripId = await page.evaluate(() => state.quoteSessionId);
+    await page.locator("#backToDashboardButton").click();
+    await page.waitForFunction(() => !appIsBusy() && state.activeAppView === "dashboard", null, { timeout: 30000 });
+    await page.locator('[data-quote-session-id="' + roundTripId + '"]').first().click();
+    await page.locator('[data-dashboard-panel-action="modify-session"]').click();
+    await page.waitForFunction((id) => !appIsBusy() && state.activeAppView === "quote" && state.quoteSessionId === id, roundTripId, { timeout: 30000 });
+    if (!(await page.locator("#quoteBasisPanel").isVisible())) await page.locator('button[data-side-panel="basis"]').click();
+    await page.locator("#quoteBasisPanel").waitFor({ state: "visible", timeout: 30000 });
+    await expectRows("Include", "Exclude", "Modify did not reopen the standard row decisions");
+    await resetDraft("Reset Draft after Dashboard and Modify did not return the standard rows to Confirm");
+
+    // 4. The same without leaving the quote; then Re-Analyse keeps both decisions.
+    await tickAndX("tick or X did not apply after Reset");
+    await resetDraft("Reset Draft did not return the standard rows to Confirm");
+    await tickAndX("tick or X did not apply before Re-Analyse");
     // Re-Analyse replaces the analysis snapshot that Reset returns to; wait for the new one.
     await page.evaluate(() => { window.__standardRowsSnapshot = state.originalAnalysisSnapshot; });
     await page.locator("#analyseAgainButton").click();
@@ -77,7 +100,7 @@ replaceOnce('  result.basisLines = draftLines.length;', `  result.basisLines = d
     await confirmStart.click();
     await page.waitForFunction(() => state.originalAnalysisSnapshot && state.originalAnalysisSnapshot !== window.__standardRowsSnapshot && !appIsBusy(), null, { timeout: 90000 });
     await expectRows("Include", "Exclude", "Re-Analyse lost the standard row decisions or duplicated a row");
-    result.standardServiceRows = { newQuote: "PASS", tickAndX: "PASS", reset: "PASS", reAnalyse: "PASS" };
+    result.standardServiceRows = { newQuote: "PASS", tickAndX: "PASS", dashboardModifyReset: "PASS", reset: "PASS", reAnalyse: "PASS" };
   }`);
 // Reload restores the saved decisions, and the generated workbook carries the ticked row at zero only.
 replaceOnce('    result.saveReopen = "PASS";', `    result.saveReopen = "PASS";
@@ -86,14 +109,18 @@ replaceOnce('    result.saveReopen = "PASS";', `    result.saveReopen = "PASS";
     assert(JSON.stringify(reopenedStandard) === JSON.stringify([["standard-project-management-fee", "Include"], ["standard-waste-disposal", "Exclude"]]),
       "reopen lost the standard row decisions", reopenedStandard);
     const includedRow = await rowFor("standard-project-management-fee");
-    assert(includedRow?.authority?.variant === "included" && !(await rowFor("standard-waste-disposal")), "Output does not hold only the ticked standard row, Included", includedRow);
+    assert(includedRow?.authority?.variant === "included" && includedRow.amount === "Included" && !(await rowFor("standard-waste-disposal")), "Output does not hold only the ticked standard row, Included", includedRow);
     result.standardServiceRowsReopen = { decisions: reopenedStandard, output: includedRow.authority.variant };`);
 replaceOnce('      { id: "u1-review", description: cases.find((entry) => entry.id === "u1-review").text, quantity: quantityText(1, "lot"), amount: 500 },',
   `      { id: "u1-review", description: cases.find((entry) => entry.id === "u1-review").text, quantity: quantityText(1, "lot"), amount: 500 },
-      { id: "standard-project-management-fee", description: "Lump sum for project management", quantity: quantityText(1, "nos"), amount: 0 },`);
+      { id: "standard-project-management-fee", description: "Lump sum for project management", quantity: quantityText(1, "nos"), amount: "Included" },`);
 replaceOnce(`      "assert '???' not in xml, 'unresolved marker in workbook'",`, `      "assert '???' not in xml, 'unresolved marker in workbook'",
       "assert 'Waste disposal / Recycling at production venue' not in xml, 'crossed standard row reached the workbook'",
       "assert all(text in xml for text in ('The above quote excludes:', 'Organiser Admin Fees', 'Power sockets which can be directly ordered with connection fees with the organiser', 'Connection fees for electrical fittings')), 'exclusions missing from the workbook'",`);
+// The ticked row's amount is the literal text Included, never a formula, and adds nothing to the total.
+replaceOnce("abs(float(get(hit[0],'E') or 'nan')-e['amount'])>0.005",
+  "(hit[0].get('E') != (e['amount'], None) if isinstance(e['amount'], str) else abs(float(get(hit[0],'E') or 'nan')-e['amount'])>0.005)");
+replaceOnce("and get(r,'B')!='Quantity']", "and get(r,'B')!='Quantity' and get(r,'E')!='Included']");
 const runtime = path.join(carrierRoot, 'standard-service-rows-carrier.mjs');
 await fs.writeFile(runtime, code);
 const child = spawn(process.execPath, [runtime, '--lines=8', '--latency-ms=100', '--fresh-analysis', ...process.argv.slice(2)], {

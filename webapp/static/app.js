@@ -7739,7 +7739,7 @@ function standardServiceLineItem(row) {
   return authority ? normalizeLineItem({ ...item, pricing_authority: authority }) : item;
 }
 
-// Puts the standard rows, with the operator's decisions, after an analysis result or a Reset. Suggested
+// Puts the standard rows, with the given decisions, after an analysis result or a Reset. Suggested
 // lines offering the same service, and their pricing rows, are dropped so neither row is duplicated.
 function withStandardServiceRows(sections = [], lineItems = [], decisions = null) {
   if (!decisions) return { sections, lineItems };
@@ -10788,7 +10788,8 @@ function outputCellDisplayValue(row = {}, field = "") {
     const authority = outputPriceAuthority(row);
     const price = pricingAuthorityPrice(authority);
     if (price === null) return "???";
-    if (authority.variant === "included") return field === "amount" ? "0.00" : "Included";
+    // An Included row shows the word in the amount column too; its amount stays 0 in every total (owner, INT-SQAG-202611200003).
+    if (authority.variant === "included") return "Included";
     if (field === "unit_price_override") return outputPriceDenomination(row) === "quote" ? "Inactive" : formatAmount(price);
     if (field === "quoted_unit_price") return formatAmount(quoteAmountValue(price, outputRowFxMultiplier(row)));
     return formatAmount(quoteAmountValue(row.amount, outputRowFxMultiplier(row))) || "???";
@@ -12798,13 +12799,14 @@ function renderQuoteBasisMessage(basis = state.quoteBasis, source = "") {
     .map((line) => cleanCustomerQuoteLineText(line.text || line.description || "")))
     .filter(Boolean);
   // Structured analysis dimensions come first; the box is omitted when nothing is known.
-  const dimensionLines = [detectedBoothSizeText(aiDimensionLines), ...aiDimensionLines].filter(Boolean);
+  const boothSizeText = detectedBoothSizeText(aiDimensionLines);
+  const dimensionLines = [boothSizeText, ...aiDimensionLines].filter(Boolean);
   const dimensionDisplay = dimensionLines.length
     ? `
       <div class="basis-visual-display" aria-label="Booth display details">
         <strong>Detected booth</strong>
         <ul>
-          ${dimensionLines.map((line) => `<li>${escapeHtml(line)}</li>`).join("")}
+          ${dimensionLines.map((line, index) => `<li${boothSizeText && index === 0 ? ' class="basis-booth-size"' : ""}>${escapeHtml(line)}</li>`).join("")}
         </ul>
       </div>
     `
@@ -14946,11 +14948,12 @@ function resetQuoteBasisToOriginal() {
   const snapshot = state.originalAnalysisSnapshot;
   if (!snapshot) return;
   invalidateBasisChatAuthority();
-  const standardServiceDecisions = currentStandardServiceDecisions();
   state.quoteBasisSections = cloneQuoteBasisSections(snapshot.quote_basis_sections || snapshot.quote_basis || []);
   state.quoteBasis = cloneQuoteBasis(snapshot.quote_basis || quoteBasisFromSections(state.quoteBasisSections));
   state.lineItems = Array.isArray(snapshot.line_items) ? snapshot.line_items.map(normalizeLineItem) : [];
-  applyStandardServiceRows(standardServiceDecisions);
+  // Reset returns the standard rows to Confirm like every other line (owner, INT-SQAG-202611200003);
+  // an older draft without a decisions record stays without the rows.
+  applyStandardServiceRows(state.standardServiceRows ? newStandardServiceDecisions() : null);
   state.boothDimensions = normalizeBoothDimensions(snapshot.boothDimensions || state.boothDimensions);
   state.lastAnalysisMode = normalizeAnalysisMode(snapshot.analysis_mode || state.lastAnalysisMode);
   state.outputRows = [];

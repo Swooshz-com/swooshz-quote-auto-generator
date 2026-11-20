@@ -644,7 +644,7 @@ try {
     await (await cellFor("unit_price_override", '[data-output-denomination="quote"]')).click();
     await page.locator("[data-output-included-action]").click();
     edited = await editedRow();
-    assert(edited.authority?.variant === "included" && edited.quoted === "Included" && Number(edited.amount) === 0, "Included action", edited);
+    assert(edited.authority?.variant === "included" && edited.quoted === "Included" && edited.amount === "Included" && Number(edited.rowAmount) === 0, "Included action", edited);
     await (await cellFor("unit_price_override", '[data-output-denomination="quote"]')).click();
     await page.locator("[data-output-reference-action]").click();
     await page.waitForFunction(() => !appIsBusy());

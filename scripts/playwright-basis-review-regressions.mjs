@@ -107,7 +107,30 @@ replaceOnce('  result.basisLines = draftLines.length;', `  result.basisLines = d
       return boxes;
     });
     assert(unknownBooth.length === 0 || unknownBooth.every((text) => text.replace("Detected booth", "").trim()), "empty Detected booth box rendered", unknownBooth);
-    result.detectedBooth = { structured: (await boothBox.innerText()).trim(), unknownDimensions: unknownBooth };
+    // The booth size line reads about as large as the "Matched" heading, in bold; the card and its other
+    // lines keep their look (owner, INT-SQAG-202611200004).
+    const boothStyle = await page.evaluate(() => {
+      const style = (node) => {
+        const computed = node && getComputedStyle(node);
+        return computed ? { fontSize: parseFloat(computed.fontSize), fontWeight: Number(computed.fontWeight), color: computed.color } : null;
+      };
+      const box = document.querySelector("#basisReviewSurface .basis-visual-display");
+      const lines = [...box.querySelectorAll("li")];
+      const sizeLine = lines.find((line) => line.textContent.trim().startsWith("Booth size"));
+      const card = getComputedStyle(box);
+      return {
+        sizeLine: style(sizeLine),
+        otherLines: lines.filter((line) => line !== sizeLine).map(style),
+        label: style(box.querySelector("strong")),
+        matchedHeading: style(document.querySelector('#basisReviewSurface .basis-review-grid[aria-label="Matched"] > h4')),
+        card: { background: card.backgroundColor, border: card.borderTopColor, padding: card.padding, radius: card.borderTopLeftRadius },
+      };
+    });
+    assert(boothStyle.sizeLine && boothStyle.matchedHeading && boothStyle.sizeLine.fontWeight >= 700
+      && Math.abs(boothStyle.sizeLine.fontSize - boothStyle.matchedHeading.fontSize) <= 1
+      && boothStyle.otherLines.every((line) => line.fontSize === 13 && line.fontWeight < 700)
+      && boothStyle.label.fontSize === 12, "Detected booth size line is not large and bold like the Matched heading", boothStyle);
+    result.detectedBooth = { structured: (await boothBox.innerText()).trim(), unknownDimensions: unknownBooth, style: boothStyle };
 
     // 4. Click latency on the 60+ line basis: line tick/X and section-block X stay inside a budget,
     // and rows the click did not change keep their DOM nodes (no full rebuild).
@@ -169,6 +192,13 @@ replaceOnce('  result.basisLines = draftLines.length;', `  result.basisLines = d
     // The predicted size shows "Est." beside it; sizes with no estimate show none.
     assert(await (await rowFor("g-matched")).locator("[data-basis-quantity-est]").innerText() === "Est.", "a predicted size has no Est. tag");
     assert(await surface.locator("[data-basis-quantity-est]").count() === 1, "Est. shows on sizes nobody predicted");
+    // "Est." has the size and colour of its quantity, so "3 nos Est." reads as one (owner, INT-SQAG-202611200004).
+    const estStyle = await (await rowFor("g-matched")).evaluate((row) => {
+      const style = (node) => { const computed = getComputedStyle(node); return { fontSize: computed.fontSize, color: computed.color }; };
+      return { quantity: style(row.querySelector("[data-basis-quantity-edit]")), est: style(row.querySelector("[data-basis-quantity-est]")) };
+    });
+    assert(JSON.stringify(estStyle.est) === JSON.stringify(estStyle.quantity), "Est. tag size or colour differs from its quantity", estStyle);
+    result.estTag = estStyle;
     if (process.env.SQAG_BASIS_SCREENSHOT_DIR) {
       await (await rowFor("g-matched")).locator("xpath=ancestor::*[contains(@class,'basis-review-item')][1]").screenshot({ path: process.env.SQAG_BASIS_SCREENSHOT_DIR + "/est-tag.png" });
     }

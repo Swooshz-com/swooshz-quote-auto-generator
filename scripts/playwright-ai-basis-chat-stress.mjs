@@ -746,7 +746,7 @@ async function main() {
         || actual.section !== expected.section || actual.quantity !== expected.quantity || actual.unit !== expected.unit
         || actual.raw?.variant !== "included" || actual.raw.price !== 0
         || actual.trusted?.variant !== "included" || actual.trusted.price !== 0 || actual.amount !== 0
-        || !/^-?\d+(?:\.\d+)?$/.test(actual.amountText) || Number(actual.amountText) !== 0) {
+        || actual.amountText !== "Included") {
         throw new Error("Sequential Included lost RIGHT authority, numeric zero, LEFT provenance or row identity: " + JSON.stringify(actual));
       }
     };

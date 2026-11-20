@@ -140,7 +140,7 @@ class StandardServiceRowsTest(unittest.TestCase):
             # The standard rows add zero, so the total is the analysis's own.
             self.assertEqual(step["priced_total"], TITLED_SECTIONS_TOTAL)
 
-    def test_tick_and_x_survive_reanalyse_reset_and_reopen(self):
+    def test_tick_and_x_survive_reanalyse_and_reopen_and_reset_returns_them_to_confirm(self):
         result = self.run_steps([
             {"adopt": FIRST_ANALYSIS},
             {"tag": {"id": PM, "tag": "Include"}},
@@ -155,15 +155,42 @@ class StandardServiceRowsTest(unittest.TestCase):
         # Re-Analyse keeps the decisions and drops the new result's own disposal suggestion.
         self.assert_standard_rows(reanalysed, "Include", "Exclude")
         self.assertEqual(self.line_ids(reanalysed), ["wall-2", PM, WASTE])
-        self.assert_standard_rows(reset, "Include", "Exclude")
+        # Reset Draft returns both rows to Confirm, as it does every other line (owner, INT-SQAG-202611200003).
+        self.assert_standard_rows(reset, "Confirm", "Confirm")
         self.assertEqual(self.line_ids(reset), ["wall-2", PM, WASTE])
+        self.assertEqual(reset["saved"], {"standardServiceRows": {PM: "Confirm", WASTE: "Confirm"}})
 
-        # Reopening a saved quote restores the record, and a later Reset or Re-Analyse still keeps it.
+        # Reopening a saved quote restores the record and Re-Analyse keeps it; a later Reset returns it to Confirm.
         saved = crossed["saved"]["standardServiceRows"]
-        reopened = self.run_steps([{"adopt": SECOND_ANALYSIS}, {"reset": True}], decisions=saved)["steps"]
-        for step in reopened:
-            self.assert_standard_rows(step, "Include", "Exclude")
-            self.assertEqual(step["saved"], {"standardServiceRows": saved})
+        reanalysed, reset = self.run_steps([{"adopt": SECOND_ANALYSIS}, {"reset": True}], decisions=saved)["steps"]
+        self.assert_standard_rows(reanalysed, "Include", "Exclude")
+        self.assertEqual(reanalysed["saved"], {"standardServiceRows": saved})
+        self.assert_standard_rows(reset, "Confirm", "Confirm")
+        self.assertEqual(reset["saved"], {"standardServiceRows": {PM: "Confirm", WASTE: "Confirm"}})
+
+    def test_reset_after_the_quote_is_reopened_returns_the_standard_rows_to_confirm(self):
+        # The owner's path (INT-SQAG-202611200003): tick one row, X the other, leave for the Dashboard and come
+        # back with Modify (the page's own restore of the saved draft), then Reset Draft without Re-Analyse.
+        decided = self.run_steps([
+            {"adopt": FIRST_ANALYSIS},
+            {"tag": {"id": PM, "tag": "Include"}},
+            {"tag": {"id": WASTE, "tag": "Exclude"}},
+        ])["steps"][-1]
+        saved_draft = {
+            "quoteBasisSections": decided["sections"],
+            "lineItems": FIRST_ANALYSIS["line_items"],
+            "standardServiceRows": {PM: "Include", WASTE: "Exclude"},
+            "originalAnalysisSnapshot": {
+                "quote_basis_sections": FIRST_ANALYSIS["quote_basis_sections"],
+                "line_items": FIRST_ANALYSIS["line_items"],
+            },
+        }
+        reopened, reset = self.run_steps([{"reopen": saved_draft}, {"reset": True}])["steps"]
+        self.assertEqual({PM: self.tags(reopened)[PM], WASTE: self.tags(reopened)[WASTE]}, {PM: "Include", WASTE: "Exclude"})
+        self.assert_standard_rows(reset, "Confirm", "Confirm")
+        # The analysis's own lines come back as the analysis gave them, with no duplicate service rows.
+        self.assertEqual(self.line_ids(reset), ["wall", "bin-graphic", "signage-pm", PM, WASTE])
+        self.assertEqual(reset["saved"], {"standardServiceRows": {PM: "Confirm", WASTE: "Confirm"}})
 
     def test_decisions_survive_an_analysis_that_clears_the_basis_first(self):
         result = self.run_steps([

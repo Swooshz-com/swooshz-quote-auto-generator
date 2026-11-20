@@ -2894,6 +2894,11 @@ def line_quote_exchange_rate(line: QuoteLine, exchange_rate: float) -> float:
     return 1.0 if isinstance(authority, dict) and authority.get("variant") == "manual" and authority.get("price_currency") else exchange_rate
 
 
+# Customer amount text for a line priced as Included. It is text, not a number, so
+# SUM totals and cached formula values count it as zero.
+INCLUDED_AMOUNT_TEXT = "Included"
+
+
 def amount_value(line: QuoteLine, exchange_rate: float = 1.0) -> str | float | None:
     exchange_rate = line_quote_exchange_rate(line, exchange_rate)
     if line.price_mode == "Included":
@@ -3625,7 +3630,7 @@ def render_quote_entries(
             }
             entries.append(active_section_entry)
         detail_number += 1
-        detail_amount = amount_value(line, exchange_rate)
+        detail_amount = INCLUDED_AMOUNT_TEXT if line.price_mode == "Included" else amount_value(line, exchange_rate)
         if active_section_entry and active_section_entry.get("section_grouped"):
             active_section_entry["amount"] = round_commercial_cents(
                 float(active_section_entry["amount"] or 0.0) + float(line_amount_value(line, exchange_rate) or 0.0)
@@ -5447,7 +5452,7 @@ def write_styled_pdf_fallback(path: Path, brief: dict[str, Any], lines: list[Quo
                     elif col_number == 6:
                         c.drawRightString(548, y, text)
                     continue
-                if col_number == 5 and text in {"Estimate", "SGD"}:
+                if col_number == 5 and text in {"Estimate", "SGD", INCLUDED_AMOUNT_TEXT}:
                     c.drawCentredString(x, y, text)
                     continue
                 if col_number == 5 and isinstance(value, str):
