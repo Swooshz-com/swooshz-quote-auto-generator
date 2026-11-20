@@ -12806,7 +12806,7 @@ function renderQuoteBasisMessage(basis = state.quoteBasis, source = "") {
       <div class="basis-visual-display" aria-label="Booth display details">
         <strong>Detected booth</strong>
         <ul>
-          ${dimensionLines.map((line, index) => `<li${boothSizeText && index === 0 ? ' class="basis-booth-size"' : ""}>${escapeHtml(line)}</li>`).join("")}
+          ${dimensionLines.map((line) => `<li>${escapeHtml(line)}</li>`).join("")}
         </ul>
       </div>
     `
