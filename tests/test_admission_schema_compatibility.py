@@ -14,6 +14,8 @@ from scripts import validate_runtime_privilege_contract as contract
 
 ROOT = Path(__file__).resolve().parents[1]
 DEDICATED = "sqag_quote_api_reject_binding_change"
+MIGRATION_012 = "012_quote_api_admission_postgres.sql"
+MIGRATION_013 = "013_quote_templates_postgres.sql"
 LEGACY_ROUTINES = {"sqag_reject_immutable_change", "sqag_require_retention_delete_authorization"}
 # Frozen pre-012 dependencies, independent of the current manifest.
 LEGACY_LINKS = {
@@ -164,14 +166,14 @@ class AdmissionSchemaCompatibilityTest(unittest.TestCase):
         self.assertTrue(report["safeToApply"], report)
         self.assertEqual(report["blockers"], [])
         self.assertEqual(report["appliedMigrationIds"], [m.migration_id for m in catalog.manifest[:10]])
-        self.assertEqual(report["pendingMigrationIds"], ["012_quote_api_admission_postgres.sql"])
+        self.assertEqual(report["pendingMigrationIds"], [MIGRATION_012, MIGRATION_013])
         with mock.patch.object(server.DatabaseSqagStorage, "connection", side_effect=lambda: contextlib.nullcontext(catalog)):
             assert_runtime_surfaces(self, "postgresql://sqag_runtime@localhost/synthetic")
         self.assertFalse(any("sqag_schema_migrations" in sql for sql in catalog.calls[1:]))
 
     def test_old_image_forensic_inventory_on_012_still_passes_and_shared_dependency_mutant_fails(self):
         catalog = Catalog(11)
-        old_manifest = catalog.manifest[:-1]
+        old_manifest = catalog.manifest[:10]
         self.assertEqual(old_manifest[-1].migration_id, "011_quote_ai_spend_postgres.sql")
         old_ids = {m.migration_id for m in old_manifest}
         old_links = {name: frozenset((t.name, t.table_name)
@@ -210,7 +212,7 @@ class AdmissionSchemaCompatibilityTest(unittest.TestCase):
             assert_runtime_surfaces(self, "postgresql://sqag_runtime@localhost/synthetic")
         for kind in ("table", "index", "trigger", "routine", "body", "owner"):
             catalog = Catalog(11)
-            spec = migrations.MIGRATION_OBJECTS[-1]
+            spec = next(item for item in migrations.MIGRATION_OBJECTS if item.migration_id == MIGRATION_012)
             if kind == "table":
                 catalog.relations = [r for r in catalog.relations if r["name"] != spec.tables[0].name]
             elif kind == "index":
@@ -246,6 +248,32 @@ class AdmissionSchemaCompatibilityTest(unittest.TestCase):
         report = catalog.inspect()
         self.assertFalse(report["safeToApply"])
         self.assertTrue(any(b.startswith("pending_suffix_present:") for b in report["blockers"]))
+
+    def test_code_ahead_of_database_012_runs_without_quote_templates_until_013_is_applied(self):
+        catalog = Catalog(11)
+        report = catalog.inspect()
+        self.assertTrue(report["safeToApply"], report)
+        self.assertEqual(report["pendingMigrationIds"], [MIGRATION_013])
+        self.assertNotIn("sqag_quote_templates", catalog.tables)
+        # Quote templates are optional until 013 is applied: admission must not require the table.
+        with mock.patch.object(server.DatabaseSqagStorage, "connection", side_effect=lambda: contextlib.nullcontext(catalog)):
+            assert_runtime_surfaces(self, "postgresql://sqag_runtime@localhost/synthetic")
+
+    def test_applied_013_objects_are_checked_and_each_missing_object_fails(self):
+        catalog = Catalog(12)
+        report = catalog.inspect()
+        self.assertEqual(report["blockers"], [])
+        self.assertEqual(report["pendingMigrationIds"], [])
+        self.assertEqual(report["appliedMigrationIds"][-1], MIGRATION_013)
+        spec = next(item for item in migrations.MIGRATION_OBJECTS if item.migration_id == MIGRATION_013)
+        for kind in ("table", "index"):
+            catalog = Catalog(12)
+            if kind == "table":
+                catalog.relations = [r for r in catalog.relations if r["name"] != spec.tables[0].name]
+            else:
+                del catalog.indexes[spec.indexes[0].name]
+            with self.subTest(kind=kind):
+                self.assertFalse(catalog.inspect()["safeToApply"])
 
 
 if __name__ == "__main__":

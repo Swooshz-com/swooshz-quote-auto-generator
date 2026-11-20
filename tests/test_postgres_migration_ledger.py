@@ -576,17 +576,42 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
     def test_admission_011_to_012_is_additive_unseeded_and_repeatable(self):
         self.apply(self.manifest[:10])
         before=self.inspect()
-        self.assertEqual(before['pendingMigrationIds'],['012_quote_api_admission_postgres.sql'])
-        result=self.apply()
+        self.assertEqual(before['pendingMigrationIds'],['012_quote_api_admission_postgres.sql','013_quote_templates_postgres.sql'])
+        result=self.apply(self.manifest[:11])
         self.assertEqual(result['appliedNow'],['012_quote_api_admission_postgres.sql'])
-        self.assertEqual(self.apply()['appliedNow'],[])
+        self.assertEqual(self.apply(self.manifest[:11])['appliedNow'],[])
         c=self.connect()
         try:
             for table in ('sqag_quote_api_tenants','sqag_quote_api_callers'):
                 self.assertEqual(c.execute('select count(*) as count from public.'+table).fetchone()['count'],0)
         finally:
             c.rollback(); c.close()
+        self.assertEqual(self.inspect()['pendingMigrationIds'],['013_quote_templates_postgres.sql'])
+
+    def test_quote_templates_012_to_013_is_additive_empty_runtime_only_and_repeatable(self):
+        self.apply(self.manifest[:11])
+        self.assertEqual(self.inspect()['pendingMigrationIds'],['013_quote_templates_postgres.sql'])
+        self.assertEqual(self.apply()['appliedNow'],['013_quote_templates_postgres.sql'])
+        self.assertEqual(self.apply()['appliedNow'],[])
         self.assertEqual(self.inspect()['pendingMigrationIds'],[])
+        c=self.connect()
+        try:
+            self.assertEqual(c.execute('select count(*) as count from public.sqag_quote_templates').fetchone()['count'],0)
+            grants=c.execute(
+                "select grantee, privilege_type from information_schema.role_table_grants "
+                "where table_schema='public' and table_name='sqag_quote_templates' and grantee<>'sqag_migrator' "
+                "order by grantee, privilege_type"
+            ).fetchall()
+            self.assertEqual([(row['grantee'],row['privilege_type']) for row in grants],
+                             [('sqag_runtime',p) for p in ('DELETE','INSERT','SELECT','UPDATE')])
+            insert=("insert into public.sqag_quote_templates (workspace_id, template_id, name, definition_json, "
+                    "fingerprint, save_number, is_default, created_at, updated_at) values (?, ?, 'T', '{}', 'f', 1, 1, 'now', 'now')")
+            c.execute(insert,('ws-a','tpl-1'))
+            c.execute(insert,('ws-b','tpl-1'))
+            with self.assertRaises(Exception):
+                c.execute(insert,('ws-a','tpl-2'))
+        finally:
+            c.rollback(); c.close()
 
     @classmethod
     def setUpClass(cls):

@@ -2450,7 +2450,8 @@ order by object_kind, object_schema, object_name, object_type
         self.assertEqual(int(major) // 10000, 17)
         report = self._inspect(database)
         self.assertEqual(report["blockers"], [])
-        self.assertEqual(report["pendingMigrationIds"], ["012_quote_api_admission_postgres.sql"])
+        self.assertEqual(report["pendingMigrationIds"],
+                         ["012_quote_api_admission_postgres.sql", "013_quote_templates_postgres.sql"])
         url = safe_postgres_url("sqag_runtime", database)
         assert_runtime_surfaces(self, url)
         # Forward application is explicit and confined to this disposable fixture.

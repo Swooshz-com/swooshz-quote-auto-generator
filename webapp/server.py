@@ -67,6 +67,7 @@ from webapp.profile_access import ProfilePolicy, content_profile, access_state, 
 from webapp.forensics import EVIDENCE_SCHEMA_VERSION
 
 from scripts import pricing_reference_cleanup, pricing_reference_enrichment
+from scripts import quote_template
 from webapp.forensics import (
     MAX_GENERATION_MANIFEST_BYTES,
     SQLITE_TELEMETRY_HISTORICAL_009,
@@ -307,6 +308,7 @@ MAX_FORENSIC_REQUEST_EVIDENCE_BYTES = 1024 * 1024
 MAX_PRICING_REFERENCE_BYTES = 10 * 1024 * 1024
 MAX_PROFILE_LAYOUT_BYTES = 10 * 1024 * 1024
 MAX_PROFILE_LAYOUT_RULES_BYTES = 256 * 1024
+MAX_PROFILE_LOGO_BYTES = 2 * 1024 * 1024
 MAX_PROFILE_LAYOUT_XLSX_MEMBERS = 1024
 MAX_PROFILE_LAYOUT_XLSX_ENTRY_BYTES = 16 * 1024 * 1024
 MAX_PROFILE_LAYOUT_XLSX_TOTAL_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -599,6 +601,11 @@ POST_RATE_LIMITS = {
     "/api/settings/pricing-references/:id": 20,
     "/api/settings/profiles": 30,
     "/api/settings/profiles/:id": 30,
+    "/api/settings/quote-templates": 20,
+    "/api/settings/quote-templates/:id": 20,
+    "/api/settings/quote-templates/default": 20,
+    # Checking a draft is admin-only and capped below saves.
+    "/api/settings/quote-templates/preview": 6,
     "/api/quote-sessions": 30,
     "/api/quote-sessions/pricing-selections": 30,
     "/api/quote-sessions/:id": 30,
@@ -3022,7 +3029,6 @@ def blocked_platform_permissions() -> dict[str, bool]:
         "canManagePricingReferences": False,
         "canManageProfiles": False,
         "canCreateProfiles": False,
-        "canManageSharedProfiles": False,
         "canImportPricingReferences": False,
         "canSelectPricingReference": False,
         "canGenerateQuote": False,
@@ -3073,8 +3079,7 @@ def permissions_for_auth_session(session: dict[str, Any] | None) -> dict[str, bo
         role = user.get("internal_role") if isinstance(user, dict) else ""
         permissions = role_permissions(role) if role in {"admin", "operator"} else blocked_platform_permissions()
         if role in {"admin", "operator"}:
-            permissions.update(canManageProfiles=True, canCreateProfiles=True,
-                               canManageSharedProfiles=role == "admin")
+            permissions.update(canManageProfiles=True, canCreateProfiles=True)
         return permissions
     if configured_app_mode() == "deploy":
         mode = configured_auth_mode()
@@ -8392,7 +8397,7 @@ def versioned_index_html() -> bytes:
     return body.encode("utf-8")
 
 
-def decode_data_url_bytes(data_url: Any, max_bytes: int) -> bytes:
+def decode_data_url_bytes(data_url: Any, max_bytes: int, file_label: str = "Pricing reference file") -> bytes:
     text = str(data_url or "")
     prefix, separator, encoded = text.partition(",")
     if not separator or ";base64" not in prefix:
@@ -8402,7 +8407,7 @@ def decode_data_url_bytes(data_url: Any, max_bytes: int) -> bytes:
     except binascii.Error as exc:
         raise ValueError("Upload payload is not valid base64.") from exc
     if len(raw) > max_bytes:
-        raise ValueError(f"Pricing reference file is larger than {max_bytes // (1024 * 1024)} MB.")
+        raise ValueError(f"{file_label} is larger than {max_bytes // (1024 * 1024)} MB.")
     return raw
 
 
@@ -8437,6 +8442,17 @@ def sanitize_profile_defaults(value: Any) -> dict[str, Any]:
         return {}
     sanitized = sanitize_profile_default_value(value)
     return sanitized if isinstance(sanitized, dict) else {}
+
+
+def check_profile_logo_data_url(defaults: dict[str, Any]) -> None:
+    """Refuse a saved profile logo that is not a PNG or JPEG data URL within MAX_PROFILE_LOGO_BYTES."""
+    company = defaults.get("company") if isinstance(defaults.get("company"), dict) else {}
+    data_url = company.get("logo_data_url")
+    if data_url in (None, ""):
+        return
+    if not re.fullmatch(r"data:image/(?:png|jpeg|jpg);base64,[A-Za-z0-9+/=]*", str(data_url), flags=re.IGNORECASE):
+        raise ValueError("Profile logo must be a PNG or JPEG image.")
+    decode_data_url_bytes(data_url, MAX_PROFILE_LOGO_BYTES, "Profile logo")
 
 
 def safe_profile_pack_filename(value: Any, fallback: str, allowed_suffixes: set[str]) -> str:
@@ -8934,7 +8950,7 @@ def normalize_profile_layout_rules_payload(value: Any) -> dict[str, Any]:
     elif isinstance(value.get("data"), dict):
         rules_value = value.get("data")
     elif clean_text(value.get("data_url")):
-        raw = decode_data_url_bytes(value.get("data_url"), MAX_PROFILE_LAYOUT_RULES_BYTES)
+        raw = decode_data_url_bytes(value.get("data_url"), MAX_PROFILE_LAYOUT_RULES_BYTES, "Quote layout rules file")
         try:
             rules_value = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -9075,7 +9091,7 @@ def normalize_profile_pack_assets(profile_payload: dict[str, Any], source_payloa
     rules_payload = normalize_profile_layout_rules_payload(rules) if rules else {}
     layout = pack.get("quotation_layout") if isinstance(pack.get("quotation_layout"), dict) else {}
     if layout:
-        raw = decode_data_url_bytes(layout.get("data_url"), MAX_PROFILE_LAYOUT_BYTES)
+        raw = decode_data_url_bytes(layout.get("data_url"), MAX_PROFILE_LAYOUT_BYTES, "Quote layout file")
         validate_profile_layout_xlsx(raw)
         if rules_payload:
             raw = xlsx_bytes_with_embedded_layout_rules(raw, rules_payload)
@@ -9674,6 +9690,11 @@ def normalize_profile_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "defaults": sanitize_profile_defaults(profile_payload.get("defaults")),
         "saved_at": utc_timestamp(),
     }
+    check_profile_logo_data_url(normalized["defaults"])
+    if "quote_template_id" in profile_payload:
+        if not quote_template_choice_valid(profile_payload["quote_template_id"]):
+            raise ValueError("Quote template choice is invalid.")
+        normalized["quote_template_id"] = profile_payload["quote_template_id"]
     pack_assets = normalize_profile_pack_assets(profile_payload, payload)
     if pack_assets:
         normalized["_pack_assets"] = pack_assets
@@ -10607,6 +10628,10 @@ def rate_limit_path_key(path: str) -> str:
         return "/api/settings/profiles/:id"
     if re.fullmatch(r"/api/settings/profiles/[A-Za-z0-9_-]+", normalized_path):
         return "/api/settings/profiles/:id"
+    if normalized_path in {"/api/settings/quote-templates/default", "/api/settings/quote-templates/preview"}:
+        return normalized_path
+    if re.fullmatch(r"/api/settings/quote-templates/[A-Za-z0-9_-]+", normalized_path):
+        return "/api/settings/quote-templates/:id"
     return normalized_path
 
 
@@ -11010,6 +11035,8 @@ def public_database_profile_summary(profile: dict[str, Any]) -> dict[str, Any]:
     }
     if isinstance(profile.get("permissions"), dict):
         summary["permissions"] = copy.deepcopy(profile["permissions"])
+    if "quote_template_id" in profile:
+        summary["quote_template_id"] = profile["quote_template_id"]
     if "revision" in profile or "_revision" in profile:
         summary["revision"] = profile.get("revision", profile.get("_revision", 0))
     if defaults:
@@ -11064,7 +11091,6 @@ def role_permissions(role: str) -> dict[str, bool]:
         "canManagePricingReferences": can_manage,
         "canManageProfiles": can_manage,
         "canCreateProfiles": can_manage,
-        "canManageSharedProfiles": can_manage,
         "canImportPricingReferences": can_manage,
         "canSelectPricingReference": normalized in {"admin", "management", "operator", "viewer"},
         "canGenerateQuote": can_generate,
@@ -11244,6 +11270,7 @@ SQAG_STORAGE_MIGRATION_PATHS = [
     PROJECT_ROOT / "migrations" / "007_feedback_publication_binding.sql",
     PROJECT_ROOT / "migrations" / "009_telemetry_events.sql",
     PROJECT_ROOT / "migrations" / "011_quote_ai_spend.sql",
+    PROJECT_ROOT / "migrations" / "013_quote_templates.sql",
 ]
 SQAG_POSTGRES_METADATA_MIGRATION_PATHS = [
     PROJECT_ROOT / "migrations" / "001_platform_scoped_storage.sql",
@@ -13291,6 +13318,14 @@ class DatabaseSqagStorage:
             if stored["_access"] is None:
                 del stored["_access"]
             stored["_revision"] = (existing or {}).get("_revision", 0) + 1
+            if "quote_template_id" not in stored:
+                if existing is not None and "quote_template_id" in existing:
+                    # Saves from screens without a template control keep the profile's choice.
+                    stored["quote_template_id"] = existing["quote_template_id"]
+                elif create and not profile_payload_has_layout_artifact(profile):
+                    # New profiles follow the workspace default template; imports carrying
+                    # their own layout workbook keep that workbook.
+                    stored["quote_template_id"] = DEFAULT_QUOTE_TEMPLATE_CHOICE
 
         artifact_mode = configured_artifact_storage_mode()
         materialize_default_layout = configured_storage_mode() == "database"
@@ -18540,6 +18575,344 @@ def database_profile_storage_for_auth_session(auth_session: dict[str, Any] | Non
     except SqagStorageAccessError:
         return None
     return storage if isinstance(storage, DatabaseSqagStorage) else None
+
+
+# Quote templates (#167). Admins save up to SQAG_QUOTE_TEMPLATE_LIMIT checked definitions per
+# workspace; each keeps only its current version (no history) and a save number. A profile picks
+# one with `quote_template_id`: absent keeps the profile's own layout workbook (every profile saved
+# before templates existed), "default" follows the workspace default, "standard" is the built-in
+# Standard template, and a saved template id uses that template. Quotes already made keep their
+# stored files; each new quote records the template name, save number and fingerprint.
+QUOTE_TEMPLATE_LIMIT_ENV_NAME = "SQAG_QUOTE_TEMPLATE_LIMIT"
+QUOTE_TEMPLATE_DEFAULT_LIMIT = 10
+QUOTE_TEMPLATE_MAX_LIMIT = 100
+STANDARD_QUOTE_TEMPLATE_ID = "standard"
+DEFAULT_QUOTE_TEMPLATE_CHOICE = "default"
+QUOTE_TEMPLATE_ID_RE = re.compile(r"tpl-[0-9a-f]{32}")
+QUOTE_TEMPLATE_DELETED_NOTE = "The template chosen for this profile was deleted, so the default template was used."
+QUOTE_TEMPLATE_TABLE = "sqag_quote_templates"
+QUOTE_TEMPLATE_COLUMNS = frozenset({
+    "workspace_id", "template_id", "name", "definition_json", "fingerprint",
+    "save_number", "is_default", "created_at", "updated_at",
+})
+
+
+def configured_quote_template_limit() -> int:
+    raw = clean_text(read_dotenv_value(QUOTE_TEMPLATE_LIMIT_ENV_NAME))
+    if not raw:
+        return QUOTE_TEMPLATE_DEFAULT_LIMIT
+    if not raw.isdecimal() or int(raw) > QUOTE_TEMPLATE_MAX_LIMIT:
+        raise SqagStorageAccessError(
+            "The quote template limit setting is invalid.", status=503, reason="quote_template_limit_invalid",
+        )
+    return int(raw)
+
+
+def quote_template_choice_valid(value: Any) -> bool:
+    return isinstance(value, str) and (
+        value in {DEFAULT_QUOTE_TEMPLATE_CHOICE, STANDARD_QUOTE_TEMPLATE_ID}
+        or QUOTE_TEMPLATE_ID_RE.fullmatch(value) is not None
+    )
+
+
+def standard_quote_template_record() -> dict[str, Any]:
+    definition = quote_template.load_standard_quote_template()
+    return {
+        "id": STANDARD_QUOTE_TEMPLATE_ID,
+        "name": definition["name"],
+        "save_number": 0,
+        "builtin": True,
+        "fingerprint": quote_template.quote_template_fingerprint(definition),
+        "definition": definition,
+    }
+
+
+def quote_template_summary(record: dict[str, Any], default_id: str) -> dict[str, Any]:
+    return {
+        "id": record["id"],
+        "name": record["name"],
+        "save_number": record["save_number"],
+        "builtin": record.get("builtin", False),
+        "is_default": record["id"] == default_id,
+        "fingerprint": record["fingerprint"],
+    }
+
+
+class QuoteTemplateStore:
+    """Saved quote templates of one workspace.
+
+    Owns the template limit (checked inside the insert transaction under a workspace lock),
+    the single default per workspace and the save number that guards every overwrite and
+    delete. Who may call which method is decided by the HTTP handler's role check.
+    """
+
+    def __init__(self, storage: "DatabaseSqagStorage", limit: int | None = None) -> None:
+        self.storage = storage
+        self.workspace_id = storage.workspace_id
+        self._limit = limit
+
+    @property
+    def limit(self) -> int:
+        """Saved templates allowed in the workspace (Standard not counted); read when first needed."""
+        if self._limit is None:
+            self._limit = configured_quote_template_limit()
+        return self._limit
+
+    def ready(self) -> bool:
+        """False only while migration 013 is not applied (no table yet); any other fault raises.
+
+        Until 013 reaches a database the app keeps working: quotes use the Standard template
+        or the profile's own layout. Remove this tolerance once 013 is applied everywhere.
+        """
+        try:
+            with self.storage.connection() as connection:
+                if self.storage.database_family == "postgres_compatible":
+                    rows = self.storage._postgres_schema_columns(connection, {QUOTE_TEMPLATE_TABLE})
+                else:
+                    rows = self.storage._sqlite_schema_columns(connection, {QUOTE_TEMPLATE_TABLE})
+        except SqagStorageAccessError:
+            raise
+        except Exception as exc:
+            raise SqagStorageAccessError(
+                "Quote templates are unavailable right now.", status=503, reason="quote_templates_unavailable",
+            ) from exc
+        present = {clean_text(row["column_name"]) for row in rows}
+        if not present:
+            return False
+        if QUOTE_TEMPLATE_COLUMNS - present:
+            raise SqagStorageAccessError(
+                "SQAG database storage migration has not been applied.", status=503, reason="quote_templates_not_migrated",
+            )
+        return True
+
+    def ensure_ready(self) -> None:
+        if not self.ready():
+            raise SqagStorageAccessError(
+                "Saved quote templates need a database upgrade first.", status=503, reason="quote_templates_not_migrated",
+            )
+
+    def _lock_workspace(self, connection: Any) -> None:
+        if self.storage.database_family == "postgres_compatible":
+            key = int.from_bytes(
+                hashlib.sha256(f"{self.workspace_id}\x1fquote_templates".encode("utf-8")).digest()[:8],
+                byteorder="big", signed=True,
+            )
+            connection.execute("select pg_advisory_xact_lock(?)", (key,))
+        else:
+            connection.execute("begin immediate")
+
+    @staticmethod
+    def _record(row: Any) -> dict[str, Any]:
+        return {
+            "id": row["template_id"],
+            "name": row["name"],
+            "save_number": int(row["save_number"]),
+            "builtin": False,
+            "is_default": bool(row["is_default"]),
+            "fingerprint": row["fingerprint"],
+            "definition": json.loads(row["definition_json"]),
+        }
+
+    def _rows(self, connection: Any) -> list[dict[str, Any]]:
+        rows = connection.execute(
+            "select template_id, name, definition_json, fingerprint, save_number, is_default "
+            "from sqag_quote_templates where workspace_id = ? order by created_at, template_id",
+            (self.workspace_id,),
+        ).fetchall()
+        return [self._record(row) for row in rows]
+
+    def _row(self, connection: Any, template_id: str) -> dict[str, Any] | None:
+        row = connection.execute(
+            "select template_id, name, definition_json, fingerprint, save_number, is_default "
+            "from sqag_quote_templates where workspace_id = ? and template_id = ?",
+            (self.workspace_id, template_id),
+        ).fetchone()
+        return self._record(row) if row else None
+
+    def _read(self, operation: Callable[[Any], Any]) -> Any:
+        self.ensure_ready()
+        with self.storage.connection() as connection:
+            return operation(connection)
+
+    def list(self) -> list[dict[str, Any]]:
+        return self._read(self._rows)
+
+    def get(self, template_id: str) -> dict[str, Any] | None:
+        if QUOTE_TEMPLATE_ID_RE.fullmatch(clean_text(template_id)) is None:
+            return None
+        return self._read(lambda connection: self._row(connection, template_id))
+
+    def default(self) -> dict[str, Any] | None:
+        return next((record for record in self.list() if record["is_default"]), None)
+
+    @staticmethod
+    def _checked(definition: Any) -> tuple[dict[str, Any], str, str]:
+        checked = quote_template.read_quote_template(definition)
+        canonical = quote_template.canonical_quote_template_json(checked)
+        return checked, canonical, hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _missing(self) -> SqagStorageAccessError:
+        return SqagStorageAccessError("Quote template not found.", status=404, reason="template_not_found")
+
+    def _builtin(self) -> SqagStorageAccessError:
+        return SqagStorageAccessError(
+            "The Standard template is built in and cannot be changed or deleted.", status=403, reason="template_builtin",
+        )
+
+    def _stale(self) -> SqagStorageAccessError:
+        return SqagStorageAccessError(
+            "This template changed since it was opened. Reload it before trying again.",
+            status=409, reason="template_save_conflict",
+        )
+
+    def create(self, definition: Any) -> dict[str, Any]:
+        checked, canonical, fingerprint = self._checked(definition)
+        self.ensure_ready()
+
+        def insert(connection: Any) -> dict[str, Any]:
+            self._lock_workspace(connection)
+            count = connection.execute(
+                "select count(*) as saved from sqag_quote_templates where workspace_id = ?", (self.workspace_id,),
+            ).fetchone()["saved"]
+            if int(count) >= self.limit:
+                raise SqagStorageAccessError(
+                    f"This workspace already has {self.limit} quote templates, the most it can keep. "
+                    "Delete one before adding another.",
+                    status=409, reason="template_limit_reached",
+                )
+            template_id = "tpl-" + secrets.token_hex(16)
+            now = utc_timestamp()
+            connection.execute(
+                "insert into sqag_quote_templates (workspace_id, template_id, name, definition_json, fingerprint, "
+                "save_number, is_default, created_at, updated_at) values (?, ?, ?, ?, ?, 1, 0, ?, ?)",
+                (self.workspace_id, template_id, checked["name"], canonical, fingerprint, now, now),
+            )
+            return self._row(connection, template_id)
+
+        return self.storage._run_storage_transaction(insert)
+
+    def update(self, template_id: str, definition: Any, save_number: Any) -> dict[str, Any]:
+        if template_id == STANDARD_QUOTE_TEMPLATE_ID:
+            raise self._builtin()
+        if type(save_number) is not int:
+            raise ValueError("Template save number is required.")
+        if QUOTE_TEMPLATE_ID_RE.fullmatch(clean_text(template_id)) is None:
+            raise self._missing()
+        checked, canonical, fingerprint = self._checked(definition)
+        self.ensure_ready()
+
+        def overwrite(connection: Any) -> dict[str, Any]:
+            self._lock_workspace(connection)
+            changed = connection.execute(
+                "update sqag_quote_templates set name = ?, definition_json = ?, fingerprint = ?, "
+                "save_number = save_number + 1, updated_at = ? "
+                "where workspace_id = ? and template_id = ? and save_number = ?",
+                (checked["name"], canonical, fingerprint, utc_timestamp(), self.workspace_id, template_id, save_number),
+            ).rowcount
+            if changed != 1:
+                raise self._stale() if self._row(connection, template_id) else self._missing()
+            return self._row(connection, template_id)
+
+        return self.storage._run_storage_transaction(overwrite)
+
+    def delete(self, template_id: str, save_number: Any) -> None:
+        """Remove a saved template permanently. Profiles that chose it fall back at generation time."""
+        if template_id == STANDARD_QUOTE_TEMPLATE_ID:
+            raise self._builtin()
+        if type(save_number) is not int:
+            raise ValueError("Template save number is required.")
+        if QUOTE_TEMPLATE_ID_RE.fullmatch(clean_text(template_id)) is None:
+            raise self._missing()
+        self.ensure_ready()
+
+        def remove(connection: Any) -> None:
+            self._lock_workspace(connection)
+            deleted = connection.execute(
+                "delete from sqag_quote_templates where workspace_id = ? and template_id = ? and save_number = ?",
+                (self.workspace_id, template_id, save_number),
+            ).rowcount
+            if deleted != 1:
+                raise self._stale() if self._row(connection, template_id) else self._missing()
+
+        self.storage._run_storage_transaction(remove)
+
+    def set_default(self, template_id: str) -> str:
+        """Make one saved template, or the built-in Standard template, the workspace default."""
+        if template_id != STANDARD_QUOTE_TEMPLATE_ID and QUOTE_TEMPLATE_ID_RE.fullmatch(clean_text(template_id)) is None:
+            raise self._missing()
+        self.ensure_ready()
+
+        def mark(connection: Any) -> str:
+            self._lock_workspace(connection)
+            if template_id != STANDARD_QUOTE_TEMPLATE_ID and self._row(connection, template_id) is None:
+                raise self._missing()
+            connection.execute(
+                "update sqag_quote_templates set is_default = 0 where workspace_id = ? and is_default = 1",
+                (self.workspace_id,),
+            )
+            if template_id != STANDARD_QUOTE_TEMPLATE_ID:
+                connection.execute(
+                    "update sqag_quote_templates set is_default = 1 where workspace_id = ? and template_id = ?",
+                    (self.workspace_id, template_id),
+                )
+            return template_id
+
+        return self.storage._run_storage_transaction(mark)
+
+
+def quote_template_store_for_storage(storage: Any) -> QuoteTemplateStore | None:
+    """The workspace's saved-template store, or None where saved templates cannot exist (local files)."""
+    if not isinstance(storage, DatabaseSqagStorage):
+        return None
+    return QuoteTemplateStore(storage)
+
+
+@dataclass(frozen=True)
+class QuoteTemplateResolution:
+    """How one quote is laid out: `definition` None means the profile's own layout workbook."""
+
+    definition: dict[str, Any] | None
+    record: dict[str, Any]
+    note: str = ""
+
+
+def resolve_quote_template(choice: Any, store: QuoteTemplateStore | None) -> QuoteTemplateResolution:
+    """Pick the template for a profile's `quote_template_id` (absent keeps the legacy layout)."""
+    if choice is None:
+        return QuoteTemplateResolution(None, {"legacy_layout": True})
+    saved = store if store is not None and store.ready() else None
+
+    def chosen(record: dict[str, Any], note: str = "") -> QuoteTemplateResolution:
+        manifest = {key: record[key] for key in ("id", "name", "save_number", "builtin")}
+        manifest["sha256"] = record["fingerprint"]
+        return QuoteTemplateResolution(record["definition"], manifest, note)
+
+    def workspace_default(note: str = "") -> QuoteTemplateResolution:
+        record = saved.default() if saved is not None else None
+        return chosen(record or standard_quote_template_record(), note)
+
+    if choice == STANDARD_QUOTE_TEMPLATE_ID:
+        return chosen(standard_quote_template_record())
+    if choice == DEFAULT_QUOTE_TEMPLATE_CHOICE:
+        return workspace_default()
+    record = saved.get(choice) if saved is not None and isinstance(choice, str) else None
+    if record is None:
+        return workspace_default(QUOTE_TEMPLATE_DELETED_NOTE)
+    return chosen(record)
+
+
+def check_profile_quote_template_choice(profile: dict[str, Any], storage: Any) -> None:
+    """Refuse a profile save that names a template id that is not saved in this workspace."""
+    if "quote_template_id" not in profile:
+        return
+    choice = profile["quote_template_id"]
+    if choice in {DEFAULT_QUOTE_TEMPLATE_CHOICE, STANDARD_QUOTE_TEMPLATE_ID}:
+        return
+    store = quote_template_store_for_storage(storage)
+    if store is None or not store.ready() or store.get(choice) is None:
+        raise SqagStorageAccessError(
+            "The chosen quote template does not exist. Pick another template.", status=400, reason="template_not_found",
+        )
 
 
 def database_profile_detail_for_payload(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any] | None:
@@ -32464,6 +32837,7 @@ def compact_generation_canonical_manifest(
         ("pricing_reference", "snapshot"),
         ("profile", "snapshot"),
         ("layout_rules", "snapshot"),
+        ("quote_template", "definition"),
         ("normalized_brief",),
         ("approved_basis",),
         ("output_rows",),
@@ -34025,6 +34399,14 @@ def _run_quote_job(
         if profile is None:
             return blocked([PROFILE_SELECTION_ERROR_MESSAGE], "profile_layout_unavailable")
         layout_template_path = profile.quotation_layout_path
+    profile_settings = profile.config if isinstance(profile, ProfilePack) else profile
+    try:
+        quote_template_resolution = resolve_quote_template(
+            profile_settings.get("quote_template_id") if isinstance(profile_settings, dict) else None,
+            quote_template_store_for_storage(database_profile_storage_for_auth_session(auth_session)),
+        )
+    except SqagStorageAccessError as exc:
+        return storage_block(exc)
     pricing_catalog_path = pricing_catalog_path_for_payload(payload, job_tmp, auth_session=auth_session)
     uploaded_images = save_uploaded_images(image_entries(payload), job_tmp)
     brief = payload_to_brief(payload, auth_session=auth_session)
@@ -34054,6 +34436,10 @@ def _run_quote_job(
         str(layout_template_path),
         "--allow-ambiguous",
     ]
+    if quote_template_resolution.definition is not None:
+        quote_template_path = job_tmp / "quote-template.json"
+        atomic_write_text(quote_template_path, quote_template.canonical_quote_template_json(quote_template_resolution.definition))
+        command.extend(["--quote-template", str(quote_template_path)])
     if normalized_pdf_mode != "none":
         command.extend(["--pdf-mode", normalized_pdf_mode])
 
@@ -34136,6 +34522,8 @@ def _run_quote_job(
         "pdf_mode": normalized_pdf_mode,
         "errors": errors_for_response,
     }
+    if quote_template_resolution.definition is not None:
+        result["quote_template"] = {**quote_template_resolution.record, "note": quote_template_resolution.note}
     profile_snapshot_for_publication = copy.deepcopy(profile.config if isinstance(profile, ProfilePack) else profile)
     profile_snapshot_for_publication.pop("pack", None)
     profile_snapshot_for_publication = content_profile(profile_snapshot_for_publication)
@@ -34351,6 +34739,13 @@ def _run_quote_job(
         "profile": {"snapshot": profile_snapshot, "sha256": hashlib.sha256(json.dumps(profile_snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()},
         "pricing_reference": {"snapshot": json.loads(pricing_bytes.decode("utf-8")), "sha256": hashlib.sha256(pricing_bytes).hexdigest()},
         "layout_template": {"filename": layout_template_path.name, "sha256": hashlib.sha256(layout_bytes).hexdigest(), "size_bytes": len(layout_bytes)},
+        # The quote's template is evidence of how it was laid out, not template history:
+        # editing or deleting the template later never changes this quote or its files.
+        "quote_template": (
+            {**quote_template_resolution.record, "note": quote_template_resolution.note,
+             "definition": copy.deepcopy(quote_template_resolution.definition)}
+            if quote_template_resolution.definition is not None else dict(quote_template_resolution.record)
+        ),
         "generation_configuration": generation_configuration,
         "inputs": input_references,
         "layout_rules": {"snapshot": layout_rules_snapshot, "sha256": hashlib.sha256(json.dumps(layout_rules_snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()},
@@ -35009,6 +35404,8 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             export_profile_id = safe_segment(clean_text(payload.get("profile", {}).get("id")), "company-profile")
             self.send_json_download(f"{export_profile_id}.quote-company-profile.json", payload)
             return
+        if self.handle_quote_template_route("GET", parsed):
+            return
         if path == "/api/settings/profiles":
             allowed, error = self.require_permission("canManageProfiles")
             if not allowed:
@@ -35192,6 +35589,9 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             })
             return
 
+        if self.handle_quote_template_route("POST", parsed, payload):
+            return
+
         if parsed.path == "/api/settings/profiles":
             allowed, error = self.require_permission("canManageProfiles")
             if not allowed:
@@ -35220,6 +35620,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                         raise ValueError("Access changes require user-scoped storage.")
                     saved = storage.change_profile_access(profile["id"], payload.get("access"), revision=revision)
                 else:
+                    check_profile_quote_template_choice(profile, storage)
                     saved = storage.save_profile(profile, operation=operation, revision=revision)
                 append_runtime_telemetry(
                     auth_session,
@@ -35677,6 +36078,8 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 status=200 if deleted else 404,
             )
             return
+        if self.handle_quote_template_route("DELETE", parsed):
+            return
         profile_match = re.fullmatch(r"/api/settings/profiles/([A-Za-z0-9_-]+)", parsed.path)
         if profile_match:
             allowed, error = self.require_permission("canManageProfiles")
@@ -35925,6 +36328,96 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             "errors": ["You do not have permission to perform this action."],
             "permissions": permissions,
         }
+
+    def handle_quote_template_route(self, method: str, parsed: Any, payload: dict[str, Any] | None = None) -> bool:
+        """Serve /api/settings/quote-templates. Staff may list templates; only admins read or change them."""
+        path = parsed.path
+        if path != "/api/settings/quote-templates" and not path.startswith("/api/settings/quote-templates/"):
+            return False
+        match = re.fullmatch(r"/api/settings/quote-templates(?:/([A-Za-z0-9_-]+))?", path)
+        target = match.group(1) if match else None
+        if match is None or (method == "GET" and target in {"default", "preview"}) or (
+            method == "DELETE" and target in {None, "default", "preview"}
+        ):
+            self.send_json({"error": "Not found"}, status=404)
+            return True
+        listing = method == "GET" and target is None
+        allowed, error = self.require_permission("canGenerateQuote" if listing else "canManageSettings")
+        if not allowed:
+            self.send_json(error, status=403)
+            return True
+        payload = payload if isinstance(payload, dict) else {}
+        try:
+            if method == "POST" and target == "preview":
+                checked = quote_template.read_quote_template(payload.get("definition"))
+                self.send_json({
+                    "status": "valid",
+                    "definition": checked,
+                    "fingerprint": quote_template.quote_template_fingerprint(checked),
+                })
+                return True
+            storage = self.current_app_storage()
+            if storage is None:
+                return True
+            store = quote_template_store_for_storage(storage)
+            if store is None:
+                raise SqagStorageAccessError(
+                    "Quote templates need database storage.", status=503, reason="quote_templates_storage_unavailable",
+                )
+            if listing:
+                saved = store.list()
+                default_id = next((record["id"] for record in saved if record["is_default"]), STANDARD_QUOTE_TEMPLATE_ID)
+                self.send_json({
+                    "templates": [
+                        quote_template_summary(record, default_id)
+                        for record in [standard_quote_template_record(), *saved]
+                    ],
+                    "default_template_id": default_id,
+                    "limit": store.limit,
+                    "saved_count": len(saved),
+                })
+                return True
+            if method == "GET":
+                record = standard_quote_template_record() if target == STANDARD_QUOTE_TEMPLATE_ID else store.get(target)
+                if record is None:
+                    self.send_json({"error": "Not found"}, status=404)
+                    return True
+                default = store.default()
+                summary = quote_template_summary(record, default["id"] if default else STANDARD_QUOTE_TEMPLATE_ID)
+                self.send_json({"template": {**summary, "definition": record["definition"]}})
+                return True
+            if method == "POST" and target == "default":
+                template_id = payload.get("template_id")
+                if not isinstance(template_id, str):
+                    raise ValueError("Template id is required.")
+                self.send_json({"status": "saved", "default_template_id": store.set_default(template_id)})
+                return True
+            if method == "DELETE":
+                raw_save_number = parse_qs(parsed.query).get("save_number", [""])[0]
+                if not raw_save_number.isdecimal():
+                    raise ValueError("Template save number is required.")
+                store.delete(target, int(raw_save_number))
+                self.send_json({"status": "deleted"})
+                return True
+            if method == "POST":
+                if target is None:
+                    record = store.create(payload.get("definition"))
+                else:
+                    record = store.update(target, payload.get("definition"), payload.get("save_number"))
+                default = store.default()
+                self.send_json({
+                    "status": "saved",
+                    "template": quote_template_summary(record, default["id"] if default else STANDARD_QUOTE_TEMPLATE_ID),
+                })
+                return True
+        except SqagStorageAccessError as exc:
+            self.send_json(storage_access_error_payload(exc), status=exc.status)
+            return True
+        except ValueError as exc:
+            self.send_json({"status": "blocked", "errors": safe_error_messages([str(exc)])}, status=400)
+            return True
+        self.send_json({"error": "Not found"}, status=404)
+        return True
 
     def current_ai_log_tracking(self) -> dict[str, Any]:
         return ai_log_tracking_metadata(self.current_auth_session())

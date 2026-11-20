@@ -15247,10 +15247,24 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "/api/settings/pricing-references/example-pack",
             "/api/settings/profiles",
             "/api/settings/profiles/example-profile",
+            "/api/settings/quote-templates",
+            "/api/settings/quote-templates/tpl-0123456789abcdef0123456789abcdef",
+            "/api/settings/quote-templates/default",
+            "/api/settings/quote-templates/preview",
             "/api/log",
         ):
             with self.subTest(path=path):
                 self.assertIn(webapp.rate_limit_path_key(path), webapp.POST_RATE_LIMITS)
+        # Template saves, deletes and default changes share one id bucket; checking a draft has its own lower cap.
+        self.assertEqual(
+            webapp.rate_limit_path_key("/api/settings/quote-templates/tpl-0123456789abcdef0123456789abcdef?save_number=1"),
+            "/api/settings/quote-templates/:id",
+        )
+        self.assertEqual(webapp.rate_limit_path_key("/api/settings/quote-templates/preview"), "/api/settings/quote-templates/preview")
+        self.assertLess(
+            webapp.POST_RATE_LIMITS["/api/settings/quote-templates/preview"],
+            webapp.POST_RATE_LIMITS["/api/settings/quote-templates"],
+        )
 
         webapp.RATE_LIMIT_BUCKETS.clear()
         dynamic_path = "/api/settings/pricing-references/example-pack"
