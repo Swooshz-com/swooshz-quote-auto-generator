@@ -15,6 +15,11 @@ Profiles without a template keep using their own layout workbook exactly as
 today. Storage, permissions, the editor and choosing a template for a profile
 come in later slices.
 
+`scripts/generate_quote.py` renders a quote with a template through
+`write_template_quote_xlsx`, or from the command line with
+`--quote-template PATH`. It builds a new workbook with the standard library
+only and writes all text as inline strings.
+
 ## Reading rules
 
 - **Default-deny.** Every object lists its keys below. An unknown key, a missing
@@ -71,11 +76,14 @@ columns, inside the grid) and an optional `style` (`font`, `size_pt`, `bold`,
 - **Body blocks** flow down the page in list order. Optional `gap_before`
   (0 to 10 blank rows, default 1) and `beside` (default false): a block with
   `beside: true` shares the previous block's rows and must not overlap its
-  columns. The item table and totals always stand on their own rows.
+  columns. The item table and totals always stand on their own rows. A block
+  with nothing to show (a quote without notes) takes no rows and its gap is
+  skipped. Blocks that do not fit on a page move to the next one, below the
+  repeated item-table header.
 
 | Type | Area | Extra keys | Count |
 | --- | --- | --- | --- |
-| `logo` | header | `logo`: `width_mm` 5 to 120, `height_mm` 5 to 80, `align`, `valign` (`top`, `middle`, `bottom`), `keep_aspect`, `repeat` (also show it at the same place on every later page) | at most 1 |
+| `logo` | header | `logo`: `width_mm` 5 to 120, `height_mm` 5 to 80 (the picture's box, which may extend past the block's cells), `align`, `valign` (`top`, `middle`, `bottom`: place the box inside the block's cells), `keep_aspect`, `repeat` (also show it at the same place on every later page) | at most 1 |
 | `company_details` | header | `fields` from `header_lines`, `project_number`, `blank` | at most 1 |
 | `client_details` | header | `fields` from `client_name`, `client_address`, `attention`, `client_title`, `blank`; `address_rows` 1 to 6; `indent_cols` 0 to span-1 | at most 1 |
 | `quote_details` | header | `fields` from `quote_date`, `project_title`, `project_number`, `blank` | at most 1 |

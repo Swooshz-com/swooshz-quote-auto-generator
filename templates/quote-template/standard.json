@@ -54,7 +54,7 @@
         {"key": "amount", "label": "Estimate", "col": 5, "span": 1, "align": "right"}
       ]
     },
-    {"type": "totals", "area": "body", "col": 4, "span": 3, "gap_before": 1, "label_col": 4, "currency_col": 6},
+    {"type": "totals", "area": "body", "col": 4, "span": 3, "gap_before": 2, "label_col": 4, "currency_col": 6},
     {
       "type": "free_text", "area": "body", "col": 1, "span": 9, "gap_before": 2,
       "heading": "The above quote excludes:",

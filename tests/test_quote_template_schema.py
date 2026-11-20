@@ -224,6 +224,10 @@ class HostileDefinitionTest(unittest.TestCase):
             "too many free text": (lambda d: d["blocks"].extend(copy.deepcopy(block(d, "free_text")) for _ in range(10)), "blocks"),
             "too many blocks": (lambda d: d["blocks"].extend([copy.deepcopy(block(d, "free_text"))] * 20), "blocks"),
             "empty free text": (lambda d: block(d, "free_text").update({"heading": "", "lines": [" "]}), "blocks[6]"),
+            "header free text overflows rows": (lambda d: d["blocks"].append({
+                "type": "free_text", "area": "header", "row": 1, "rows": 1, "col": 1, "span": 3,
+                "heading": "Quotation", "lines": ["Valid for 30 days"],
+            }), "blocks[11].rows"),
             "terms with one column": (lambda d: block(d, "terms").update({"span": 1}), "blocks[7].span"),
             "client fields overflow rows": (lambda d: block(d, "client_details").update({"address_rows": 5}), "blocks[2].rows"),
             "quote fields overflow rows": (lambda d: block(d, "quote_details")["fields"].append("project_number"), "blocks[3].rows"),

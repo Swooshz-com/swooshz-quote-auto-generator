@@ -309,6 +309,9 @@ def _read_block(value: Any, index: int, grid_columns: int, header_rows: int) -> 
             _refuse(path, "free text needs a heading or at least one line")
         if area == "body" and block["lines"] and span < 2:
             _refuse(f"{path}.span", "must be at least 2 when the text has lines under a heading")
+        needed = bool(block["heading"]) + len(block["lines"])
+        if area == "header" and needed > block["rows"]:
+            _refuse(f"{path}.rows", f"must be at least {needed} to fit the heading and lines")
     return block
 
 
@@ -428,7 +431,7 @@ def parse_quote_template_json(raw: bytes | str) -> Any:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         _refuse("definition", "is not UTF-8 text")
-    if text.startswith("﻿"):
+    if text.startswith("\ufeff"):
         _refuse("definition", "starts with a byte order mark")
     try:
         return json.loads(text, object_pairs_hook=_reject_duplicate_keys, parse_constant=_reject_constant)
