@@ -27,6 +27,14 @@ XDR = "{http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing}"
 A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
 EMU_PER_MM = 36_000
 BUNDLED_LAYOUT = ROOT / "templates" / "quote-layout" / "quotation-layout.xlsx"
+# The bundled workbook sets 18.7 pt on rows 1 to 89 and nothing else of that height. Rows after 89
+# keep stray heights (the sheet default 17 pt, 17.35 pt, 17.7 pt) that no layout asks for, so Standard
+# keeps its designed 18.7 pt there. That is the one accepted row height difference (docs/quote-template-schema.md).
+BUNDLED_DESIGNED_HEIGHT_PT = 18.7
+BUNDLED_DESIGNED_ROWS_END = 89
+BUNDLED_STRAY_HEIGHTS_PT = {17.0, 17.35, 17.7}
+# The bundled text box offsets are stored in EMU to the nearest value; 720 EMU is 0.02 mm.
+TEXT_BOX_TOLERANCE_EMU = 720
 FIXTURE_CATALOG = (
     ROOT / "tests" / "fixtures" / "quote-generator" / "pricing-references"
     / "synthetic-exhibition-fixture-pricing" / "pricing-catalog.json"
@@ -243,6 +251,63 @@ def full_summary(path, grid_columns):
     return {**workbook_summary(path, grid_columns), **appearance_summary(path)}
 
 
+def cell_alignments(path):
+    """Effective horizontal alignment of every cell that holds text, a number or a formula. General
+    alignment reads as left for text and right for numbers, as Excel shows it."""
+    with zipfile.ZipFile(path) as archive:
+        sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+        styles = ET.fromstring(archive.read("xl/styles.xml"))
+    xfs = styles.find(f"{M}cellXfs").findall(f"{M}xf")
+    result = {}
+    for cell in sheet.iter(f"{M}c"):
+        if cell.find(f"{M}f") is not None:
+            kind = "number"
+        elif cell.get("t") == "inlineStr":
+            if not "".join(node.text or "" for node in cell.iter(f"{M}t")):
+                continue
+            kind = "text"
+        elif cell.get("t") is None and cell.find(f"{M}v") is not None:
+            kind = "number"
+        else:
+            continue
+        alignment = xfs[int(cell.get("s", "0"))].find(f"{M}alignment")
+        horizontal = alignment.get("horizontal") if alignment is not None else None
+        result[cell.get("r")] = horizontal or ("left" if kind == "text" else "right")
+    return result
+
+
+def row_heights(path):
+    """Rows 1 to the last row written: (height in points, whether the height is fixed). A row with no
+    height of its own takes the sheet default and is not fixed, so Excel may size it to its content."""
+    with zipfile.ZipFile(path) as archive:
+        sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+    default = float(sheet.find(f"{M}sheetFormatPr").get("defaultRowHeight"))
+    rows = sheet.findall(f"{M}sheetData/{M}row")
+    explicit = {int(row.get("r")): (float(row.get("ht")), row.get("customHeight") == "1") for row in rows if row.get("ht")}
+    last = max(int(row.get("r")) for row in rows)
+    return {number: explicit.get(number, (default, False)) for number in range(1, last + 1)}
+
+
+def text_box_markers(path):
+    """Where the company details text box starts and ends, as (col, colOff, row, rowOff) tuples."""
+    with zipfile.ZipFile(path) as archive:
+        if "xl/drawings/drawing1.xml" not in archive.namelist():
+            return None
+        drawing = ET.fromstring(archive.read("xl/drawings/drawing1.xml"))
+    for anchor in drawing:
+        if anchor.find(f"{XDR}sp") is None:
+            continue
+        return {
+            tag: tuple(int(anchor.findtext(f"{XDR}{tag}/{XDR}{name}")) for name in ("col", "colOff", "row", "rowOff"))
+            for tag in ("from", "to")
+        }
+    return None
+
+
+def layout_details(path):
+    return {"alignments": cell_alignments(path), "heights": row_heights(path), "text_box": text_box_markers(path)}
+
+
 def cached_formula_values(path):
     """The results saved with each formula, which a viewer shows before it recalculates."""
     with zipfile.ZipFile(path) as archive:
@@ -287,11 +352,13 @@ class StandardTemplateEquivalenceTest(unittest.TestCase):
         cls.standard = qt.load_standard_quote_template()
         cls.grid_columns = len(cls.standard["grid"]["columns"])
         cls.legacy = {}
+        cls.legacy_details = {}
         for name, (brief, lines) in EQUIVALENCE_CASES.items():
             with tempfile.TemporaryDirectory() as tmp:
                 path = Path(tmp) / "legacy.xlsx"
                 quote.write_quote_layout_xlsx(BUNDLED_LAYOUT, path, copy.deepcopy(brief), lines)
                 cls.legacy[name] = full_summary(path, cls.grid_columns)
+                cls.legacy_details[name] = layout_details(path)
 
     def template_summaries(self, definition):
         summaries = {}
@@ -301,11 +368,50 @@ class StandardTemplateEquivalenceTest(unittest.TestCase):
             summaries[name] = full_summary(path, self.grid_columns)
         return summaries
 
+    def template_details(self, definition):
+        details = {}
+        for name, (brief, lines) in EQUIVALENCE_CASES.items():
+            tmp, path = render(definition, copy.deepcopy(brief), lines)
+            self.addCleanup(tmp.cleanup)
+            details[name] = layout_details(path)
+        return details
+
     def test_standard_template_matches_the_bundled_layout(self):
         for name, template in self.template_summaries(self.standard).items():
             with self.subTest(case=name):
                 for key, legacy_value in self.legacy[name].items():
                     self.assertEqual(template[key], legacy_value, key)
+
+    def test_standard_matches_the_bundled_alignment_row_heights_and_text_box(self):
+        for name, template in self.template_details(self.standard).items():
+            legacy = self.legacy_details[name]
+            with self.subTest(case=name, part="alignment"):
+                differing = {
+                    ref: (legacy["alignments"][ref], template["alignments"].get(ref))
+                    for ref in legacy["alignments"] if legacy["alignments"][ref] != template["alignments"].get(ref)
+                }
+                self.assertEqual(differing, {}, "cell alignment as (legacy, template)")
+            with self.subTest(case=name, part="row heights"):
+                for row, legacy_height in legacy["heights"].items():
+                    template_height = template["heights"][row]
+                    if row <= BUNDLED_DESIGNED_ROWS_END:
+                        self.assertEqual(legacy_height, (BUNDLED_DESIGNED_HEIGHT_PT, True), f"row {row} in the bundled layout")
+                        self.assertEqual(template_height, legacy_height, f"row {row} height and fixed flag")
+                    else:
+                        self.assertIn(legacy_height[0], BUNDLED_STRAY_HEIGHTS_PT | {BUNDLED_DESIGNED_HEIGHT_PT}, f"row {row}")
+                        self.assertEqual(template_height, (BUNDLED_DESIGNED_HEIGHT_PT, True), f"row {row} height and fixed flag")
+            with self.subTest(case=name, part="text box"):
+                legacy_box, template_box = legacy["text_box"], template["text_box"]
+                self.assertIsNotNone(legacy_box)
+                self.assertIsNotNone(template_box)
+                for edge in ("from", "to"):
+                    self.assertEqual(template_box[edge][0], legacy_box[edge][0], f"{edge} column")
+                    self.assertEqual(template_box[edge][2], legacy_box[edge][2], f"{edge} row")
+                    for index in (1, 3):
+                        self.assertLessEqual(
+                            abs(template_box[edge][index] - legacy_box[edge][index]), TEXT_BOX_TOLERANCE_EMU,
+                            f"{edge} offset index {index}: legacy {legacy_box[edge]}, template {template_box[edge]}",
+                        )
 
     def test_changes_to_the_standard_template_are_caught(self):
         # Each change is a valid template, so only the comparison with the bundled layout can catch it.

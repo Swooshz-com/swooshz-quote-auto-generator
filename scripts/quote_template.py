@@ -253,7 +253,8 @@ def _read_block(value: Any, index: int, grid_columns: int, header_rows: int) -> 
         _refuse(f"{path}.area", f"a {block_type} block belongs in the body")
     place = ("row", "rows") if area == "header" else ()
     body_optional = ("beside", "gap_before") if area == "body" else ()
-    _object(value, path, ("type", "area", "col", "span") + place + TYPE_KEYS[block_type], ("style",) + body_optional)
+    box_optional = ("box",) if block_type == "company_details" else ()
+    _object(value, path, ("type", "area", "col", "span") + place + TYPE_KEYS[block_type], ("style",) + body_optional + box_optional)
 
     col = _integer(value["col"], f"{path}.col", 1, grid_columns)
     span = _integer(value["span"], f"{path}.span", 1, grid_columns)
@@ -282,6 +283,7 @@ def _read_block(value: Any, index: int, grid_columns: int, header_rows: int) -> 
         }
     elif block_type == "company_details":
         block["fields"] = _fields(value["fields"], f"{path}.fields", COMPANY_FIELDS)
+        block["box"] = _read_company_box(value.get("box", {}), f"{path}.box")
     elif block_type == "client_details":
         block["fields"] = _fields(value["fields"], f"{path}.fields", CLIENT_FIELDS)
         block["address_rows"] = _integer(value["address_rows"], f"{path}.address_rows", 1, 6)
@@ -318,6 +320,16 @@ def _read_block(value: Any, index: int, grid_columns: int, header_rows: int) -> 
     return block
 
 
+def _read_company_box(value: Any, path: str) -> dict[str, float]:
+    """Where the company details text box starts and stops inside its cells, as offsets in mm.
+
+    left_mm and top_mm move the box's top-left corner in from the block's top-left corner, right_mm
+    stops the box that far short of the block's right edge. Missing keys mean no offset.
+    """
+    box = _object(value, path, (), ("left_mm", "top_mm", "right_mm"))
+    return {key: _number(box.get(key, 0), f"{path}.{key}", 0, 20) for key in ("left_mm", "top_mm", "right_mm")}
+
+
 def _field_rows(block: dict[str, Any]) -> int:
     """Rows a cell-based header block needs: the address takes address_rows, attention a label and a name row."""
     sizes = {"client_address": block.get("address_rows", 1), "attention": 2}
@@ -329,7 +341,7 @@ def _read_table_columns(value: Any, path: str, block_col: int, block_span: int) 
     used: set[int] = set()
     for index, column in enumerate(_list(value, path, 2, MAX_TABLE_COLUMNS)):
         column_path = f"{path}[{index}]"
-        column = _object(column, column_path, ("key", "label", "col", "span", "align"))
+        column = _object(column, column_path, ("key", "label", "col", "span", "align"), ("item_align",))
         key = _choice(column["key"], f"{column_path}.key", TABLE_COLUMN_KEYS)
         if any(existing["key"] == key for existing in columns):
             _refuse(f"{column_path}.key", "is listed twice")
@@ -342,12 +354,16 @@ def _read_table_columns(value: Any, path: str, block_col: int, block_span: int) 
         if cells & used:
             _refuse(f"{column_path}.col", "overlaps another table column")
         used |= cells
+        align = _choice(column["align"], f"{column_path}.align", ALIGNMENTS)
+        # Item rows may align differently from the heading and section rows (item numbers are
+        # centred while section numbers are left); item_align defaults to align.
         columns.append({
             "key": key,
             "label": _text(column["label"], f"{column_path}.label", 40),
             "col": col,
             "span": span,
-            "align": _choice(column["align"], f"{column_path}.align", ALIGNMENTS),
+            "align": align,
+            "item_align": _choice(column.get("item_align", align), f"{column_path}.item_align", ALIGNMENTS),
         })
     keys = {column["key"] for column in columns}
     for required in ("description", "amount"):
