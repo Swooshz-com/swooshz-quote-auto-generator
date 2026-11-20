@@ -1,0 +1,73 @@
+{
+  "schema": "sqag.quote-template.v1",
+  "name": "Standard",
+  "page": {
+    "size": "A4",
+    "orientation": "portrait",
+    "margins_mm": {"left": 21, "right": 10, "top": 19, "bottom": 19, "header": 8, "footer": 8},
+    "row_height_pt": 18.7,
+    "first_page_rows": 55,
+    "page_rows": 61,
+    "continuation_top_rows": 2
+  },
+  "header": {"rows": 19, "repeat_rows": 2},
+  "grid": {
+    "columns": [
+      {"width": 6.125},
+      {"width": 10.5},
+      {"width": 49.375},
+      {"width": 14},
+      {"width": 15.5},
+      {"width": 7.625},
+      {"width": 15, "hidden": true},
+      {"width": 16.375, "hidden": true},
+      {"width": 26.875}
+    ]
+  },
+  "theme": {"font": "Calibri", "size_pt": 13, "color": "#000000", "heading_color": "#000000"},
+  "labels": {"total": "Total", "attention": "Attention:", "project_number": "Project No:"},
+  "blocks": [
+    {
+      "type": "logo", "area": "header", "row": 2, "rows": 2, "col": 9, "span": 1,
+      "logo": {"width_mm": 47.8, "height_mm": 18.1, "align": "left", "valign": "top", "keep_aspect": true}
+    },
+    {
+      "type": "company_details", "area": "header", "row": 4, "rows": 16, "col": 9, "span": 1,
+      "fields": ["header_lines", "blank", "project_number"],
+      "style": {"size_pt": 9}
+    },
+    {
+      "type": "client_details", "area": "header", "row": 6, "rows": 8, "col": 1, "span": 3,
+      "fields": ["client_name", "client_address", "attention", "client_title"],
+      "address_rows": 4, "indent_cols": 1
+    },
+    {
+      "type": "quote_details", "area": "header", "row": 16, "rows": 3, "col": 1, "span": 3,
+      "fields": ["quote_date", "blank", "project_title"]
+    },
+    {
+      "type": "item_table", "area": "body", "col": 1, "span": 5, "gap_before": 0, "currency_row": true,
+      "columns": [
+        {"key": "position", "label": "Pos.", "col": 1, "span": 1, "align": "left"},
+        {"key": "quantity", "label": "Quantity", "col": 2, "span": 1, "align": "center"},
+        {"key": "description", "label": "Service", "col": 3, "span": 2, "align": "left"},
+        {"key": "amount", "label": "Estimate", "col": 5, "span": 1, "align": "right"}
+      ]
+    },
+    {"type": "totals", "area": "body", "col": 4, "span": 3, "gap_before": 1, "label_col": 4, "currency_col": 6},
+    {
+      "type": "free_text", "area": "body", "col": 1, "span": 9, "gap_before": 2,
+      "heading": "The above quote excludes:",
+      "lines": [
+        "Organiser Admin Fees",
+        "Power sockets which can be directly ordered with connection fees with the organiser",
+        "Connection fees for electrical fittings"
+      ],
+      "style": {"size_pt": 10, "color": "#FF0000"}
+    },
+    {"type": "terms", "area": "body", "col": 1, "span": 9, "gap_before": 1, "style": {"size_pt": 10}},
+    {"type": "notes", "area": "body", "col": 1, "span": 9, "gap_before": 1, "style": {"size_pt": 10}},
+    {"type": "signature", "area": "body", "col": 2, "span": 3, "gap_before": 2, "style": {"size_pt": 10}},
+    {"type": "acceptance", "area": "body", "col": 5, "span": 5, "beside": true, "style": {"size_pt": 10}}
+  ]
+}
