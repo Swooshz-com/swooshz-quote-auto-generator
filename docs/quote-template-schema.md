@@ -63,7 +63,11 @@ only and writes all text as inline strings.
 larger than the top or bottom margin). `row_height_pt` is 12 to 40.
 `first_page_rows` and `page_rows` (20 to 150) are the printable rows on page 1
 and on each later page; `continuation_top_rows` (0 to 10, default 2) is the gap
-above the repeated item-table header on later pages.
+above the repeated item-table header on later pages. The rows must fit the
+paper: the sheet prints scaled to the width of the visible columns, so page
+height divided by that scaled row height limits the rows per page. Too many
+rows spill onto extra printed pages. The reader cannot check this exactly
+(the print scale depends on the PDF renderer), so the editor must preview it.
 
 ## Blocks
 

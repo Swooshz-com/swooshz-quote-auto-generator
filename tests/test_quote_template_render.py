@@ -159,7 +159,7 @@ def custom_template():
         "page": {
             "size": "A4", "orientation": "portrait",
             "margins_mm": {"left": 12, "right": 12, "top": 15, "bottom": 15, "header": 6, "footer": 6},
-            "row_height_pt": 16, "first_page_rows": 50, "page_rows": 56, "continuation_top_rows": 1,
+            "row_height_pt": 16, "first_page_rows": 40, "page_rows": 44, "continuation_top_rows": 1,
         },
         "header": {"rows": 7},
         "grid": {"columns": [{"width": 40}, {"width": 9}, {"width": 8}, {"width": 13}, {"width": 15}, {"width": 7}, {"width": 12}]},
