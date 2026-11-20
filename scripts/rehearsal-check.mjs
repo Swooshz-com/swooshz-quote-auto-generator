@@ -62,7 +62,7 @@ import { signIn } from "./internal-password-browser-test.mjs";
 import { pdfFontNames, unexpectedPdfFonts, validatePdf, validateXlsx } from "./lib/artifact-checks.mjs";
 import { AI_CAP_MAX_USD, AI_PRICING_ENRICHMENT_USD, AiCapError, loadBudget, reportedUsd, saveBudget } from "./lib/ai-budget.mjs";
 import { derivedReasons, ManifestError, targetsDocument, validateManifest, walkTargets } from "./lib/live-cases.mjs";
-import { byteBudget, CLICK_COUNT_BUDGET, groupActions, installClickProbe, judgeClickCounts, lineButton, linesIn, measureClicks } from "./lib/basis-click-probe.mjs";
+import { byteBudget, CLICK_COUNT_BUDGET, CLICK_WINDOW_MS, groupActions, installClickProbe, judgeClickCounts, lineButton, linesIn, measureClicks } from "./lib/basis-click-probe.mjs";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -1084,7 +1084,11 @@ async function clickBudgetOnQuote(run, sessionId) {
     await page.goto(`${run.baseUrl}/`, { waitUntil: "domcontentloaded", timeout: 30000 });
     await page.locator(`#dashboardSessionsList [data-quote-session-id="${sessionId}"]`).waitFor({ state: "attached", timeout: 30000 });
     assert(await page.evaluate((id) => modifyDashboardQuote(id), sessionId) === true, "The quote did not reopen for the click probe.");
+    // A reopened quote may open on another panel: open Quote Basis as a user would, then let
+    // any save the switch armed finish before the first measured click.
+    await page.locator("#quoteBasisButton").click();
     await page.locator("#basisReviewSurface li[data-basis-key]").first().waitFor({ state: "visible", timeout: 30000 });
+    await page.waitForTimeout(CLICK_WINDOW_MS);
     // The quote's own size sets the byte budgets (a click copies it once, a save about three times).
     const quoteBytes = await page.evaluate(() => JSON.stringify(currentQuoteSessionDraftState()).length);
     const budget = byteBudget(CLICK_COUNT_BUDGET, quoteBytes);
