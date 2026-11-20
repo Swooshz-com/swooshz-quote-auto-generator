@@ -64,11 +64,32 @@ only and writes all text as inline strings.
 larger than the top or bottom margin). `row_height_pt` is 12 to 40.
 `first_page_rows` and `page_rows` (20 to 150) are the printable rows on page 1
 and on each later page; `continuation_top_rows` (0 to 10, default 2) is the gap
-above the repeated item-table header on later pages. The rows must fit the
-paper: the sheet prints scaled to the width of the visible columns, so page
-height divided by that scaled row height limits the rows per page. Too many
-rows spill onto extra printed pages. The reader cannot check this exactly
-(the print scale depends on the PDF renderer), so the editor must preview it.
+above the repeated item-table header on later pages.
+
+The reader refuses a layout its pages cannot hold (paths `page.first_page_rows`,
+`page.page_rows`). The sheet prints fit to one page wide: the scale is the
+printable width over the visible columns' width (at most 1), and each row takes
+`row_height_pt` times that scale. Printable height is A4 height less the top and
+bottom margins, and the paper is landscape-swapped when `orientation` is
+`landscape`. One width unit counts as 6.1 pt (`WIDTH_UNIT_POINTS` in
+`scripts/quote_template.py`). That constant is calibrated so the bundled layout's
+61 rows at 18.7 pt still fit; it is not measured in Excel (Excel's 7-pixel unit
+is 5.25 pt and would allow 52 rows on Standard). The PDF smoke test checks the
+real print. Rows left for items: at least 20 on the first page after the header
+and table header (`header.rows`), and at least 20 on a later page after the
+continuation rows and table header (`page.continuation_top_rows`). The
+description column must span at least 30 visible width units (`blocks[i].columns[j]`).
+A line item taller than a later page is refused at render time with a
+`QuoteTemplateError` at `page.page_rows`.
+
+Item rows may align differently from the heading and section rows: an item-table
+column's optional `item_align` (`left`, `center` or `right`, default `align`)
+sets its item cells. Standard uses it to centre item numbers while section numbers
+stay left.
+
+A `company_details` block may take an optional `box`: `left_mm`, `top_mm` and
+`right_mm` (0 to 20, default 0) move the company details text box in from the
+block's top-left corner and stop it short of the block's right edge.
 
 ## Blocks
 
@@ -125,3 +146,12 @@ client details and quote details on the left, the `Pos.`, `Quantity`,
 `Service`, `Estimate` table, totals in D to F, the red exclusions text, terms,
 notes, and the signature and acceptance side by side. `tests/test_quote_template_schema.py`
 checks it against the bundled workbook so the two cannot drift apart.
+`tests/test_quote_template_render.py` compares the rendered Standard quote with
+the bundled one: cell text, alignment, row heights and the text box.
+
+One difference is accepted. The bundled workbook sets 18.7 pt only on rows 1 to
+89; its later rows keep stray heights (the sheet default 17 pt, and 17.35 pt and
+17.7 pt on a few rows) that no layout asks for. Standard keeps 18.7 pt on every
+row, so on quotes longer than 89 rows the later pages have a slightly taller row
+pitch. Matching the stray heights would need per-row data, and it is recorded
+here until an owner decides otherwise.

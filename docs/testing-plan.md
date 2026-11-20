@@ -718,7 +718,8 @@ the owner-approved CI lane.
   table and totals and the layout rules in `docs/quote-template-schema.md`. It
   also checks the Standard template against the bundled quotation layout
   (widths, hidden columns, margins, logo repeat, page rows, labels, exclusions
-  text and body font), so changing either one alone fails.
+  text and body font), so changing either one alone fails. The rendered output
+  is compared with the bundled layout by `tests.test_quote_template_render`.
 - Quote template rendering: run
   `python -m unittest tests.test_quote_template_render`. It renders synthetic
   quotes with the Standard template and with the bundled layout workbook and
