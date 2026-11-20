@@ -71,11 +71,15 @@ The reader refuses a layout its pages cannot hold (paths `page.first_page_rows`,
 printable width over the visible columns' width (at most 1), and each row takes
 `row_height_pt` times that scale. Printable height is A4 height less the top and
 bottom margins, and the paper is landscape-swapped when `orientation` is
-`landscape`. One width unit counts as 6.1 pt (`WIDTH_UNIT_POINTS` in
-`scripts/quote_template.py`). That constant is calibrated so the bundled layout's
-61 rows at 18.7 pt still fit; it is not measured in Excel (Excel's 7-pixel unit
-is 5.25 pt and would allow 52 rows on Standard). The PDF smoke test checks the
-real print. Rows left for items: at least 20 on the first page after the header
+`landscape`. A width unit is the widest digit of the sheet's Normal font, which
+the renderer sets to `theme.font` at `theme.size_pt`, so a smaller or narrower
+font holds fewer rows (`width_unit_points` in `scripts/quote_template.py`). The
+digit is 1038/2048 em in Calibri (Carlito) and 1139/2048 em in Arial (Liberation
+Sans); the reader takes the smaller of that exact width (LibreOffice) and Excel's
+whole-pixel width at 96 dpi. Standard (Calibri 13: 6.59 pt exact, 9 px in Excel)
+holds 66 rows of 18.7 pt; at Calibri 11 (7 px, 5.25 pt) it would hold 52. The
+CI PDF smoke prints Standard, a custom layout and Standard at Calibri 9 at its
+45-row limit. Rows left for items: at least 20 on the first page after the header
 and table header (`header.rows`), and at least 20 on a later page after the
 continuation rows and table header (`page.continuation_top_rows`). The
 description column must span at least 30 visible width units (`blocks[i].columns[j]`).
@@ -89,7 +93,10 @@ stay left.
 
 A `company_details` block may take an optional `box`: `left_mm`, `top_mm` and
 `right_mm` (0 to 20, default 0) move the company details text box in from the
-block's top-left corner and stop it short of the block's right edge.
+block's top-left corner and stop it short of the block's right edge. The reader
+refuses a box whose left and right margins fill the block's visible width, or
+whose top margin reaches its last row (`blocks[i].box`); the width is the smaller
+of the renderer's placement width and the theme font's printed width.
 
 ## Blocks
 

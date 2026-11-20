@@ -720,6 +720,8 @@ the owner-approved CI lane.
   (widths, hidden columns, margins, logo repeat, page rows, labels, exclusions
   text and body font), so changing either one alone fails. The rendered output
   is compared with the bundled layout by `tests.test_quote_template_render`.
+  Page-fit cases check each font's row limit at its boundary (small and large
+  Calibri and Arial sizes) and the company details box room.
 - Quote template rendering: run
   `python -m unittest tests.test_quote_template_render`. It renders synthetic
   quotes with the Standard template and with the bundled layout workbook and
@@ -729,8 +731,8 @@ the owner-approved CI lane.
   header blocks, fonts and colours, logo size, place and repeat, and the totals
   formulas follow the template; that template and quote text never becomes a
   live formula; and the `--quote-template` option of `scripts/generate_quote.py`.
-  Its LibreOffice PDF smoke prints Standard and the changed template on the
-  expected number of pages with all text inside the page; it skips locally
+  Its LibreOffice PDF smoke prints Standard, the changed template and Standard
+  at Calibri 9 at its largest accepted row count on the expected number of pages with all text inside the page; it skips locally
   without LibreOffice and fails in CI if LibreOffice is missing. Changes to the
   legacy layout path also run `tests.test_generate_quote`,
   `tests.test_profile_layout_safety` and `tests.test_quote_exclusions`.

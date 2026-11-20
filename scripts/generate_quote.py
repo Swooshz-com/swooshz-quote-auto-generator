@@ -4529,7 +4529,7 @@ class TemplateQuoteRenderer:
 
     def _column_emu(self, col: int) -> int:
         column = self.grid[col - 1]
-        return 0 if column["hidden"] else round(column["width"] * 7 + 5) * EMU_PER_PIXEL
+        return 0 if column["hidden"] else quote_template.grid_column_pixels(column["width"]) * EMU_PER_PIXEL
 
     def _row_emu(self) -> int:
         return round(float(self.row_height) * EMU_PER_POINT)

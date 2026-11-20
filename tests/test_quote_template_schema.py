@@ -349,13 +349,48 @@ class PageFitTest(unittest.TestCase):
         )
 
     def test_rows_per_page_stop_at_what_the_paper_holds(self):
-        # The bundled layout's 61 continuation rows at 18.7 pt are the most A4 holds at its width.
-        qt.read_quote_template(mutated(lambda d: d["page"].update({"page_rows": 61})))
-        self.assert_refused(mutated(lambda d: d["page"].update({"page_rows": 62})), "page.page_rows")
+        # Standard (Calibri 13) holds 66 rows of 18.7 pt: the digit is 6.59 pt exact (LibreOffice), 9 px in Excel.
+        qt.read_quote_template(mutated(lambda d: d["page"].update({"page_rows": 66})))
+        self.assert_refused(mutated(lambda d: d["page"].update({"page_rows": 67})), "page.page_rows")
         self.assert_refused(mutated(lambda d: d["page"].update({"first_page_rows": 80})), "page.first_page_rows")
         # Taller rows or a landscape page hold fewer rows; a first page of 20 rows fits either, so page_rows is what is refused.
         self.assert_refused(mutated(lambda d: d["page"].update({"row_height_pt": 40, "first_page_rows": 20, "page_rows": 61})), "page.page_rows")
         self.assert_refused(mutated(lambda d: d["page"].update({"orientation": "landscape", "first_page_rows": 20})), "page.page_rows")
+
+    def test_the_theme_font_sets_how_many_rows_fit(self):
+        # Columns are sized in the theme font's widest digit, so a smaller or narrower font prints the same
+        # grid narrower, at a larger scale, with fewer rows a page. Limits for Standard's grid, margins and
+        # 18.7 pt rows, worked out from the digit widths (Calibri 1038/2048 em, Arial 1139/2048 em), using
+        # the smaller of the exact width and Excel's whole-pixel width at 96 dpi.
+        limits = (
+            ("Calibri", 9, 45),    # small: 4.56 pt exact, 6 px = 4.5 pt in Excel
+            ("Calibri", 11, 52),   # 5.58 pt exact would allow 56; Excel rounds to 7 px = 5.25 pt
+            ("Calibri", 12, 60),   # 6.08 pt exact would allow 61; Excel rounds to 8 px = 6.0 pt
+            ("Arial", 10, 52),     # 5.56 pt exact would allow 55; Excel 7 px
+            ("Arial", 20, 111),    # large: 11.12 pt exact; Excel 15 px = 11.25 pt would allow 113
+            ("Calibri", 20, 101),  # large: 10.14 pt exact; Excel 14 px would allow 105
+        )
+        for font, size, rows in limits:
+            def with_font(first_page_rows, page_rows):
+                return mutated(lambda d: (
+                    d["theme"].update({"font": font, "size_pt": size}),
+                    d["page"].update({"first_page_rows": first_page_rows, "page_rows": page_rows}),
+                ))
+            first = min(rows, 55)
+            with self.subTest(font=font, size=size):
+                qt.read_quote_template(with_font(first, rows))
+                self.assert_refused(with_font(first, rows + 1), "page.page_rows")
+                if rows < 55:
+                    self.assert_refused(with_font(rows + 1, rows), "page.first_page_rows")
+        # The smallest Calibri holds 39 rows, so Standard's own 55 first-page rows are refused.
+        self.assert_refused(mutated(lambda d: d["theme"].update({"size_pt": 7})), "page.first_page_rows")
+
+    def test_width_unit_follows_the_theme_font(self):
+        self.assertEqual(qt.width_unit_points({"font": "Calibri", "size_pt": 11}), 5.25)
+        self.assertEqual(qt.width_unit_points({"font": "Calibri", "size_pt": 12}), 6.0)
+        self.assertAlmostEqual(qt.width_unit_points({"font": "Calibri", "size_pt": 13}), 13 * 1038 / 2048)
+        self.assertAlmostEqual(qt.width_unit_points({"font": "Arial", "size_pt": 20}), 20 * 1139 / 2048)
+        self.assertEqual(qt.width_unit_points({"font": "Arial", "size_pt": 7}), 3.75)
 
     def test_a_narrow_description_column_is_refused_with_its_path(self):
         # Standard's description spans grid columns C and D (49.375 + 14 units); its first column is blocks[4].columns[2].

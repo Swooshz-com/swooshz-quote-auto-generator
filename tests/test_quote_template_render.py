@@ -247,6 +247,14 @@ def custom_template():
     }
 
 
+def small_font_template():
+    """Standard at Calibri 9 with both page lengths at the largest the reader accepts for that font."""
+    definition = copy.deepcopy(STANDARD_RAW)
+    definition["theme"]["size_pt"] = 9
+    definition["page"].update({"first_page_rows": 45, "page_rows": 45})
+    return definition
+
+
 def full_summary(path, grid_columns):
     return {**workbook_summary(path, grid_columns), **appearance_summary(path)}
 
@@ -712,6 +720,66 @@ class TemplateRenderTest(unittest.TestCase):
             self.assertFalse((Path(tmp) / "quotation.xlsx").exists())
 
 
+def narrow_company_column(box, **theme):
+    """Standard with the company details column (I) narrowed to 8 width units and the given box."""
+    definition = copy.deepcopy(qt.load_standard_quote_template())
+    definition["grid"]["columns"][8]["width"] = 8
+    definition["page"].update({"first_page_rows": 41, "page_rows": 41})
+    definition["theme"].update(theme)
+    for block in definition["blocks"]:
+        if block["type"] == "logo":
+            block["logo"].update({"width_mm": 10, "height_mm": 5})
+        if block["type"] == "company_details":
+            block["box"] = box
+    return definition
+
+
+class CompanyBoxRoomTest(unittest.TestCase):
+    """A company details box must leave room inside its cells, checked when read and again when rendered."""
+
+    def setUp(self):
+        self.brief = synthetic_brief()
+        self.lines = synthetic_lines(3)
+        self.index = next(i for i, block in enumerate(qt.load_standard_quote_template()["blocks"]) if block["type"] == "company_details")
+
+    def assert_reader_refuses(self, definition):
+        with self.assertRaises(qt.QuoteTemplateError) as caught:
+            qt.read_quote_template(definition)
+        self.assertEqual(caught.exception.path, f"blocks[{self.index}].box")
+        self.assertEqual(caught.exception.message, "leaves no room for the company details inside its cells")
+
+    def test_reader_refuses_a_box_wider_than_its_column(self):
+        # 8 units place as 61 px (16.1 mm) and print as 8 Calibri 13 digits (18.6 mm): 15 mm of margins fit, 20 mm do not.
+        fits = narrow_company_column({"left_mm": 7.5, "top_mm": 0, "right_mm": 7.5})
+        qt.read_quote_template(fits)
+        with tempfile.TemporaryDirectory() as tmp:
+            quote.write_template_quote_xlsx(fits, Path(tmp) / "quotation.xlsx", self.brief, self.lines)
+            self.assertTrue((Path(tmp) / "quotation.xlsx").exists())
+        self.assert_reader_refuses(narrow_company_column({"left_mm": 10, "top_mm": 0, "right_mm": 10}))
+
+    def test_reader_uses_the_printed_width_of_a_small_font(self):
+        # At Calibri 10 the same 8 units print as 8 x 5.07 pt = 14.3 mm, narrower than the 16.1 mm placement width.
+        self.assert_reader_refuses(narrow_company_column({"left_mm": 7.5, "top_mm": 0, "right_mm": 7.5}, size_pt=10))
+        qt.read_quote_template(narrow_company_column({"left_mm": 7, "top_mm": 0, "right_mm": 7}, size_pt=10))
+
+    def test_reader_refuses_a_top_margin_below_the_block(self):
+        def one_row(top):
+            definition = narrow_company_column({"left_mm": 0, "top_mm": top, "right_mm": 0})
+            definition["blocks"][self.index]["rows"] = 1
+            return definition
+        qt.read_quote_template(one_row(6.5))  # one 18.7 pt row is 6.6 mm
+        self.assert_reader_refuses(one_row(6.7))
+
+    def test_renderer_still_refuses_a_box_with_no_room(self):
+        # A definition that reached the renderer without this reader check (for example saved by an older build).
+        read = qt.read_quote_template(narrow_company_column({"left_mm": 0, "top_mm": 0, "right_mm": 0}))
+        read["blocks"][self.index]["box"] = {"left_mm": 10, "top_mm": 0, "right_mm": 10}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(quote.quote_template, "read_quote_template", return_value=read):
+            with self.assertRaisesRegex(qt.QuoteTemplateError, rf"blocks\[{self.index}\]\.box"):
+                quote.write_template_quote_xlsx(read, Path(tmp) / "quotation.xlsx", self.brief, self.lines)
+            self.assertFalse((Path(tmp) / "quotation.xlsx").exists())
+
+
 class TemplatePdfSmokeTest(unittest.TestCase):
     """LibreOffice prints both layouts on the expected pages with nothing pushed off the page."""
 
@@ -727,6 +795,8 @@ class TemplatePdfSmokeTest(unittest.TestCase):
         layouts = {
             "standard": (qt.load_standard_quote_template(), ["Estimate", "Total including GST", "We accept the quotation"]),
             "custom": (custom_template(), ["Rate", "Subtotal", "We accept the quotation"]),
+            # A small font at the most rows the reader accepts for it (Calibri 9: 45 rows of 18.7 pt).
+            "small font": (small_font_template(), ["Estimate", "Total including GST", "We accept the quotation"]),
         }
         for name, (definition, phrases) in layouts.items():
             with self.subTest(layout=name), tempfile.TemporaryDirectory() as tmp:

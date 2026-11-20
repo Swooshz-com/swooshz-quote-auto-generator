@@ -32,11 +32,14 @@ MAX_GRID_COLUMNS = 12
 MAX_NUMBER_CHARACTERS = 32
 A4_MM = (210.0, 297.0)
 POINTS_PER_MM = 72 / 25.4
-# Printed width of one grid width unit, in points, for the fit-to-width scale of a page. The bundled
-# layout prints 61 rows of 18.7 pt on its later pages, which needs at least about 6.06 pt a unit, so 6.1
-# is used. This is calibrated to that layout, not measured in Excel: Excel's 7-pixel unit (5.25 pt)
-# would allow only 52 rows on the Standard page. The PDF smoke test checks the real print.
-WIDTH_UNIT_POINTS = 6.1
+# A grid width unit is the widest digit of the sheet's Normal font, which the renderer sets to the theme
+# font and size. Widest digit advance (0-9) of each allowed font as a fraction of the em, from the font
+# files; Carlito and Liberation Sans, which LibreOffice prints with, have the same widths.
+DIGIT_EM = {"Calibri": 1038 / 2048, "Arial": 1139 / 2048}
+PIXELS_PER_POINT = 96 / 72
+EMU_PER_MM = 36_000
+EMU_PER_POINT = 12_700
+EMU_PER_PIXEL = 9525
 # The fewest rows a page may leave for items after its header, and the narrowest description in
 # width units (about 27 characters a line), so an ordinary item still fits and wraps sensibly.
 MIN_BODY_ROWS = 20
@@ -388,7 +391,42 @@ def _visible_width_units(grid: dict[str, Any], first: int, span: int) -> float:
     return sum(column["width"] for column in grid["columns"][first - 1:first - 1 + span] if not column["hidden"])
 
 
-def printable_rows_per_page(page: dict[str, Any], grid: dict[str, Any]) -> int:
+def width_unit_points(theme: dict[str, Any]) -> float:
+    """Printed width of one grid width unit, in points, for this theme's font and size.
+
+    LibreOffice uses the digit's exact width; Excel rounds it to whole pixels at 96 dpi. The smaller of
+    the two gives the larger print scale, so a layout that fits with it fits in both.
+    """
+    exact = DIGIT_EM[theme["font"]] * theme["size_pt"]
+    whole_pixels = math.floor(exact * PIXELS_PER_POINT + 0.5) / PIXELS_PER_POINT
+    return min(exact, whole_pixels)
+
+
+def grid_column_pixels(width: float) -> int:
+    """Pixels the renderer gives a visible grid column when it places pictures and text boxes."""
+    return round(width * 7 + 5)
+
+
+def _check_company_box(page: dict[str, Any], grid: dict[str, Any], theme: dict[str, Any], blocks: list[dict[str, Any]]) -> None:
+    """Refuse a company details box whose margins leave no room inside its cells.
+
+    The width is the smaller of the renderer's placement width and the printed width of the theme
+    font's digits, so the renderer's own check cannot fail on a definition read here.
+    """
+    for index, block in enumerate(blocks):
+        if block["type"] != "company_details":
+            continue
+        columns = [column for column in grid["columns"][block["col"] - 1:block["col"] - 1 + block["span"]] if not column["hidden"]]
+        placed = sum(grid_column_pixels(column["width"]) for column in columns) * EMU_PER_PIXEL
+        printed = round(sum(column["width"] for column in columns) * width_unit_points(theme) * EMU_PER_POINT)
+        height = block["rows"] * round(page["row_height_pt"] * EMU_PER_POINT)
+        box = block["box"]
+        left, top, right = (round(box[key] * EMU_PER_MM) for key in ("left_mm", "top_mm", "right_mm"))
+        if left + right >= min(placed, printed) or top >= height:
+            _refuse(f"blocks[{index}].box", "leaves no room for the company details inside its cells")
+
+
+def printable_rows_per_page(page: dict[str, Any], grid: dict[str, Any], theme: dict[str, Any]) -> int:
     """Most rows one page of this layout can print.
 
     The sheet prints fit to one page wide: its scale is the printable width over the visible width,
@@ -398,12 +436,14 @@ def printable_rows_per_page(page: dict[str, Any], grid: dict[str, Any]) -> int:
     margins = page["margins_mm"]
     printable_width = (paper_width - margins["left"] - margins["right"]) * POINTS_PER_MM
     printable_height = (paper_height - margins["top"] - margins["bottom"]) * POINTS_PER_MM
-    visible_width = _visible_width_units(grid, 1, len(grid["columns"])) * WIDTH_UNIT_POINTS
+    visible_width = _visible_width_units(grid, 1, len(grid["columns"])) * width_unit_points(theme)
     scale = min(1.0, printable_width / visible_width)
     return math.floor(printable_height / (page["row_height_pt"] * scale) + 1e-9)
 
 
-def _check_page_fit(page: dict[str, Any], grid: dict[str, Any], blocks: list[dict[str, Any]], header_rows: int) -> None:
+def _check_page_fit(
+    page: dict[str, Any], grid: dict[str, Any], theme: dict[str, Any], blocks: list[dict[str, Any]], header_rows: int,
+) -> None:
     """Refuse a layout whose pages cannot physically hold their rows, or whose items have no room."""
     table_index, table = next((index, block) for index, block in enumerate(blocks) if block["type"] == "item_table")
     table_header = 2 if table["currency_row"] else 1
@@ -415,7 +455,7 @@ def _check_page_fit(page: dict[str, Any], grid: dict[str, Any], blocks: list[dic
                     f"blocks[{table_index}].columns[{index}]",
                     f"the description needs at least {MIN_DESCRIPTION_WIDTH_UNITS} visible width units, not {width:g}",
                 )
-    rows_fit = printable_rows_per_page(page, grid)
+    rows_fit = printable_rows_per_page(page, grid, theme)
     for key in ("first_page_rows", "page_rows"):
         if page[key] > rows_fit:
             _refuse(f"page.{key}", f"is more rows than the paper holds at this size, margins and row height (at most {rows_fit})")
@@ -572,14 +612,16 @@ def read_quote_template(value: Any) -> dict[str, Any]:
         for index, block in enumerate(_list(root["blocks"], "blocks", 2, MAX_BLOCKS))
     ]
     _check_layout(blocks, grid)
-    _check_page_fit(page, grid, blocks, header_rows)
+    theme = _read_theme(root["theme"])
+    _check_page_fit(page, grid, theme, blocks, header_rows)
+    _check_company_box(page, grid, theme, blocks)
     return {
         "schema": SCHEMA_ID,
         "name": _text(root["name"], "name", 60, allow_empty=False),
         "page": page,
         "header": {"rows": header_rows},
         "grid": grid,
-        "theme": _read_theme(root["theme"]),
+        "theme": theme,
         "labels": _read_labels(root["labels"]),
         "blocks": blocks,
     }
