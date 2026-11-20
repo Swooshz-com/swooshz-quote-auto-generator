@@ -114,6 +114,28 @@ class CurrentWorkbookReceiptTest(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "Non-numeric amount"):
             self.verify(self.mutate("xl/worksheets/sheet1.xml", swap))
 
+    def test_changed_numeric_amount_with_its_type_kept_rejects_in_its_own_row(self):
+        # A wrong number in a numeric cell, on a priced line or a total, is caught by the value check
+        # itself, not by the type check.
+        def total_cell(tree):
+            row = next(row for row in tree.findall(".//m:sheetData/m:row", NS)
+                       if any(cell.get("r") == "D" + row.get("r") and "".join(cell.itertext()) == "Total" for cell in row))
+            return next(cell for cell in row if cell.get("r") == "E" + row.get("r"))
+
+        def bump(find):
+            def edit(tree):
+                cell = find(tree)
+                self.assertIsNone(cell.get("t"))
+                value = cell.find("m:v", NS)
+                value.text = str(float(value.text) + 1)
+            return edit
+
+        cases = (("priced line", lambda tree: self.row_cell(tree, self.rows[0]["description"], "E")), ("total", total_cell))
+        for name, find in cases:
+            with self.subTest(cell=name):
+                with self.assertRaisesRegex(AssertionError, "Wrong amount in its own row: E"):
+                    self.verify(self.mutate("xl/worksheets/sheet1.xml", bump(find)))
+
     def test_included_row_must_read_the_word_included_not_a_number_or_formula(self):
         # Owner decision INT-SQAG-202611200003: an Included row reads "Included" and adds zero to the total.
         with zipfile.ZipFile(io.BytesIO(self.data)) as archive:

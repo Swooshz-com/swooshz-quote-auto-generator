@@ -2111,6 +2111,11 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             )
             for index in range(1, 46)
         ]
+        # An Included line prints the word Included in the Estimate column of the rendered PDF (#363).
+        lines.insert(0, quote.QuoteLine(
+            "Graphics", 1, "lot", "Rendered coordination service", "", "Included", None, 0.0,
+            "included", [], price_mode="Included",
+        ))
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2248,8 +2253,9 @@ class GenerateQuoteRowsTest(unittest.TestCase):
 
             first_page = first_pages[0]
             self.assertIn("Rendered Fidelity Co", first_page["text"])
-            for expected in ("Quantity", "Service", "Estimate", "2 sqm"):
+            for expected in ("Quantity", "Service", "Estimate", "2 sqm", "Rendered coordination service"):
                 self.assertIn(expected, first_page["text"])
+            self.assertRegex(first_page["text"], r"Included")
             self.assertIsNotNone(first_page["logo_bbox"])
             self.assertIsNotNone(first_page["header_bbox"])
             self.assertTrue(first_page["header_fonts"])
