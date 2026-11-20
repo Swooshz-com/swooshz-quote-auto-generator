@@ -32,6 +32,9 @@ Update this map when an entry point or source of truth moves.
 - `docs/sqag-current-status.md`: current RC verdict plus SQAG namespace cleanup
   update, module boundary, runtime data model, private asset rules, owner smoke
   checklist, audit findings, and docs cleanup summary.
+- `docs/ui-design-standard.md`: how new or changed screens look and are
+  checked, taken from the existing UI (type, colour, spacing, buttons, forms,
+  containers, status, review checklist).
 - `docs/testing-plan.md`: validation expectations for product, frontend,
   import/export, security, CI, and smoke-test changes.
 - `docs/internal-uat.md`: internal Koncept/Swooshz UAT checklist, smoke
