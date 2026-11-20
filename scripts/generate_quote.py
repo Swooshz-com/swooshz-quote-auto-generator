@@ -3192,6 +3192,9 @@ def visible_column_width_points(root: ET.Element, first: int, last: int) -> floa
     return width - 6
 
 
+QUOTE_ENTRY_TOO_TALL_MESSAGE = "A quotation line item exceeds the available page height."
+
+
 def prepare_quantity_lines(
     entries: list[dict[str, Any]], root: ET.Element, parts: dict[str, bytes] | None,
     *, columns: tuple[int, int] | None = (2, 2), font_size: float | None = None,
@@ -3227,7 +3230,7 @@ def prepare_quantity_lines(
         ]
     capacity = page.page_height - page.body_offset
     if any(quote_entry_keep_height(entries, index) > capacity for index in range(len(entries))):
-        raise ValueError("A quotation line item exceeds the available page height.")
+        raise ValueError(QUOTE_ENTRY_TOO_TALL_MESSAGE)
 
 
 def acceptance_text_lines(
@@ -4370,11 +4373,19 @@ class TemplateQuoteRenderer:
             for entry in entries:
                 if entry["kind"] == "item":
                     entry["quantity"] = entry["quantity_number"]
-        prepare_quantity_lines(
-            entries, self.root, None,
-            columns=(quantity["col"], quantity["col"] + quantity["span"] - 1) if quantity else None,
-            font_size=self._block_size(block), page=self.page,
-        )
+        try:
+            prepare_quantity_lines(
+                entries, self.root, None,
+                columns=(quantity["col"], quantity["col"] + quantity["span"] - 1) if quantity else None,
+                font_size=self._block_size(block), page=self.page,
+            )
+        except ValueError as exc:
+            if str(exc) != QUOTE_ENTRY_TOO_TALL_MESSAGE:
+                raise
+            raise quote_template.QuoteTemplateError(
+                "page.page_rows",
+                "a line item is taller than a later page at these settings; shorten its description or raise page_rows",
+            ) from exc
         self._write_table_header(start)
         first_body_row = start + (2 if block["currency_row"] else 1)
 

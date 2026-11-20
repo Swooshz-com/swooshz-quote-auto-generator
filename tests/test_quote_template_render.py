@@ -590,6 +590,7 @@ class TemplateRenderTest(unittest.TestCase):
 
     def test_square_metres_print_as_sqm(self):
         definition = custom_template()
+        definition["grid"]["columns"][3]["width"] = 30  # the description needs at least 30 width units
         definition["blocks"][3]["columns"] = [
             {"key": "position", "label": "No.", "col": 1, "span": 1, "align": "left"},
             {"key": "quantity", "label": "Qty", "col": 2, "span": 2, "align": "center"},
@@ -653,13 +654,25 @@ class TemplateRenderTest(unittest.TestCase):
 
     def test_landscape_orientation_and_margins_are_written(self):
         definition = custom_template()
-        definition["page"]["orientation"] = "landscape"
+        # Landscape prints 31 rows of 16 pt on this paper and margin set; 30 and 31 fit with room for items.
+        definition["page"].update({"orientation": "landscape", "first_page_rows": 30, "page_rows": 31})
         _, path = self.summary(definition)
         setup, margins = page_setup_and_margins(path)
         self.assertEqual(setup.get("orientation"), "landscape")
         self.assertEqual(setup.get("paperSize"), "9")
         for key, value in qt.read_quote_template(definition)["page"]["margins_mm"].items():
             self.assertAlmostEqual(float(margins.get(key)), value / 25.4, places=6, msg=key)
+
+    def test_an_item_taller_than_a_later_page_is_refused_with_a_path(self):
+        huge = [quote.QuoteLine(
+            section="Section 1", quantity=1, unit="nos", description="word " * 400, pricing_keyword="", display_price="",
+            matched_price=None, amount=10.0, match_status="matched", match_candidates=[],
+        )]
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(qt.QuoteTemplateError) as caught:
+                quote.write_template_quote_xlsx(custom_template(), Path(tmp) / "quotation.xlsx", self.brief, huge)
+        self.assertEqual(caught.exception.path, "page.page_rows")
+        self.assertIn("taller", caught.exception.message)
 
     def test_cli_quote_template_option_lays_out_the_quote(self):
         brief = {

@@ -30,6 +30,17 @@ MIN_GRID_COLUMNS = 4
 MAX_GRID_COLUMNS = 12
 # Longest number text accepted in definition JSON; every real value is far shorter.
 MAX_NUMBER_CHARACTERS = 32
+A4_MM = (210.0, 297.0)
+POINTS_PER_MM = 72 / 25.4
+# Printed width of one grid width unit, in points, for the fit-to-width scale of a page. The bundled
+# layout prints 61 rows of 18.7 pt on its later pages, which needs at least about 6.06 pt a unit, so 6.1
+# is used. This is calibrated to that layout, not measured in Excel: Excel's 7-pixel unit (5.25 pt)
+# would allow only 52 rows on the Standard page. The PDF smoke test checks the real print.
+WIDTH_UNIT_POINTS = 6.1
+# The fewest rows a page may leave for items after its header, and the narrowest description in
+# width units (about 27 characters a line), so an ordinary item still fits and wraps sensibly.
+MIN_BODY_ROWS = 20
+MIN_DESCRIPTION_WIDTH_UNITS = 30
 STANDARD_TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "templates" / "quote-template" / "standard.json"
 
 # Fonts installed in the deploy image and checked by CI before PDF rendering
@@ -372,6 +383,48 @@ def _read_table_columns(value: Any, path: str, block_col: int, block_span: int) 
     return columns
 
 
+def _visible_width_units(grid: dict[str, Any], first: int, span: int) -> float:
+    """Width of the visible grid columns from column number `first` (1-based) across `span` columns."""
+    return sum(column["width"] for column in grid["columns"][first - 1:first - 1 + span] if not column["hidden"])
+
+
+def printable_rows_per_page(page: dict[str, Any], grid: dict[str, Any]) -> int:
+    """Most rows one page of this layout can print.
+
+    The sheet prints fit to one page wide: its scale is the printable width over the visible width,
+    at most 1, and each row prints at row_height_pt times that scale.
+    """
+    paper_width, paper_height = A4_MM if page["orientation"] == "portrait" else A4_MM[::-1]
+    margins = page["margins_mm"]
+    printable_width = (paper_width - margins["left"] - margins["right"]) * POINTS_PER_MM
+    printable_height = (paper_height - margins["top"] - margins["bottom"]) * POINTS_PER_MM
+    visible_width = _visible_width_units(grid, 1, len(grid["columns"])) * WIDTH_UNIT_POINTS
+    scale = min(1.0, printable_width / visible_width)
+    return math.floor(printable_height / (page["row_height_pt"] * scale) + 1e-9)
+
+
+def _check_page_fit(page: dict[str, Any], grid: dict[str, Any], blocks: list[dict[str, Any]], header_rows: int) -> None:
+    """Refuse a layout whose pages cannot physically hold their rows, or whose items have no room."""
+    table_index, table = next((index, block) for index, block in enumerate(blocks) if block["type"] == "item_table")
+    table_header = 2 if table["currency_row"] else 1
+    for index, column in enumerate(table["columns"]):
+        if column["key"] == "description":
+            width = _visible_width_units(grid, column["col"], column["span"])
+            if width < MIN_DESCRIPTION_WIDTH_UNITS:
+                _refuse(
+                    f"blocks[{table_index}].columns[{index}]",
+                    f"the description needs at least {MIN_DESCRIPTION_WIDTH_UNITS} visible width units, not {width:g}",
+                )
+    rows_fit = printable_rows_per_page(page, grid)
+    for key in ("first_page_rows", "page_rows"):
+        if page[key] > rows_fit:
+            _refuse(f"page.{key}", f"is more rows than the paper holds at this size, margins and row height (at most {rows_fit})")
+    if page["first_page_rows"] - header_rows - table_header < MIN_BODY_ROWS:
+        _refuse("header.rows", f"must leave at least {MIN_BODY_ROWS} rows for the item table on the first page")
+    if page["page_rows"] - (page["continuation_top_rows"] + table_header + 1) < MIN_BODY_ROWS:
+        _refuse("page.continuation_top_rows", f"must leave at least {MIN_BODY_ROWS} rows for items on a later page")
+
+
 def _check_layout(blocks: list[dict[str, Any]], grid: dict[str, Any]) -> None:
     counts: dict[str, int] = {}
     for block in blocks:
@@ -519,6 +572,7 @@ def read_quote_template(value: Any) -> dict[str, Any]:
         for index, block in enumerate(_list(root["blocks"], "blocks", 2, MAX_BLOCKS))
     ]
     _check_layout(blocks, grid)
+    _check_page_fit(page, grid, blocks, header_rows)
     return {
         "schema": SCHEMA_ID,
         "name": _text(root["name"], "name", 60, allow_empty=False),

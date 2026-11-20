@@ -337,5 +337,45 @@ class HostileDefinitionTest(unittest.TestCase):
         self.assertIn("is required", str(error))
 
 
+class PageFitTest(unittest.TestCase):
+    """A layout must physically fit its paper: rows per page, room for items and a readable description."""
+
+    def assert_refused(self, definition, path_prefix):
+        with self.assertRaises(qt.QuoteTemplateError) as caught:
+            qt.read_quote_template(definition)
+        self.assertTrue(
+            caught.exception.path.startswith(path_prefix),
+            f"refused at {caught.exception.path!r} ({caught.exception.message}), expected {path_prefix!r}",
+        )
+
+    def test_rows_per_page_stop_at_what_the_paper_holds(self):
+        # The bundled layout's 61 continuation rows at 18.7 pt are the most A4 holds at its width.
+        qt.read_quote_template(mutated(lambda d: d["page"].update({"page_rows": 61})))
+        self.assert_refused(mutated(lambda d: d["page"].update({"page_rows": 62})), "page.page_rows")
+        self.assert_refused(mutated(lambda d: d["page"].update({"first_page_rows": 80})), "page.first_page_rows")
+        # Taller rows or a landscape page hold fewer rows; a first page of 20 rows fits either, so page_rows is what is refused.
+        self.assert_refused(mutated(lambda d: d["page"].update({"row_height_pt": 40, "first_page_rows": 20, "page_rows": 61})), "page.page_rows")
+        self.assert_refused(mutated(lambda d: d["page"].update({"orientation": "landscape", "first_page_rows": 20})), "page.page_rows")
+
+    def test_a_narrow_description_column_is_refused_with_its_path(self):
+        # Standard's description spans grid columns C and D (49.375 + 14 units); its first column is blocks[4].columns[2].
+        narrow = mutated(lambda d: (d["grid"]["columns"][2].update({"width": 4}), d["grid"]["columns"][3].update({"width": 4})))
+        self.assert_refused(narrow, "blocks[4].columns[2]")
+        # 16 + 14 = 30 units is the least allowed; with that width, 41 rows on page 1 and 45 later still fit the paper.
+        def narrowed(width):
+            return mutated(lambda d: (d["grid"]["columns"][2].update({"width": width}), d["page"].update({"first_page_rows": 41, "page_rows": 45})))
+        qt.read_quote_template(narrowed(16))
+        self.assert_refused(narrowed(15.9), "blocks[4].columns[2]")
+
+    def test_the_continuation_header_must_leave_room_for_items(self):
+        # 20 rows per page with 10 rows above the repeated header leaves 7 rows for items on later pages.
+        self.assert_refused(mutated(lambda d: d["page"].update({"page_rows": 20, "continuation_top_rows": 10})), "page.continuation_top_rows")
+        qt.read_quote_template(mutated(lambda d: d["page"].update({"continuation_top_rows": 2})))
+
+    def test_the_first_page_must_leave_room_for_items(self):
+        self.assert_refused(mutated(lambda d: d["page"].update({"first_page_rows": 40})), "header.rows")
+        qt.read_quote_template(mutated(lambda d: d["page"].update({"first_page_rows": 41})))
+
+
 if __name__ == "__main__":
     unittest.main()
