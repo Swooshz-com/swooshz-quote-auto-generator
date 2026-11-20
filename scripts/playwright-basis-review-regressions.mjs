@@ -107,30 +107,70 @@ replaceOnce('  result.basisLines = draftLines.length;', `  result.basisLines = d
       return boxes;
     });
     assert(unknownBooth.length === 0 || unknownBooth.every((text) => text.replace("Detected booth", "").trim()), "empty Detected booth box rendered", unknownBooth);
-    // The booth size line reads about as large as the "Matched" heading, in bold; the card and its other
-    // lines keep their look (owner, INT-SQAG-202611200004).
-    const boothStyle = await page.evaluate(() => {
-      const style = (node) => {
-        const computed = node && getComputedStyle(node);
-        return computed ? { fontSize: parseFloat(computed.fontSize), fontWeight: Number(computed.fontWeight), color: computed.color } : null;
-      };
-      const box = document.querySelector("#basisReviewSurface .basis-visual-display");
-      const lines = [...box.querySelectorAll("li")];
-      const sizeLine = lines.find((line) => line.textContent.trim().startsWith("Booth size"));
-      const card = getComputedStyle(box);
-      return {
-        sizeLine: style(sizeLine),
-        otherLines: lines.filter((line) => line !== sizeLine).map(style),
-        label: style(box.querySelector("strong")),
-        matchedHeading: style(document.querySelector('#basisReviewSurface .basis-review-grid[aria-label="Matched"] > h4')),
-        card: { background: card.backgroundColor, border: card.borderTopColor, padding: card.padding, radius: card.borderTopLeftRadius },
-      };
-    });
-    assert(boothStyle.sizeLine && boothStyle.matchedHeading && boothStyle.sizeLine.fontWeight >= 700
-      && Math.abs(boothStyle.sizeLine.fontSize - boothStyle.matchedHeading.fontSize) <= 1
-      && boothStyle.otherLines.every((line) => line.fontSize === 13 && line.fontWeight < 700)
-      && boothStyle.label.fontSize === 12, "Detected booth size line is not large and bold like the Matched heading", boothStyle);
-    result.detectedBooth = { structured: (await boothBox.innerText()).trim(), unknownDimensions: unknownBooth, style: boothStyle };
+    // Every Detected booth variant (detected size, Known details size, 6m x 6m default note) has one look: the
+    // "Detected booth" heading is the size and weight of the "Matched" heading and every line is 15px regular;
+    // the card keeps its place and colours and fits at desktop and phone widths (owner, INT-SQAG-202611200005).
+    const defaultNote = "Booth size defaults to 6m x 6m because no clear dimensions were found; confirm before generating.";
+    const boothVariant = async (variant, label) => {
+      const look = await page.evaluate(({ variant, defaultNote }) => {
+        const savedDimensions = state.boothDimensions;
+        const noteLine = { tag: "Confirm", text: defaultNote };
+        const noteLines = state.quoteBasisSections[0].lines;
+        window.restoreBoothVariant = () => {
+          if (noteLines.includes(noteLine)) noteLines.splice(noteLines.indexOf(noteLine), 1);
+          state.boothDimensions = savedDimensions;
+          updateQuoteBasisCard("edited");
+        };
+        if (variant === "knownDetails") state.boothDimensions = { ...savedDimensions, booth_width: "", booth_depth: "", booth_area_sqm: 93, dimension_source: "staff" };
+        if (variant === "defaultNote") {
+          state.boothDimensions = { ...DEFAULT_BOOTH_DIMENSIONS };
+          noteLines.push(noteLine);
+        }
+        updateQuoteBasisCard("edited");
+        const style = (node) => {
+          const computed = node && getComputedStyle(node);
+          return computed ? { fontSize: parseFloat(computed.fontSize), fontWeight: Number(computed.fontWeight), color: computed.color } : null;
+        };
+        const box = document.querySelector("#basisReviewSurface .basis-visual-display");
+        const card = box && getComputedStyle(box);
+        const rect = box && box.getBoundingClientRect();
+        const matchedHeading = document.querySelector('#basisReviewSurface .basis-review-grid[aria-label="Matched"] > h4');
+        const found = box ? {
+          lines: [...box.querySelectorAll("li")].map((line) => ({ text: line.textContent.trim(), ...style(line) })),
+          heading: { text: box.querySelector("strong").textContent.trim(), ...style(box.querySelector("strong")) },
+          matchedHeading: style(matchedHeading),
+          card: { background: card.backgroundColor, border: card.borderTopColor, padding: card.padding, radius: card.borderTopLeftRadius },
+          abovePriceGroups: Boolean(box.compareDocumentPosition(matchedHeading) & Node.DOCUMENT_POSITION_FOLLOWING),
+          fits: box.scrollWidth <= box.clientWidth && rect.left >= 0 && rect.right <= document.documentElement.clientWidth,
+        } : null;
+        return found;
+      }, { variant, defaultNote });
+      if (look) await surface.locator(".basis-visual-display").screenshot({ path: path.join(runRoot, "detected-booth-" + label + "-" + variant + ".png") });
+      await page.evaluate(() => window.restoreBoothVariant());
+      return look;
+    };
+    const boothCardLooks = {};
+    const desktopViewport = page.viewportSize();
+    for (const [width, label] of [[desktopViewport.width, "desktop"], [390, "phone"]]) {
+      if (label === "phone") await page.setViewportSize({ width, height: 844 });
+      for (const variant of ["detected", "knownDetails", "defaultNote"]) boothCardLooks[label + ":" + variant] = await boothVariant(variant, label);
+    }
+    await page.setViewportSize(desktopViewport);
+    const expectedText = { detected: "Booth size 9m x 10.5m (94.5 sqm)", knownDetails: "Booth size 93 sqm (from Known details)", defaultNote };
+    for (const [key, look] of Object.entries(boothCardLooks)) {
+      const variant = key.split(":")[1];
+      assert(look && look.heading.text === "Detected booth" && look.lines.some((line) => line.text === expectedText[variant]),
+        "Detected booth variant did not render", { key, look });
+      assert(look.heading.fontSize === look.matchedHeading.fontSize && look.heading.fontWeight === look.matchedHeading.fontWeight,
+        "Detected booth heading is not the size and weight of the Matched heading", { key, look });
+      assert(look.lines.every((line) => line.fontSize === 15 && line.fontWeight < 700),
+        "Detected booth lines are not all 15px regular", { key, look });
+      assert(look.heading.color === "rgb(24, 48, 71)" && look.lines.every((line) => line.color === "rgb(24, 48, 71)")
+        && JSON.stringify(look.card) === JSON.stringify({ background: "rgb(247, 251, 255)", border: "rgb(213, 227, 238)", padding: "14px 18px", radius: "8px" })
+        && look.abovePriceGroups, "Detected booth card changed its colours, box or place", { key, look });
+      assert(look.fits, "Detected booth card overflows", { key, look });
+    }
+    result.detectedBooth = { structured: (await boothBox.innerText()).trim(), unknownDimensions: unknownBooth, looks: boothCardLooks };
 
     // 4. Click latency on the 60+ line basis: line tick/X and section-block X stay inside a budget,
     // and rows the click did not change keep their DOM nodes (no full rebuild).

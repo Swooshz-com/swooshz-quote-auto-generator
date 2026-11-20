@@ -4901,9 +4901,10 @@ select:focus {
   color: #183047;
 }
 
+/* Heading inherits the size of the "Matched" group heading and takes its weight; every line,
+   detected size or note alike, is 15px (owner, INT-SQAG-202611200005). */
 .basis-visual-display strong {
-  font-size: 12px;
-  font-weight: 850;
+  font-weight: 700;
   line-height: 1.2;
 }
 
@@ -4916,15 +4917,9 @@ select:focus {
 }
 
 .basis-visual-display li {
-  font-size: 13px;
+  font-size: 15px;
   line-height: 1.35;
   overflow-wrap: anywhere;
-}
-
-/* The booth size line, bold and about as large as the "Matched" heading (owner, INT-SQAG-202611200004). */
-.basis-visual-display li.basis-booth-size {
-  font-size: 16px;
-  font-weight: 700;
 }
 
 .basis-empty-state {

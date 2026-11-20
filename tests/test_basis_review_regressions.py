@@ -30,13 +30,20 @@ class BasisReviewRegressionsTest(unittest.TestCase):
                                     'Unmatched:Lighting and Electrical'])
         self.assertIn('Booth size 9m x 10.5m (94.5 sqm)', evidence['detectedBooth']['structured'])
         self.assertEqual(evidence['detectedBooth']['unknownDimensions'], [])
-        # Owner-approved display (INT-SQAG-202611200004): the booth size line is bold and about the size of the
-        # "Matched" heading; the card keeps its colours; "Est." matches its quantity's size and colour.
-        booth = evidence['detectedBooth']['style']
-        self.assertGreaterEqual(booth['sizeLine']['fontWeight'], 700)
-        self.assertLessEqual(abs(booth['sizeLine']['fontSize'] - booth['matchedHeading']['fontSize']), 1)
-        self.assertEqual(booth['card'], {'background': 'rgb(247, 251, 255)', 'border': 'rgb(213, 227, 238)',
-                                         'padding': '14px 18px', 'radius': '8px'})
+        # Owner-approved display (INT-SQAG-202611200005): every Detected booth variant, at desktop and phone
+        # widths, has a heading the size and weight of "Matched" and 15px regular lines, in the same card.
+        looks = evidence['detectedBooth']['looks']
+        self.assertEqual(sorted(looks), sorted(f'{width}:{variant}' for width in ('desktop', 'phone')
+                                              for variant in ('detected', 'knownDetails', 'defaultNote')))
+        for key, look in looks.items():
+            with self.subTest(key):
+                self.assertEqual((look['heading']['fontSize'], look['heading']['fontWeight']),
+                                 (look['matchedHeading']['fontSize'], look['matchedHeading']['fontWeight']))
+                self.assertTrue(all(line['fontSize'] == 15 and line['fontWeight'] < 700 for line in look['lines']))
+                self.assertEqual(look['card'], {'background': 'rgb(247, 251, 255)', 'border': 'rgb(213, 227, 238)',
+                                                'padding': '14px 18px', 'radius': '8px'})
+                self.assertTrue(look['fits'])
+        # "Est." matches its quantity's size and colour (INT-SQAG-202611200004).
         self.assertEqual(evidence['estTag']['est'], evidence['estTag']['quantity'])
         self.assertGreaterEqual(evidence['latency']['basisLines'], 60)
         reused, probes = evidence['latency']['reusedProbeNodes'].split('/')
