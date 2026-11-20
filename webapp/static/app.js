@@ -17947,7 +17947,7 @@ function syncControlStates() {
     const canManage = canManagePricingReferences();
     elements.settingsButton.hidden = false;
     elements.settingsButton.disabled = busy || !canManage;
-    elements.settingsButton.title = canManage ? "Pricing reference settings" : pricingReferenceNoAccessReason();
+    elements.settingsButton.title = canManage ? "Settings" : pricingReferenceNoAccessReason();
     elements.settingsButton.setAttribute("aria-disabled", String(elements.settingsButton.disabled));
   }
   updatePresetButtons();
