@@ -45,7 +45,7 @@ come in later slices.
 | `schema` | text | exactly `sqag.quote-template.v1` |
 | `name` | text | 1 to 60 characters |
 | `page` | object | below |
-| `header` | object | `rows` 1 to 40 (rows reserved at the top of page 1 for header blocks; must be fewer than `page.first_page_rows`), `repeat_rows` 0 to `rows` (rows reprinted at the top of every page) |
+| `header` | object | `rows` 1 to 40: rows reserved at the top of page 1 for header blocks; must be fewer than `page.first_page_rows` |
 | `grid` | object | `columns`: 4 to 12 Excel columns, each `{width: 4 to 60, hidden?: bool}`; at least one visible |
 | `theme` | object | `font` (`Calibri` or `Arial`, the fonts installed for PDF rendering), `size_pt` 7 to 20, `color` and `heading_color` as `#RRGGBB` |
 | `labels` | object | `total` (1 to 40), `attention` (0 to 40), `project_number` (0 to 40). Tax and currency labels come from the quote itself. |
@@ -75,18 +75,20 @@ columns, inside the grid) and an optional `style` (`font`, `size_pt`, `bold`,
 
 | Type | Area | Extra keys | Count |
 | --- | --- | --- | --- |
-| `logo` | header | `logo`: `width_mm` 5 to 120, `height_mm` 5 to 80, `align`, `valign` (`top`, `middle`, `bottom`), `keep_aspect` | at most 1 |
+| `logo` | header | `logo`: `width_mm` 5 to 120, `height_mm` 5 to 80, `align`, `valign` (`top`, `middle`, `bottom`), `keep_aspect`, `repeat` (also show it at the same place on every later page) | at most 1 |
 | `company_details` | header | `fields` from `header_lines`, `project_number`, `blank` | at most 1 |
 | `client_details` | header | `fields` from `client_name`, `client_address`, `attention`, `client_title`, `blank`; `address_rows` 1 to 6; `indent_cols` 0 to span-1 | at most 1 |
 | `quote_details` | header | `fields` from `quote_date`, `project_title`, `project_number`, `blank` | at most 1 |
 | `item_table` | body | `currency_row` (bool); `columns`: 2 to 8 of `{key, label (0 to 40), col, span, align}` | exactly 1 |
 | `totals` | body | `label_col` and `currency_col` (0 for none) inside the block | exactly 1 |
 | `terms`, `notes` | body | none; span at least 2 (number column and text) | at most 1 each |
-| `signature`, `acceptance` | body | none | at most 1 each |
+| `signature`, `acceptance` | body | `line_chars` 5 to 60: length of the signing line | at most 1 each |
 | `free_text` | either | `heading` (0 to 80), `lines` (0 to 20 lines of up to 200); needs some text | at most 10 |
 
 `fields` lists 1 to 8 entries, each named once (`blank` may repeat), and at
-least one entry other than `blank`.
+least one entry other than `blank`. Client and quote details are written in
+cells, one row per field (the address takes `address_rows`, attention takes a
+label row and a name row), so the block's `rows` must fit them.
 
 Item-table column keys: `position`, `quantity`, `unit`, `description`,
 `unit_price`, `amount`, each at most once; `description` and `amount` are
@@ -102,7 +104,7 @@ calculated exactly as for every other quote; a template only places them.
 
 `templates/quote-template/standard.json` reproduces the bundled layout: the nine
 columns A to I with G and H hidden, the same margins, 18.7 pt rows, 55 rows on
-page 1 and 61 on later pages, the logo and company details on the right,
+page 1 and 61 on later pages, the logo (repeated on later pages) and company details on the right,
 client details and quote details on the left, the `Pos.`, `Quantity`,
 `Service`, `Estimate` table, totals in D to F, the red exclusions text, terms,
 notes, and the signature and acceptance side by side. `tests/test_quote_template_schema.py`

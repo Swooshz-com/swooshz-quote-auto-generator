@@ -10,7 +10,7 @@
     "page_rows": 61,
     "continuation_top_rows": 2
   },
-  "header": {"rows": 19, "repeat_rows": 2},
+  "header": {"rows": 19},
   "grid": {
     "columns": [
       {"width": 6.125},
@@ -29,7 +29,7 @@
   "blocks": [
     {
       "type": "logo", "area": "header", "row": 2, "rows": 2, "col": 9, "span": 1,
-      "logo": {"width_mm": 47.8, "height_mm": 18.1, "align": "left", "valign": "top", "keep_aspect": true}
+      "logo": {"width_mm": 47.8, "height_mm": 18.1, "align": "left", "valign": "top", "keep_aspect": true, "repeat": true}
     },
     {
       "type": "company_details", "area": "header", "row": 4, "rows": 16, "col": 9, "span": 1,
@@ -67,7 +67,7 @@
     },
     {"type": "terms", "area": "body", "col": 1, "span": 9, "gap_before": 1, "style": {"size_pt": 10}},
     {"type": "notes", "area": "body", "col": 1, "span": 9, "gap_before": 1, "style": {"size_pt": 10}},
-    {"type": "signature", "area": "body", "col": 2, "span": 3, "gap_before": 2, "style": {"size_pt": 10}},
-    {"type": "acceptance", "area": "body", "col": 5, "span": 5, "beside": true, "style": {"size_pt": 10}}
+    {"type": "signature", "area": "body", "col": 2, "span": 3, "gap_before": 2, "line_chars": 29, "style": {"size_pt": 10}},
+    {"type": "acceptance", "area": "body", "col": 5, "span": 5, "beside": true, "line_chars": 37, "style": {"size_pt": 10}}
   ]
 }

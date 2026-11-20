@@ -64,7 +64,6 @@ class StandardTemplateTest(unittest.TestCase):
             [bundled_columns[number] for number in print_area_columns],
         )
         self.assertIn("Quotation!$A$1:$I$", workbook)
-        self.assertIn(f"Quotation!$1:${standard['header']['repeat_rows']}<", workbook)
 
         margins = sheet.find(f"{NS_MAIN}pageMargins")
         for key, value in standard["page"]["margins_mm"].items():
@@ -81,6 +80,10 @@ class StandardTemplateTest(unittest.TestCase):
         )
 
         rules = json.loads(rules_xml.split("<json>", 1)[1].split("</json>", 1)[0])
+        self.assertIs(
+            block(standard, "logo")["logo"]["repeat"],
+            rules["header"]["company_block"]["repeat_logo_on_continuation_pages"],
+        )
         table = block(standard, "item_table")
         self.assertEqual([column["label"] for column in table["columns"]], rules["line_items"]["columns"])
         self.assertEqual(standard["labels"]["total"], rules["totals"]["labels"][0])
@@ -139,7 +142,10 @@ class HostileDefinitionTest(unittest.TestCase):
             "grid.columns": lambda d: d["grid"].update({"columns": d["grid"]["columns"][:3]}),
             "theme.size_pt": lambda d: d["theme"].update({"size_pt": 72}),
             "header.rows": lambda d: d["header"].update({"rows": 0}),
-            "header.repeat_rows": lambda d: d["header"].update({"repeat_rows": 20}),
+            "header.repeat_rows": lambda d: d["header"].update({"repeat_rows": 2}),
+            "blocks[0].logo.repeat": lambda d: d["blocks"][0]["logo"].update({"repeat": "yes"}),
+            "blocks[9].line_chars": lambda d: block(d, "signature").update({"line_chars": 200}),
+            "blocks[10].line_chars": lambda d: block(d, "acceptance").pop("line_chars"),
             "blocks[0].col": lambda d: d["blocks"][0].update({"col": 10}),
             "blocks[2].span": lambda d: block(d, "client_details").update({"col": 2, "span": 9}),
             "blocks[3].rows": lambda d: block(d, "quote_details").update({"rows": 5}),
@@ -219,6 +225,8 @@ class HostileDefinitionTest(unittest.TestCase):
             "too many blocks": (lambda d: d["blocks"].extend([copy.deepcopy(block(d, "free_text"))] * 20), "blocks"),
             "empty free text": (lambda d: block(d, "free_text").update({"heading": "", "lines": [" "]}), "blocks[6]"),
             "terms with one column": (lambda d: block(d, "terms").update({"span": 1}), "blocks[7].span"),
+            "client fields overflow rows": (lambda d: block(d, "client_details").update({"address_rows": 5}), "blocks[2].rows"),
+            "quote fields overflow rows": (lambda d: block(d, "quote_details")["fields"].append("project_number"), "blocks[3].rows"),
             "indent fills block": (lambda d: block(d, "client_details").update({"indent_cols": 3}), "blocks[2].indent_cols"),
             "only blank fields": (lambda d: block(d, "quote_details").update({"fields": ["blank"]}), "blocks[3].fields"),
             "unknown field": (lambda d: block(d, "quote_details").update({"fields": ["customer_bank_account"]}), "blocks[3].fields[0]"),

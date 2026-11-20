@@ -232,8 +232,8 @@ TYPE_KEYS: dict[str, tuple[str, ...]] = {
     "totals": ("label_col", "currency_col"),
     "terms": (),
     "notes": (),
-    "signature": (),
-    "acceptance": (),
+    "signature": ("line_chars",),
+    "acceptance": ("line_chars",),
     "free_text": ("heading", "lines"),
 }
 
@@ -268,13 +268,14 @@ def _read_block(value: Any, index: int, grid_columns: int, header_rows: int) -> 
     block["style"] = _read_style(value.get("style", {}), f"{path}.style")
 
     if block_type == "logo":
-        logo = _object(value["logo"], f"{path}.logo", ("width_mm", "height_mm", "align", "valign", "keep_aspect"))
+        logo = _object(value["logo"], f"{path}.logo", ("width_mm", "height_mm", "align", "valign", "keep_aspect", "repeat"))
         block["logo"] = {
             "width_mm": _number(logo["width_mm"], f"{path}.logo.width_mm", 5, 120),
             "height_mm": _number(logo["height_mm"], f"{path}.logo.height_mm", 5, 80),
             "align": _choice(logo["align"], f"{path}.logo.align", ALIGNMENTS),
             "valign": _choice(logo["valign"], f"{path}.logo.valign", VERTICAL_ALIGNMENTS),
             "keep_aspect": _boolean(logo["keep_aspect"], f"{path}.logo.keep_aspect"),
+            "repeat": _boolean(logo["repeat"], f"{path}.logo.repeat"),
         }
     elif block_type == "company_details":
         block["fields"] = _fields(value["fields"], f"{path}.fields", COMPANY_FIELDS)
@@ -286,6 +287,10 @@ def _read_block(value: Any, index: int, grid_columns: int, header_rows: int) -> 
             _refuse(f"{path}.indent_cols", "must be smaller than the block span")
     elif block_type == "quote_details":
         block["fields"] = _fields(value["fields"], f"{path}.fields", QUOTE_FIELDS)
+    elif block_type in {"signature", "acceptance"}:
+        block["line_chars"] = _integer(value["line_chars"], f"{path}.line_chars", 5, 60)
+    if block_type in {"client_details", "quote_details"} and _field_rows(block) > block["rows"]:
+        _refuse(f"{path}.rows", f"must be at least {_field_rows(block)} to fit the fields")
     elif block_type == "item_table":
         block["currency_row"] = _boolean(value["currency_row"], f"{path}.currency_row")
         block["columns"] = _read_table_columns(value["columns"], f"{path}.columns", col, span)
@@ -305,6 +310,12 @@ def _read_block(value: Any, index: int, grid_columns: int, header_rows: int) -> 
         if area == "body" and block["lines"] and span < 2:
             _refuse(f"{path}.span", "must be at least 2 when the text has lines under a heading")
     return block
+
+
+def _field_rows(block: dict[str, Any]) -> int:
+    """Rows a cell-based header block needs: the address takes address_rows, attention a label and a name row."""
+    sizes = {"client_address": block.get("address_rows", 1), "attention": 2}
+    return sum(sizes.get(field, 1) for field in block["fields"])
 
 
 def _read_table_columns(value: Any, path: str, block_col: int, block_span: int) -> list[dict[str, Any]]:
@@ -447,7 +458,7 @@ def read_quote_template(value: Any) -> dict[str, Any]:
     if root["schema"] != SCHEMA_ID:
         _refuse("schema", f"must be {SCHEMA_ID}")
     grid = _read_grid(root["grid"])
-    header = _object(root["header"], "header", ("rows", "repeat_rows"))
+    header = _object(root["header"], "header", ("rows",))
     header_rows = _integer(header["rows"], "header.rows", 1, 40)
     page = _read_page(root["page"])
     if header_rows >= page["first_page_rows"]:
@@ -461,10 +472,7 @@ def read_quote_template(value: Any) -> dict[str, Any]:
         "schema": SCHEMA_ID,
         "name": _text(root["name"], "name", 60, allow_empty=False),
         "page": page,
-        "header": {
-            "rows": header_rows,
-            "repeat_rows": _integer(header["repeat_rows"], "header.repeat_rows", 0, header_rows),
-        },
+        "header": {"rows": header_rows},
         "grid": grid,
         "theme": _read_theme(root["theme"]),
         "labels": _read_labels(root["labels"]),
