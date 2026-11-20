@@ -243,6 +243,44 @@ def full_summary(path, grid_columns):
     return {**workbook_summary(path, grid_columns), **appearance_summary(path)}
 
 
+def cached_formula_values(path):
+    """The results saved with each formula, which a viewer shows before it recalculates."""
+    with zipfile.ZipFile(path) as archive:
+        sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+    return {
+        cell.get("r"): float(cell.findtext(f"{M}v"))
+        for cell in sheet.iter(f"{M}c") if cell.find(f"{M}f") is not None
+    }
+
+
+def cell_borders(path, ref):
+    """The (top, bottom) border styles of one cell."""
+    with zipfile.ZipFile(path) as archive:
+        sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+        styles = ET.fromstring(archive.read("xl/styles.xml"))
+    cell = next(node for node in sheet.iter(f"{M}c") if node.get("r") == ref)
+    xf = styles.find(f"{M}cellXfs")[int(cell.get("s", "0"))]
+    border = styles.find(f"{M}borders")[int(xf.get("borderId"))]
+    return tuple(border.find(f"{M}{side}").get("style") for side in ("top", "bottom"))
+
+
+def page_setup_and_margins(path):
+    with zipfile.ZipFile(path) as archive:
+        sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+    return sheet.find(f"{M}pageSetup").attrib, sheet.find(f"{M}pageMargins").attrib
+
+
+def item_rows(summary, prefix="Printed panel"):
+    """The first row of each synthetic item: its description starts with the item text and it carries an amount."""
+    rows = []
+    for ref, ((kind, value), _) in summary["cells"].items():
+        letter, row = split_ref(ref)
+        amount = summary["cells"].get(f"E{row}")
+        if letter == "A" and kind == "text" and value.startswith(prefix) and amount and amount[0][0] == "number":
+            rows.append(row)
+    return sorted(rows)
+
+
 class StandardTemplateEquivalenceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -456,6 +494,66 @@ class TemplateRenderTest(unittest.TestCase):
         texts = {value for (kind, value), _ in summary["cells"].values() if kind == "text"}
         self.assertIn("2.5 sqm", texts)
         self.assertFalse(any("m2" in value for value in texts))
+
+    def test_unit_price_is_hidden_when_its_amount_is_hidden(self):
+        # Every item in a grouped section shows no amount, so its unit price stays hidden too.
+        lines = synthetic_lines(3, sections=1)
+        grouped, _ = self.summary(custom_template(), synthetic_brief(section_pricing={"Section 1": "section_total"}), lines)
+        ungrouped, _ = self.summary(custom_template(), synthetic_brief(), lines)
+        rows = item_rows(ungrouped)
+        self.assertEqual(len(rows), 3)
+        for row in rows:
+            self.assertEqual(ungrouped["cells"][f"D{row}"], (("number", 120.0), "#,##0.00"))
+            self.assertNotIn(f"D{row}", grouped["cells"])
+            self.assertNotIn(f"E{row}", grouped["cells"])
+
+    def test_unit_price_uses_the_exchange_rate(self):
+        summary, _ = self.summary(custom_template(), synthetic_brief(currency="USD", exchange_rate=0.74))
+        row = item_rows(summary)[0]
+        self.assertEqual(summary["cells"][f"D{row}"], (("number", round(120 * 0.74, 2)), "#,##0.00"))
+        self.assertEqual(summary["cells"][f"E{row}"], (("number", round(301 * 0.74, 2)), "#,##0.00"))
+
+    def test_unit_price_uses_a_manual_override(self):
+        lines = synthetic_lines(3)
+        lines[1].unit_price_override = 99.5
+        summary, _ = self.summary(custom_template(), self.brief, lines)
+        second = item_rows(summary)[1]
+        self.assertEqual(summary["cells"][f"D{second}"], (("number", 99.5), "#,##0.00"))
+        self.assertEqual(summary["cells"][f"D{item_rows(summary)[0]}"], (("number", 120.0), "#,##0.00"))
+
+    def test_cached_totals_equal_the_item_amounts(self):
+        summary, path = self.summary(custom_template())
+        subtotal_row = split_ref(find_refs(summary, "Subtotal")[0])[1]
+        cached = cached_formula_values(path)
+        expected_subtotal = round(sum(line.amount for line in self.lines), 2)
+        expected_tax = round(expected_subtotal * 0.09, 2)
+        self.assertEqual(cached[f"E{subtotal_row}"], expected_subtotal)
+        self.assertEqual(cached[f"E{subtotal_row + 1}"], expected_tax)
+        self.assertEqual(cached[f"E{subtotal_row + 2}"], round(expected_subtotal + expected_tax, 2))
+
+    def test_currency_row_and_totals_use_the_brief_currency(self):
+        # Standard: the currency sits under the Estimate heading (E21) and on each of the three totals rows (F).
+        summary, _ = self.summary(qt.load_standard_quote_template(), synthetic_brief(currency="USD"))
+        self.assertEqual(cell_text(summary, "E21"), "USD")
+        self.assertEqual(len(find_refs(summary, "USD")), 4)
+        self.assertFalse(find_refs(summary, "SGD"))
+
+    def test_grand_total_keeps_its_double_bottom_border(self):
+        summary, path = self.summary(qt.load_standard_quote_template(), synthetic_brief())
+        (total_label,) = find_refs(summary, "Total")
+        total_row = split_ref(total_label)[1]
+        self.assertEqual(cell_borders(path, f"E{total_row}"), ("thin", None))
+        self.assertEqual(cell_borders(path, f"E{total_row + 2}"), ("thin", "double"))
+
+    def test_landscape_orientation_and_margins_are_written(self):
+        definition = custom_template()
+        definition["page"]["orientation"] = "landscape"
+        _, path = self.summary(definition)
+        setup, margins = page_setup_and_margins(path)
+        self.assertEqual(setup.get("orientation"), "landscape")
+        self.assertEqual(setup.get("paperSize"), "9")
+        for key, value in qt.read_quote_template(definition)["page"]["margins_mm"].items():
+            self.assertAlmostEqual(float(margins.get(key)), value / 25.4, places=6, msg=key)
 
     def test_cli_quote_template_option_lays_out_the_quote(self):
         brief = {
