@@ -733,6 +733,24 @@ the owner-approved CI lane.
   without LibreOffice and fails in CI if LibreOffice is missing. Changes to the
   legacy layout path also run `tests.test_generate_quote`,
   `tests.test_profile_layout_safety` and `tests.test_quote_exclusions`.
+- Saved quote templates: run `python -m unittest
+  tests.test_quote_template_storage tests.test_quote_template_permissions
+  tests.test_quote_template_generation tests.test_profile_quote_template_fields`.
+  Storage runs on SQLite and, where `SQAG_TEST_POSTGRES_*` is set (CI), on a
+  disposable PostgreSQL 17 database as the runtime role: the template limit
+  checked inside the save transaction, concurrent saves at the last free slot,
+  stale save numbers, one default per workspace, permanent deletes, workspace
+  isolation and the app before migration 013. Permissions use real loopback
+  HTTP: staff list templates, only admins read, check, save, delete or set the
+  default, signed-out and CSRF-less calls change nothing, and template links
+  never open another member's personal profile. Generation runs the real
+  generator through the job path: which template a profile gets (including the
+  note when its template was deleted), the run record, old quotes unchanged
+  after the template is edited or deleted, and a profile with no template
+  choice producing the same workbook as before. Migration changes also run
+  `tests.test_admission_schema_compatibility`,
+  `tests.test_postgres_migration_ledger` and
+  `tests.test_runtime_privilege_contract`.
 ## Manual price and restored search contract
 
 Output defaults to editable reference prices, read-only FX and derived quoted unit prices.

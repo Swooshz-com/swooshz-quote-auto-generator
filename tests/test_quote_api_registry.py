@@ -27,15 +27,16 @@ VERIFIER = secret_verifier(bytes(range(32)))
 def assert_fixture_schema(test, connection):
     """Do not trust IF NOT EXISTS to hide a pre-existing different schema."""
     from webapp.postgres_migrations import MIGRATION_OBJECTS
-    for table in MIGRATION_OBJECTS[-1].tables:
+    admission = next(item for item in MIGRATION_OBJECTS if item.migration_id == "012_quote_api_admission_postgres.sql")
+    for table in admission.tables:
         rows=connection.execute('pragma table_info('+table.name+')').fetchall()
         observed=tuple((r[1],r[2].lower(),not bool(r[3]),r[4]) for r in rows)
         expected=tuple((c.name,{'bigint':'integer','smallint':'integer','bytea':'blob'}.get(c.type_name,c.type_name),
                         c.nullable,c.default_sql) for c in table.columns)
         test.assertEqual(observed,expected)
-    expected_triggers={t.name for t in MIGRATION_OBJECTS[-1].triggers}
+    expected_triggers={t.name for t in admission.triggers}
     test.assertEqual({r[0] for r in connection.execute("select name from sqlite_master where type='trigger'")},expected_triggers)
-    for index in MIGRATION_OBJECTS[-1].indexes:
+    for index in admission.indexes:
         rows=connection.execute('pragma index_info('+index.name+')').fetchall()
         test.assertEqual(tuple(r[2] for r in rows),index.key_semantics)
         flags={r[1]:r[2] for r in connection.execute('pragma index_list('+index.table_name+')')}
@@ -354,13 +355,14 @@ class RegistrySourceControls(unittest.TestCase):
     def test_manifest_addition_does_not_move_011_index_or_seed_authority(self):
         from webapp import postgres_migrations as m
         self.assertEqual(m.MIGRATION_OBJECTS[9].indexes[0].name,"sqag_quote_ai_spend_session_idx")
-        self.assertEqual(m.migration_manifest(ROOT/'migrations')[-1].sequence_no,11)
+        admission = next(item for item in m.MIGRATION_OBJECTS if item.migration_id == "012_quote_api_admission_postgres.sql")
+        self.assertEqual({x.migration_id: x.sequence_no for x in m.migration_manifest(ROOT/'migrations')}[admission.migration_id],11)
         pg=(ROOT/'migrations/012_quote_api_admission_postgres.sql').read_text()
         self.assertEqual(len(m._split_sql_statements(pg)),21)
-        self.assertEqual(len(m.MIGRATION_OBJECTS[-1].tables),2)
-        self.assertEqual(len(m.MIGRATION_OBJECTS[-1].indexes),3)
-        self.assertEqual(len(m.MIGRATION_OBJECTS[-1].triggers),2)
-        self.assertEqual({spec.name for spec in m.MIGRATION_OBJECTS[-1].routines},
+        self.assertEqual(len(admission.tables),2)
+        self.assertEqual(len(admission.indexes),3)
+        self.assertEqual(len(admission.triggers),2)
+        self.assertEqual({spec.name for spec in admission.routines},
                          {"sqag_quote_api_admission_lookup", "sqag_quote_api_reject_binding_change"})
         self.assertNotIn("sqag_reject_immutable_change", pg)
         self.assertNotRegex(pg.lower(),r'\b(?:insert|delete|truncate|drop)\s+(?:into|from|table)')
