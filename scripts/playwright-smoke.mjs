@@ -282,7 +282,7 @@ async function expectTopbarPrimaryAction(page, expectedAction) {
   const newQuoteVisible = await page.locator("#newQuoteButton").isVisible();
   const settingsVisible = await page.locator("#settingsButton").isVisible();
   if (!settingsVisible) {
-    throw new Error("Pricing Reference topbar action should stay visible.");
+    throw new Error("Settings topbar action should stay visible.");
   }
   if (expectedAction === "dashboard" && (!dashboardVisible || newQuoteVisible)) {
     throw new Error(`Expected Dashboard-only topbar action, found ${JSON.stringify({ dashboardVisible, newQuoteVisible })}.`);
