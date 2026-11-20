@@ -30,6 +30,31 @@ MIN_GRID_COLUMNS = 4
 MAX_GRID_COLUMNS = 12
 # Longest number text accepted in definition JSON; every real value is far shorter.
 MAX_NUMBER_CHARACTERS = 32
+A4_MM = (210.0, 297.0)
+POINTS_PER_MM = 72 / 25.4
+# A grid width unit is the widest digit of the sheet's Normal font, which the renderer sets to the theme
+# font and size. Widest digit advance (0-9) of each allowed font as a fraction of the em, from the font
+# files; Carlito and Liberation Sans, which LibreOffice prints with, have the same widths.
+DIGIT_EM = {"Calibri": 1038 / 2048, "Arial": 1139 / 2048}
+# Page fit is a model with a measured margin, not an exact copy of Excel. Excel for Windows (measured at
+# 96 and 192 dpi, printing to Microsoft Print to PDF) sizes the digit from the font hinted at a whole-pixel
+# size on its display, so the unit below is the narrowest of the exact width and its whole-pixel width at
+# each Windows scaling preset. Excel prints rows taller than their set height, in proportion to it and
+# by up to 4.8 % at 192 dpi depending on the theme font: each row is counted 0.75 pt taller and a page
+# keeps one row spare, which together allow at least 6.4 % at every allowed row height and margin.
+# Excel cannot print below 10 %; its digit can be a fifth wider than the unit, so the reader refuses a
+# sheet that would need less than 13 %.
+DISPLAY_DPIS = (96, 120, 144, 168, 192, 216, 240, 288, 336)
+PRINTED_ROW_ALLOWANCE_POINTS = 0.75
+SPARE_ROWS_PER_PAGE = 1
+MIN_PRINT_SCALE = 0.13
+EMU_PER_MM = 36_000
+EMU_PER_POINT = 12_700
+EMU_PER_PIXEL = 9525
+# The fewest rows a page may leave for items after its header, and the narrowest description in
+# width units (about 27 characters a line), so an ordinary item still fits and wraps sensibly.
+MIN_BODY_ROWS = 20
+MIN_DESCRIPTION_WIDTH_UNITS = 30
 STANDARD_TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "templates" / "quote-template" / "standard.json"
 
 # Fonts installed in the deploy image and checked by CI before PDF rendering
@@ -67,7 +92,7 @@ def _refuse(path: str, message: str) -> None:
 def _object(value: Any, path: str, required: tuple[str, ...], optional: tuple[str, ...] = ()) -> dict[str, Any]:
     if not isinstance(value, dict):
         _refuse(path, "must be an object")
-    unknown = sorted(key for key in value if key not in required and key not in optional)
+    unknown = sorted((key for key in value if key not in required and key not in optional), key=str)
     if unknown:
         _refuse(f"{path}.{unknown[0]}", "is not a known key")
     missing = [key for key in required if key not in value]
@@ -253,7 +278,8 @@ def _read_block(value: Any, index: int, grid_columns: int, header_rows: int) -> 
         _refuse(f"{path}.area", f"a {block_type} block belongs in the body")
     place = ("row", "rows") if area == "header" else ()
     body_optional = ("beside", "gap_before") if area == "body" else ()
-    _object(value, path, ("type", "area", "col", "span") + place + TYPE_KEYS[block_type], ("style",) + body_optional)
+    box_optional = ("box",) if block_type == "company_details" else ()
+    _object(value, path, ("type", "area", "col", "span") + place + TYPE_KEYS[block_type], ("style",) + body_optional + box_optional)
 
     col = _integer(value["col"], f"{path}.col", 1, grid_columns)
     span = _integer(value["span"], f"{path}.span", 1, grid_columns)
@@ -282,6 +308,7 @@ def _read_block(value: Any, index: int, grid_columns: int, header_rows: int) -> 
         }
     elif block_type == "company_details":
         block["fields"] = _fields(value["fields"], f"{path}.fields", COMPANY_FIELDS)
+        block["box"] = _read_company_box(value.get("box", {}), f"{path}.box")
     elif block_type == "client_details":
         block["fields"] = _fields(value["fields"], f"{path}.fields", CLIENT_FIELDS)
         block["address_rows"] = _integer(value["address_rows"], f"{path}.address_rows", 1, 6)
@@ -318,6 +345,16 @@ def _read_block(value: Any, index: int, grid_columns: int, header_rows: int) -> 
     return block
 
 
+def _read_company_box(value: Any, path: str) -> dict[str, float]:
+    """Where the company details text box starts and stops inside its cells, as offsets in mm.
+
+    left_mm and top_mm move the box's top-left corner in from the block's top-left corner, right_mm
+    stops the box that far short of the block's right edge. Missing keys mean no offset.
+    """
+    box = _object(value, path, (), ("left_mm", "top_mm", "right_mm"))
+    return {key: _number(box.get(key, 0), f"{path}.{key}", 0, 20) for key in ("left_mm", "top_mm", "right_mm")}
+
+
 def _field_rows(block: dict[str, Any]) -> int:
     """Rows a cell-based header block needs: the address takes address_rows, attention a label and a name row."""
     sizes = {"client_address": block.get("address_rows", 1), "attention": 2}
@@ -329,7 +366,7 @@ def _read_table_columns(value: Any, path: str, block_col: int, block_span: int) 
     used: set[int] = set()
     for index, column in enumerate(_list(value, path, 2, MAX_TABLE_COLUMNS)):
         column_path = f"{path}[{index}]"
-        column = _object(column, column_path, ("key", "label", "col", "span", "align"))
+        column = _object(column, column_path, ("key", "label", "col", "span", "align"), ("item_align",))
         key = _choice(column["key"], f"{column_path}.key", TABLE_COLUMN_KEYS)
         if any(existing["key"] == key for existing in columns):
             _refuse(f"{column_path}.key", "is listed twice")
@@ -342,18 +379,112 @@ def _read_table_columns(value: Any, path: str, block_col: int, block_span: int) 
         if cells & used:
             _refuse(f"{column_path}.col", "overlaps another table column")
         used |= cells
+        align = _choice(column["align"], f"{column_path}.align", ALIGNMENTS)
+        # Item rows may align differently from the heading and section rows (item numbers are
+        # centred while section numbers are left); item_align defaults to align.
         columns.append({
             "key": key,
             "label": _text(column["label"], f"{column_path}.label", 40),
             "col": col,
             "span": span,
-            "align": _choice(column["align"], f"{column_path}.align", ALIGNMENTS),
+            "align": align,
+            "item_align": _choice(column.get("item_align", align), f"{column_path}.item_align", ALIGNMENTS),
         })
     keys = {column["key"] for column in columns}
     for required in ("description", "amount"):
         if required not in keys:
             _refuse(path, f"the item table needs a {required} column")
     return columns
+
+
+def _visible_width_units(grid: dict[str, Any], first: int, span: int) -> float:
+    """Width of the visible grid columns from column number `first` (1-based) across `span` columns."""
+    return sum(column["width"] for column in grid["columns"][first - 1:first - 1 + span] if not column["hidden"])
+
+
+def width_unit_points(theme: dict[str, Any]) -> float:
+    """Narrowest width of one grid width unit, in points, for this theme's font and size.
+
+    LibreOffice uses the digit's exact width. Excel uses the digit hinted at a whole-pixel font size on
+    its display, which this approximates by rounding the exact width to whole pixels at each scaling
+    preset; the spare row in printable_rows_per_page covers where the hinted digit is narrower.
+    """
+    exact = DIGIT_EM[theme["font"]] * theme["size_pt"]
+    whole_pixels = (math.floor(exact * dpi / 72 + 0.5) * 72 / dpi for dpi in DISPLAY_DPIS)
+    return min(exact, *whole_pixels)
+
+
+def print_scale(page: dict[str, Any], grid: dict[str, Any], theme: dict[str, Any]) -> float:
+    """Largest scale the sheet prints at: printable width over the visible width, at most 1."""
+    paper_width = A4_MM[0] if page["orientation"] == "portrait" else A4_MM[1]
+    margins = page["margins_mm"]
+    printable_width = (paper_width - margins["left"] - margins["right"]) * POINTS_PER_MM
+    visible_width = _visible_width_units(grid, 1, len(grid["columns"])) * width_unit_points(theme)
+    return min(1.0, printable_width / visible_width)
+
+
+def grid_column_pixels(width: float) -> int:
+    """Pixels the renderer gives a visible grid column when it places pictures and text boxes."""
+    return round(width * 7 + 5)
+
+
+def _check_company_box(page: dict[str, Any], grid: dict[str, Any], theme: dict[str, Any], blocks: list[dict[str, Any]]) -> None:
+    """Refuse a company details box whose margins leave no room inside its cells.
+
+    The width is the smaller of the renderer's placement width and the printed width of the theme
+    font's digits, so the renderer's own check cannot fail on a definition read here.
+    """
+    for index, block in enumerate(blocks):
+        if block["type"] != "company_details":
+            continue
+        columns = [column for column in grid["columns"][block["col"] - 1:block["col"] - 1 + block["span"]] if not column["hidden"]]
+        placed = sum(grid_column_pixels(column["width"]) for column in columns) * EMU_PER_PIXEL
+        printed = round(sum(column["width"] for column in columns) * width_unit_points(theme) * EMU_PER_POINT)
+        height = block["rows"] * round(page["row_height_pt"] * EMU_PER_POINT)
+        box = block["box"]
+        left, top, right = (round(box[key] * EMU_PER_MM) for key in ("left_mm", "top_mm", "right_mm"))
+        if left + right >= min(placed, printed) or top >= height:
+            _refuse(f"blocks[{index}].box", "leaves no room for the company details inside its cells")
+
+
+def printable_rows_per_page(page: dict[str, Any], grid: dict[str, Any], theme: dict[str, Any]) -> int:
+    """Most rows one A4 page of this layout can print, keeping one row spare.
+
+    The sheet prints fit to one page wide (print_scale). Each row counts its set height plus 0.75 pt,
+    times that scale, and the page keeps SPARE_ROWS_PER_PAGE unused for the rest of Excel's printed
+    excess. Excel rounds its zoom down to a whole percent, which only makes rows shorter.
+    """
+    paper_height = A4_MM[1] if page["orientation"] == "portrait" else A4_MM[0]
+    margins = page["margins_mm"]
+    printable_height = (paper_height - margins["top"] - margins["bottom"]) * POINTS_PER_MM
+    printed_row = (page["row_height_pt"] + PRINTED_ROW_ALLOWANCE_POINTS) * print_scale(page, grid, theme)
+    return math.floor(printable_height / printed_row - SPARE_ROWS_PER_PAGE)
+
+
+def _check_page_fit(
+    page: dict[str, Any], grid: dict[str, Any], theme: dict[str, Any], blocks: list[dict[str, Any]], header_rows: int,
+) -> None:
+    """Refuse a layout whose pages cannot physically hold their rows, or whose items have no room."""
+    table_index, table = next((index, block) for index, block in enumerate(blocks) if block["type"] == "item_table")
+    table_header = 2 if table["currency_row"] else 1
+    for index, column in enumerate(table["columns"]):
+        if column["key"] == "description":
+            width = _visible_width_units(grid, column["col"], column["span"])
+            if width < MIN_DESCRIPTION_WIDTH_UNITS:
+                _refuse(
+                    f"blocks[{table_index}].columns[{index}]",
+                    f"the description needs at least {MIN_DESCRIPTION_WIDTH_UNITS} visible width units, not {width:g}",
+                )
+    if print_scale(page, grid, theme) < MIN_PRINT_SCALE:
+        _refuse("grid.columns", "are too wide to shrink onto one page width (they would print below 13 %)")
+    rows_fit = printable_rows_per_page(page, grid, theme)
+    for key in ("first_page_rows", "page_rows"):
+        if page[key] > rows_fit:
+            _refuse(f"page.{key}", f"is more rows than the paper holds at this size, margins and row height (at most {rows_fit})")
+    if page["first_page_rows"] - header_rows - table_header < MIN_BODY_ROWS:
+        _refuse("header.rows", f"must leave at least {MIN_BODY_ROWS} rows for the item table on the first page")
+    if page["page_rows"] - (page["continuation_top_rows"] + table_header + 1) < MIN_BODY_ROWS:
+        _refuse("page.continuation_top_rows", f"must leave at least {MIN_BODY_ROWS} rows for items on a later page")
 
 
 def _check_layout(blocks: list[dict[str, Any]], grid: dict[str, Any]) -> None:
@@ -444,7 +575,10 @@ def _parse_float(text: str) -> float:
 def parse_quote_template_json(raw: bytes | str) -> Any:
     """Parse definition JSON strictly: size cap, UTF-8 only, no duplicate keys or NaN."""
     if isinstance(raw, str):
-        raw = raw.encode("utf-8")
+        try:
+            raw = raw.encode("utf-8")
+        except UnicodeEncodeError:
+            _refuse("definition", "contains a lone surrogate character")
     if not isinstance(raw, bytes):
         _refuse("definition", "must be JSON text")
     if len(raw) > MAX_DEFINITION_BYTES:
@@ -500,13 +634,16 @@ def read_quote_template(value: Any) -> dict[str, Any]:
         for index, block in enumerate(_list(root["blocks"], "blocks", 2, MAX_BLOCKS))
     ]
     _check_layout(blocks, grid)
+    theme = _read_theme(root["theme"])
+    _check_page_fit(page, grid, theme, blocks, header_rows)
+    _check_company_box(page, grid, theme, blocks)
     return {
         "schema": SCHEMA_ID,
         "name": _text(root["name"], "name", 60, allow_empty=False),
         "page": page,
         "header": {"rows": header_rows},
         "grid": grid,
-        "theme": _read_theme(root["theme"]),
+        "theme": theme,
         "labels": _read_labels(root["labels"]),
         "blocks": blocks,
     }

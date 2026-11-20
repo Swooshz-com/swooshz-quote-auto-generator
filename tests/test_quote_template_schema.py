@@ -314,6 +314,18 @@ class HostileDefinitionTest(unittest.TestCase):
         self.assert_refused(mutated(lambda d: d.update({"name": "Std\ud800"})), "definition")
         self.assert_refused(mutated(lambda d: d["theme"].update({"\udc00": 1})), "definition")
 
+    def test_lone_surrogates_in_text_and_mixed_unknown_keys_are_refused_with_a_path(self):
+        standard_text = json.dumps(STANDARD_RAW)
+        # A str that holds a lone surrogate cannot be encoded as UTF-8: refused at the definition, not a UnicodeEncodeError.
+        self.assert_refused(standard_text.replace('"Standard"', '"Std\ud800"'), "definition")
+        # Python callers may pass int keys; unknown keys of mixed types are refused as unknown, not with a TypeError.
+        for extra in ({1: 2, "zoom": 3}, {"zoom": 3, 1: 2}):
+            with self.subTest(keys=sorted(map(str, extra))):
+                with self.assertRaises(qt.QuoteTemplateError) as caught:
+                    qt.read_quote_template(mutated(lambda d: d["page"].update(extra)))
+                self.assertTrue(caught.exception.path.startswith("page."), caught.exception.path)
+                self.assertEqual(caught.exception.message, "is not a known key")
+
     def test_reader_names_a_path_for_every_refusal(self):
         error = None
         try:
@@ -323,6 +335,85 @@ class HostileDefinitionTest(unittest.TestCase):
         self.assertIsNotNone(error)
         self.assertEqual(error.path, "definition.name")
         self.assertIn("is required", str(error))
+
+
+class PageFitTest(unittest.TestCase):
+    """A layout must physically fit its paper: rows per page, room for items and a readable description."""
+
+    def assert_refused(self, definition, path_prefix):
+        with self.assertRaises(qt.QuoteTemplateError) as caught:
+            qt.read_quote_template(definition)
+        self.assertTrue(
+            caught.exception.path.startswith(path_prefix),
+            f"refused at {caught.exception.path!r} ({caught.exception.message}), expected {path_prefix!r}",
+        )
+
+    def test_rows_per_page_stop_at_what_the_paper_holds(self):
+        # Standard (Calibri 13) holds 61 rows of 18.7 pt, its own page length: its digit is 6.43 pt (15 px
+        # at 168 dpi, below the 6.59 pt exact width), each row counts 0.75 pt taller, which gives 62.17
+        # rows, and a page keeps one row spare.
+        qt.read_quote_template(mutated(lambda d: d["page"].update({"page_rows": 61})))
+        self.assert_refused(mutated(lambda d: d["page"].update({"page_rows": 62})), "page.page_rows")
+        self.assert_refused(mutated(lambda d: d["page"].update({"first_page_rows": 80})), "page.first_page_rows")
+        # Taller rows or a landscape page hold fewer rows; a first page of 20 rows fits either, so page_rows is what is refused.
+        self.assert_refused(mutated(lambda d: d["page"].update({"row_height_pt": 40, "first_page_rows": 20, "page_rows": 61})), "page.page_rows")
+        self.assert_refused(mutated(lambda d: d["page"].update({"orientation": "landscape", "first_page_rows": 20})), "page.page_rows")
+
+    def test_the_theme_font_sets_how_many_rows_fit(self):
+        # Columns are sized in the theme font's widest digit, so a smaller or narrower font prints the same
+        # grid narrower, at a larger scale, with fewer rows a page. Limits for Standard's grid, margins and
+        # 18.7 pt rows counted as 19.45 pt with one row spare, worked out from the digit widths (Calibri
+        # 1038/2048 em, Arial 1139/2048 em), using the smallest of the exact width and its whole-pixel
+        # width at each Windows display scaling (96 to 336 dpi).
+        limits = (
+            ("Calibri", 9, 42),    # small: 4.56 pt exact; 6 px at 96 dpi = 4.5 pt
+            ("Calibri", 11, 49),   # 5.58 pt exact; 7 px at 96 dpi = 5.25 pt
+            ("Calibri", 12, 57),   # 6.08 pt exact; 8 px at 96 dpi = 6.0 pt
+            ("Arial", 10, 49),     # 5.56 pt exact; 7 px at 96 dpi = 5.25 pt
+            ("Arial", 20, 105),    # large: 11.12 pt exact; 22 px at 144 dpi = 11.0 pt
+            ("Calibri", 20, 95),   # large: 10.14 pt exact; 20 px at 144 dpi = 10.0 pt
+        )
+        for font, size, rows in limits:
+            def with_font(first_page_rows, page_rows):
+                return mutated(lambda d: (
+                    d["theme"].update({"font": font, "size_pt": size}),
+                    d["page"].update({"first_page_rows": first_page_rows, "page_rows": page_rows}),
+                ))
+            first = min(rows, 55)
+            with self.subTest(font=font, size=size):
+                qt.read_quote_template(with_font(first, rows))
+                self.assert_refused(with_font(first, rows + 1), "page.page_rows")
+                if rows < 55:
+                    self.assert_refused(with_font(rows + 1, rows), "page.first_page_rows")
+        # The smallest Calibri holds 36 rows, so Standard's own 55 first-page rows are refused.
+        self.assert_refused(mutated(lambda d: d["theme"].update({"size_pt": 7})), "page.first_page_rows")
+
+    def test_width_unit_follows_the_theme_font(self):
+        self.assertEqual(qt.width_unit_points({"font": "Calibri", "size_pt": 11}), 5.25)  # 7 px at 96 dpi
+        self.assertEqual(qt.width_unit_points({"font": "Calibri", "size_pt": 12}), 6.0)  # 8 px at 96 dpi
+        self.assertAlmostEqual(qt.width_unit_points({"font": "Calibri", "size_pt": 13}), 15 * 72 / 168)  # 15 px at 168 dpi
+        self.assertAlmostEqual(qt.width_unit_points({"font": "Arial", "size_pt": 20}), 11.0)  # 22 px at 144 dpi
+        self.assertAlmostEqual(qt.width_unit_points({"font": "Arial", "size_pt": 7}), 3.6)  # 6 px at 120 dpi
+        self.assertAlmostEqual(qt.width_unit_points({"font": "Calibri", "size_pt": 7}), 3.375)  # 9 px at 192 dpi
+
+    def test_a_narrow_description_column_is_refused_with_its_path(self):
+        # Standard's description spans grid columns C and D (49.375 + 14 units); its first column is blocks[4].columns[2].
+        narrow = mutated(lambda d: (d["grid"]["columns"][2].update({"width": 4}), d["grid"]["columns"][3].update({"width": 4})))
+        self.assert_refused(narrow, "blocks[4].columns[2]")
+        # 16 + 14 = 30 units is the least allowed; with that width, 41 rows on page 1 and 45 later still fit the paper.
+        def narrowed(width):
+            return mutated(lambda d: (d["grid"]["columns"][2].update({"width": width}), d["page"].update({"first_page_rows": 41, "page_rows": 45})))
+        qt.read_quote_template(narrowed(16))
+        self.assert_refused(narrowed(15.9), "blocks[4].columns[2]")
+
+    def test_the_continuation_header_must_leave_room_for_items(self):
+        # 20 rows per page with 10 rows above the repeated header leaves 7 rows for items on later pages.
+        self.assert_refused(mutated(lambda d: d["page"].update({"page_rows": 20, "continuation_top_rows": 10})), "page.continuation_top_rows")
+        qt.read_quote_template(mutated(lambda d: d["page"].update({"continuation_top_rows": 2})))
+
+    def test_the_first_page_must_leave_room_for_items(self):
+        self.assert_refused(mutated(lambda d: d["page"].update({"first_page_rows": 40})), "header.rows")
+        qt.read_quote_template(mutated(lambda d: d["page"].update({"first_page_rows": 41})))
 
 
 if __name__ == "__main__":

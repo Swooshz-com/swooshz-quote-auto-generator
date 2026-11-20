@@ -34,6 +34,7 @@
     {
       "type": "company_details", "area": "header", "row": 4, "rows": 16, "col": 9, "span": 1,
       "fields": ["header_lines", "blank", "project_number"],
+      "box": {"left_mm": 0.48, "top_mm": 2.01, "right_mm": 3.22},
       "style": {"size_pt": 9}
     },
     {
@@ -48,7 +49,7 @@
     {
       "type": "item_table", "area": "body", "col": 1, "span": 5, "gap_before": 0, "currency_row": true,
       "columns": [
-        {"key": "position", "label": "Pos.", "col": 1, "span": 1, "align": "left"},
+        {"key": "position", "label": "Pos.", "col": 1, "span": 1, "align": "left", "item_align": "center"},
         {"key": "quantity", "label": "Quantity", "col": 2, "span": 1, "align": "center"},
         {"key": "description", "label": "Service", "col": 3, "span": 2, "align": "left"},
         {"key": "amount", "label": "Estimate", "col": 5, "span": 1, "align": "right"}

@@ -3197,6 +3197,9 @@ def visible_column_width_points(root: ET.Element, first: int, last: int) -> floa
     return width - 6
 
 
+QUOTE_ENTRY_TOO_TALL_MESSAGE = "A quotation line item exceeds the available page height."
+
+
 def prepare_quantity_lines(
     entries: list[dict[str, Any]], root: ET.Element, parts: dict[str, bytes] | None,
     *, columns: tuple[int, int] | None = (2, 2), font_size: float | None = None,
@@ -3232,7 +3235,7 @@ def prepare_quantity_lines(
         ]
     capacity = page.page_height - page.body_offset
     if any(quote_entry_keep_height(entries, index) > capacity for index in range(len(entries))):
-        raise ValueError("A quotation line item exceeds the available page height.")
+        raise ValueError(QUOTE_ENTRY_TOO_TALL_MESSAGE)
 
 
 def acceptance_text_lines(
@@ -4375,45 +4378,57 @@ class TemplateQuoteRenderer:
             for entry in entries:
                 if entry["kind"] == "item":
                     entry["quantity"] = entry["quantity_number"]
-        prepare_quantity_lines(
-            entries, self.root, None,
-            columns=(quantity["col"], quantity["col"] + quantity["span"] - 1) if quantity else None,
-            font_size=self._block_size(block), page=self.page,
-        )
+        try:
+            prepare_quantity_lines(
+                entries, self.root, None,
+                columns=(quantity["col"], quantity["col"] + quantity["span"] - 1) if quantity else None,
+                font_size=self._block_size(block), page=self.page,
+            )
+        except ValueError as exc:
+            if str(exc) != QUOTE_ENTRY_TOO_TALL_MESSAGE:
+                raise
+            raise quote_template.QuoteTemplateError(
+                "page.page_rows",
+                "a line item is taller than a later page at these settings; shorten its description or raise page_rows",
+            ) from exc
         self._write_table_header(start)
         first_body_row = start + (2 if block["currency_row"] else 1)
 
-        def column_style(key: str, **overrides: Any) -> str:
+        def item_style(key: str, **overrides: Any) -> str:
+            return self._block_style(block, horizontal=columns[key]["item_align"], **overrides)
+
+        def section_style(key: str, **overrides: Any) -> str:
             return self._block_style(block, horizontal=columns[key]["align"], **overrides)
 
         amount_col = columns["amount"]["col"]
-        price_style = column_style("amount", num_fmt=TEMPLATE_AMOUNT_FORMAT)
+        section_price_style = section_style("amount", num_fmt=TEMPLATE_AMOUNT_FORMAT)
+        item_price_style = item_style("amount", num_fmt=TEMPLATE_AMOUNT_FORMAT)
         row = first_body_row
         for index, entry in enumerate(entries):
             row = self._ensure_entry_page(row, quote_entry_keep_height(entries, index))
             if entry["kind"] == "section":
                 if "position" in columns:
-                    set_ooxml_cell(self.root, row, columns["position"]["col"], entry["number"], column_style("position", bold=True))
-                set_ooxml_cell(self.root, row, description["col"], entry["section"], column_style("description", bold=True))
+                    set_ooxml_cell(self.root, row, columns["position"]["col"], entry["number"], section_style("position", bold=True))
+                set_ooxml_cell(self.root, row, description["col"], entry["section"], section_style("description", bold=True))
                 if entry.get("amount") is not None:
-                    set_ooxml_cell(self.root, row, amount_col, entry["amount"], price_style)
+                    set_ooxml_cell(self.root, row, amount_col, entry["amount"], section_price_style)
                 if entry.get("coverage"):
                     set_ooxml_cell(self.root, row + 1, amount_col, entry["coverage"], self._block_style(block))
                 row += 2
                 continue
             height = quote_entry_height(entry)
             if "position" in columns:
-                set_ooxml_cell(self.root, row, columns["position"]["col"], entry["number"], column_style("position"))
-            set_ooxml_cell(self.root, row, amount_col, entry["amount"], price_style)
+                set_ooxml_cell(self.root, row, columns["position"]["col"], entry["number"], item_style("position"))
+            set_ooxml_cell(self.root, row, amount_col, entry["amount"], item_price_style)
             if "unit" in columns:
-                set_ooxml_cell(self.root, row, columns["unit"]["col"], entry["unit"], column_style("unit"))
+                set_ooxml_cell(self.root, row, columns["unit"]["col"], entry["unit"], item_style("unit"))
             if "unit_price" in columns:
-                set_ooxml_cell(self.root, row, columns["unit_price"]["col"], entry["unit_price"], column_style("unit_price", num_fmt=TEMPLATE_AMOUNT_FORMAT))
+                set_ooxml_cell(self.root, row, columns["unit_price"]["col"], entry["unit_price"], item_style("unit_price", num_fmt=TEMPLATE_AMOUNT_FORMAT))
             for offset in range(height):
                 if quantity and offset < len(entry["quantity_lines"]):
-                    set_ooxml_cell(self.root, row + offset, quantity["col"], entry["quantity_lines"][offset], column_style("quantity"))
+                    set_ooxml_cell(self.root, row + offset, quantity["col"], entry["quantity_lines"][offset], item_style("quantity"))
                 if offset < len(entry["description_lines"]):
-                    set_ooxml_cell(self.root, row + offset, description["col"], entry["description_lines"][offset], column_style("description"))
+                    set_ooxml_cell(self.root, row + offset, description["col"], entry["description_lines"][offset], item_style("description"))
             row += height + 1
         self.table_rows = (first_body_row, row - 1)
         self.entries = entries
@@ -4519,7 +4534,7 @@ class TemplateQuoteRenderer:
 
     def _column_emu(self, col: int) -> int:
         column = self.grid[col - 1]
-        return 0 if column["hidden"] else round(column["width"] * 7 + 5) * EMU_PER_PIXEL
+        return 0 if column["hidden"] else quote_template.grid_column_pixels(column["width"]) * EMU_PER_PIXEL
 
     def _row_emu(self) -> int:
         return round(float(self.row_height) * EMU_PER_POINT)
@@ -4609,9 +4624,17 @@ class TemplateQuoteRenderer:
         color = (style.get("color") or self.template["theme"]["color"])[1:].upper()
         typeface = style.get("font") or self.template["theme"]["font"]
         rect_width, rect_height = self._rect_emu(block)
+        box = block["box"]
+        left = round(box["left_mm"] * EMU_PER_MM)
+        top = round(box["top_mm"] * EMU_PER_MM)
+        right = round(box["right_mm"] * EMU_PER_MM)
+        if left + right >= rect_width or top >= rect_height:
+            raise quote_template.QuoteTemplateError(
+                f"blocks[{self.blocks.index(block)}].box", "leaves no room for the company details inside its cells",
+            )
         anchor = ET.Element(f"{NS_DRAWING}twoCellAnchor")
-        self._anchor_marker(anchor, "from", block["col"], 0, block["row"], 0)
-        self._anchor_marker(anchor, "to", block["col"], rect_width, block["row"], rect_height)
+        self._anchor_marker(anchor, "from", block["col"], left, block["row"], top)
+        self._anchor_marker(anchor, "to", block["col"], rect_width - right, block["row"], rect_height)
         shape = ET.SubElement(anchor, f"{NS_DRAWING}sp", {"macro": "", "textlink": ""})
         nv = ET.SubElement(shape, f"{NS_DRAWING}nvSpPr")
         ET.SubElement(nv, f"{NS_DRAWING}cNvPr", {"id": "1", "name": "Company Details"})
