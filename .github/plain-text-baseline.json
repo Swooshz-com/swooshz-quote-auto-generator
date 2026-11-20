@@ -1,245 +1,245 @@
 {
-  "schema": "toolkit-plain-references-baseline/v1",
-  "description": "What was already there when the plain-text check was added. Each entry is allowed up to its count until it is rewritten; new ones fail. This list only shrinks: rewrite an entry, then run the check with --prune-baseline. Never add entries.",
+  "schema": "toolkit-plain-references-baseline/v2",
+  "description": "Existing findings, allowed up to each count until rewritten. This list only shrinks: rewrite an entry, then run with --prune-baseline. Never add entries. Fingerprints replace matched text.",
   "allowed": [
     {
       "file": "docs/architecture-dead-code-fallback-audit.md",
       "rule": "number-reference",
-      "text": "#84",
+      "fingerprint": "7a6a4594d36f61931b1e83496384520fc5fb7b779941b1989b47223bfa5c97fa",
       "count": 3
     },
     {
       "file": "docs/architecture-dead-code-fallback-audit.md",
       "rule": "number-reference",
-      "text": "#88",
+      "fingerprint": "bf98c89bc257abd774224a4d65d7ade9f8ff37e460b0ab62d8cd085edbc7c42d",
       "count": 1
     },
     {
       "file": "docs/architecture-dead-code-fallback-audit.md",
       "rule": "number-reference",
-      "text": "#91",
+      "fingerprint": "2a35cde176bd478ad9054e48e01638e8328d089debd74630415004fa452caef8",
       "count": 7
     },
     {
       "file": "docs/current-cicd-status.md",
       "rule": "number-reference",
-      "text": "#160",
+      "fingerprint": "32226fdefdbc7f55da41402bce5c7c3bf0a160d297e7a5998d0d1aeba467959f",
       "count": 1
     },
     {
       "file": "docs/internal-uat-checkpoint.md",
       "rule": "number-reference",
-      "text": "#75",
+      "fingerprint": "27ab36fbb9e88d9bce91c7df051159477dd7aaa55ec24ad619c772a4a702d00d",
       "count": 1
     },
     {
       "file": "docs/internal-uat-checkpoint.md",
       "rule": "number-reference",
-      "text": "#76",
+      "fingerprint": "39ed481edc371c60e64c4e6fabf592ef6287115723bf98b60312207e17d325b9",
       "count": 1
     },
     {
       "file": "docs/internal-uat-checkpoint.md",
       "rule": "number-reference",
-      "text": "#77",
+      "fingerprint": "58e1e1de8f9894d1df504417dc5135f6b2d3e440d90574e855e75564da22f26b",
       "count": 1
     },
     {
       "file": "docs/internal-uat-checkpoint.md",
       "rule": "number-reference",
-      "text": "#79",
+      "fingerprint": "04b77ac9d34d5f247499bb058546f3ead8ee02daa55aca5be423eba170d7e8be",
       "count": 1
     },
     {
       "file": "docs/internal-uat-checkpoint.md",
       "rule": "number-reference",
-      "text": "#81",
+      "fingerprint": "496a80a2343afce1fdf8331973fde63dcebaf650b691ff010d29ead821914eaa",
       "count": 1
     },
     {
       "file": "docs/internal-uat-checkpoint.md",
       "rule": "number-reference",
-      "text": "#82",
+      "fingerprint": "d7634f5b450b30f1354363e8a2f98758967e178e219331d756b16620d127aac7",
       "count": 2
     },
     {
       "file": "docs/internal-uat-checkpoint.md",
       "rule": "number-reference",
-      "text": "#86",
+      "fingerprint": "9178dc7e12b99efe9526fe0a928a087b222732996bb6e59d776693115a6ce274",
       "count": 1
     },
     {
       "file": "docs/platform-integration-contract.md",
       "rule": "number-reference",
-      "text": "#114",
+      "fingerprint": "7cae955b97c437af88e15b8a87c515fda3f8538b5c1669ee45215229cfd45927",
       "count": 1
     },
     {
       "file": "docs/platform-integration-contract.md",
       "rule": "number-reference",
-      "text": "#79",
+      "fingerprint": "266fed47080584b41a8fd919e6b5520021b731c7fa2ec9de1975d7909fc0d1eb",
       "count": 1
     },
     {
       "file": "docs/production-readiness-audit.md",
       "rule": "number-reference",
-      "text": "#140",
+      "fingerprint": "a856a8822b2dcc106f7cbb1bf93a9c8043a031df4f5a447871aceb7f2fc26710",
       "count": 10
     },
     {
       "file": "docs/production-readiness-audit.md",
       "rule": "number-reference",
-      "text": "#152",
+      "fingerprint": "9edcd9e99d5cfad1e8385795d29262551947c23ee515c12982f80ae09b032869",
       "count": 1
     },
     {
       "file": "docs/production-readiness-audit.md",
       "rule": "number-reference",
-      "text": "#79",
+      "fingerprint": "57a5414a6e399d91ffd15393837c1f5a32e83b5e5ca9f8738b6fa2850d4c6e59",
       "count": 1
     },
     {
       "file": "docs/production-readiness-audit.md",
       "rule": "number-reference",
-      "text": "#84",
+      "fingerprint": "13d6cca12347bc0c0ed6a99453373ecc20117fd543ee5a2c25f8ea8e513a70ff",
       "count": 3
     },
     {
       "file": "docs/production-readiness-audit.md",
       "rule": "number-reference",
-      "text": "#88",
+      "fingerprint": "d5c9811599d550f5b07b57f869791a71e6f7fdec486a922b7d305452ad77ced9",
       "count": 5
     },
     {
       "file": "docs/production-readiness-audit.md",
       "rule": "number-reference",
-      "text": "#89",
+      "fingerprint": "5f74061b564d0f0e00140133d4613f87a582ed8b2a420087a25a4990f488ad75",
       "count": 5
     },
     {
       "file": "docs/production-readiness-audit.md",
       "rule": "number-reference",
-      "text": "#91",
+      "fingerprint": "47ca31aeba79d0b68ace87820aafaf24e005fb7f9defa8d69a80a23c64f89dc3",
       "count": 5
     },
     {
       "file": "docs/README.md",
       "rule": "number-reference",
-      "text": "#82",
+      "fingerprint": "6a18744bbe608a54357547db71fb10b66444b870247831325c0a62c362bd6af1",
       "count": 1
     },
     {
       "file": "docs/release-security-audit.md",
       "rule": "number-reference",
-      "text": "#100",
+      "fingerprint": "e66bd316053959b3bc655cfa037b8e96bc8caa8f889b18872af18842650096dd",
       "count": 2
     },
     {
       "file": "docs/release-security-audit.md",
       "rule": "number-reference",
-      "text": "#108",
+      "fingerprint": "704815d09c03816682dfc4ac29d3c0c94a83db67c47cf7ba2cdd28466c12b4f7",
       "count": 3
     },
     {
       "file": "docs/release-security-audit.md",
       "rule": "number-reference",
-      "text": "#112",
+      "fingerprint": "8d3bd8edf37da9d5630a99d7a0109575e5c029ecb4687a92cb71ad541d323b30",
       "count": 1
     },
     {
       "file": "docs/release-security-audit.md",
       "rule": "number-reference",
-      "text": "#134",
+      "fingerprint": "0581d0687ef14d984643937012f90daa02bf642ac2d2a768c3b2d49cdb2f97a4",
       "count": 1
     },
     {
       "file": "docs/release-security-audit.md",
       "rule": "number-reference",
-      "text": "#144",
+      "fingerprint": "e90d23d11c1f32d2b50914f181e6207a482f5c838951929cd3cf75584dca9688",
       "count": 2
     },
     {
       "file": "docs/release-security-audit.md",
       "rule": "number-reference",
-      "text": "#79",
+      "fingerprint": "5bbc71757568f8fedfd9b91750c71bd3185c8ddf754ee4694b0147044a449b52",
       "count": 1
     },
     {
       "file": "docs/release-security-audit.md",
       "rule": "number-reference",
-      "text": "#86",
+      "fingerprint": "ed790571198dc79696a7b81013f0c760015b0e4d635e48883a02d304ad0f3c42",
       "count": 1
     },
     {
       "file": "docs/release-security-audit.md",
       "rule": "number-reference",
-      "text": "#88",
+      "fingerprint": "73635c98628ce379573a4e0b1236de88d961a43dc51d20f9159f895bcda4dc0c",
       "count": 18
     },
     {
       "file": "docs/release-security-audit.md",
       "rule": "number-reference",
-      "text": "#89",
+      "fingerprint": "f1260735e508b94075b2e434eb9fa18e86015f5405579a774791791fee918c94",
       "count": 14
     },
     {
       "file": "docs/release-security-audit.md",
       "rule": "number-reference",
-      "text": "#91",
+      "fingerprint": "04009e8c73b8cded34193c0c302b81234cac1a599915c054d6295c128dabc7dd",
       "count": 18
     },
     {
       "file": "docs/release-security-audit.md",
       "rule": "number-reference",
-      "text": "#92",
+      "fingerprint": "3c29d78d4dd83069321846888fa4625e4c60a676531e16cc8c93eaa06424a725",
       "count": 5
     },
     {
       "file": "docs/release-security-audit.md",
       "rule": "number-reference",
-      "text": "#93",
+      "fingerprint": "9f014550218819a0be764bab2760ddd8e004d04544782502eb69a529fdf5e284",
       "count": 5
     },
     {
       "file": "docs/release-security-audit.md",
       "rule": "number-reference",
-      "text": "#94",
+      "fingerprint": "ca95de03ca651a856ec861c6d380eea018c9048ba5ea4f0288f5010c3c3e15ef",
       "count": 5
     },
     {
       "file": "docs/release-security-audit.md",
       "rule": "number-reference",
-      "text": "#95",
+      "fingerprint": "1f01b59e6a59258467c629135984fdb641c4c58793b557d12b49d46c7921c72e",
       "count": 3
     },
     {
       "file": "docs/release-security-audit.md",
       "rule": "number-reference",
-      "text": "#96",
+      "fingerprint": "2f316f2de01710176743f4b709a494ea8a1719cf3dc6b9c8fb3fe17c620d7530",
       "count": 3
     },
     {
       "file": "docs/release-security-audit.md",
       "rule": "number-reference",
-      "text": "#97",
+      "fingerprint": "70d43b8e488b24014cf527312b00e2850524341a7f11f04d792f1994a2bbdd66",
       "count": 3
     },
     {
       "file": "docs/release-security-audit.md",
       "rule": "number-reference",
-      "text": "#98",
+      "fingerprint": "9ca3e2cbbfca9920d7a876589774c4e5c45dd714a8f942206fb362f1b101e0e3",
       "count": 3
     },
     {
       "file": "docs/release-security-audit.md",
       "rule": "number-reference",
-      "text": "#99",
+      "fingerprint": "4fe2a194b6698cdbc2a90624f7dd3f2aa7db72fd20bd658753da86a06ff22494",
       "count": 3
     },
     {
       "file": "docs/sqag-current-status.md",
       "rule": "number-reference",
-      "text": "#79",
+      "fingerprint": "08d794b7a0f150e78ce8dda6fee92c0e1f14dc6d46709d663aaa6b124230bd96",
       "count": 1
     }
   ]
