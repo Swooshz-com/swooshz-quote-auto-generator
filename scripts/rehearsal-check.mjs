@@ -376,7 +376,8 @@ class Run {
       // The production-branch guard's verdict on this app's database (host and branch name only).
       db_guard: options.dbGuardResult ?? null,
     };
-    this.trace = { jobs: [], saves: [], normalizations: [], pending: [], sequence: 0 };
+    // refused: method, route shape and HTTP code of each refused app request (no ids, no bodies).
+    this.trace = { jobs: [], saves: [], normalizations: [], pending: [], refused: [], sequence: 0 };
     // Paid AI goes through the run's capped ledger; a check without one refuses any paid call.
     this.budget = options.budget ?? NO_PAID_AI;
     this.readOnly = null;
@@ -440,6 +441,9 @@ function attachTrace(run, page) {
     const task = (async () => {
       const request = response.request();
       const url = new URL(response.url());
+      if (url.origin === run.baseUrl && response.status() >= 400 && run.trace.refused.length < 20) {
+        run.trace.refused.push(`${request.method()} ${url.pathname.replace(/[A-Za-z0-9_-]{16,}/g, ":id")} ${response.status()}`);
+      }
       if (url.origin !== run.baseUrl || !(response.headers()["content-type"] || "").includes("application/json")) return;
       let payload = null;
       try { payload = request.postDataJSON(); } catch { payload = null; }
@@ -615,7 +619,9 @@ async function createQuoteDraft(run, images, projectNumber) {
   ]) await page.locator(selector).fill(value);
   const before = run.trace.sequence;
   await page.locator("#topbarBrandButton").click();
-  await page.locator("#quoteDashboardPanel.is-active").waitFor({ state: "visible", timeout: 20000 });
+  await page.locator("#quoteDashboardPanel.is-active").waitFor({ state: "visible", timeout: 20000 }).catch(async (error) => {
+    throw new Error(`${error.message.split("\n")[0]} ${await dashboardBlockReason(run, before)}`);
+  });
   const saved = await waitUntil(() => [...run.trace.saves].reverse().find((item) => item.sequence > before && item.status === 200
     && item.body?.quote_session?.session_id
     && item.payload?.draft_state?.quoteDetails?.company?.name === COMPANY
@@ -625,6 +631,16 @@ async function createQuoteDraft(run, images, projectNumber) {
   const readback = await quoteSession(run, sessionId);
   assert(readback.customer_summary?.customer_name === CUSTOMER, "The new quote lost its customer details.");
   return sessionId;
+}
+
+// Why the dashboard did not open: codes and counts only, never quote text.
+async function dashboardBlockReason(run, before) {
+  const saves = run.trace.saves.filter((item) => item.sequence > before).map((item) => item.status);
+  const app = await run.page.evaluate(() => ({
+    busy: appBusyTitle(), view: state.activeAppView,
+    errors: document.querySelectorAll("#messageList .message.error").length,
+  })).catch(() => ({}));
+  return `Saves since the click: ${saves.join(", ") || "none"}. App busy: ${app.busy || "no"}; view: ${app.view || "unknown"}; error messages: ${app.errors ?? "unknown"}. Refused requests: ${run.trace.refused.join("; ") || "none"}.`;
 }
 
 // The same deterministic basis the alpha smoke uses: two catalogue lines, no AI.
