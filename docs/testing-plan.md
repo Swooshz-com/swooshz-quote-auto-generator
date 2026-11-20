@@ -733,9 +733,13 @@ the owner-approved CI lane.
   live formula; and the `--quote-template` option of `scripts/generate_quote.py`.
   Page-fit tests at 100 % scale (a compact grid, small fonts and tall rows)
   check the row each page keeps spare for Excel's printed row height, and
-  columns that would print below 13 % are refused. Its LibreOffice PDF smoke prints Standard, the changed
-  template and Standard at Calibri 9 at its largest accepted row count on the
-  expected number of A4 pages with all text inside the page; it skips locally
+  columns that would print below 13 % are refused (pinned on both sides of 13 %).
+  Logo and quantity-column tests check that a logo wider than its block and a
+  quantity column too narrow for three digits are refused, that hidden columns
+  give a company box no room, and that every accepted quantity column renders.
+  Its LibreOffice PDF smoke prints Standard, the changed template, Standard at
+  Calibri 9 and Standard at Arial 16 (an exact-width limit) at their largest
+  accepted row counts on the expected number of A4 pages with all text inside the page; it skips locally
   without LibreOffice and fails in CI if LibreOffice is missing. Changes to the
   legacy layout path also run `tests.test_generate_quote`,
   `tests.test_profile_layout_safety` and `tests.test_quote_exclusions`.

@@ -36,18 +36,31 @@ POINTS_PER_MM = 72 / 25.4
 # font and size. Widest digit advance (0-9) of each allowed font as a fraction of the em, from the font
 # files; Carlito and Liberation Sans, which LibreOffice prints with, have the same widths.
 DIGIT_EM = {"Calibri": 1038 / 2048, "Arial": 1139 / 2048}
-# Page fit is a model with a measured margin, not an exact copy of Excel. Excel for Windows (measured at
-# 96 and 192 dpi, printing to Microsoft Print to PDF) sizes the digit from the font hinted at a whole-pixel
-# size on its display, so the unit below is the narrowest of the exact width and its whole-pixel width at
-# each Windows scaling preset. Excel prints rows taller than their set height, in proportion to it and
-# by up to 4.8 % at 192 dpi depending on the theme font: each row is counted 0.75 pt taller and a page
-# keeps one row spare, which together allow at least 6.4 % at every allowed row height and margin.
-# Excel cannot print below 10 %; its digit can be a fifth wider than the unit, so the reader refuses a
-# sheet that would need less than 13 %.
+# Page fit is a model with a measured margin, not an exact copy of Excel. Excel for Windows sizes the
+# digit from the font hinted at a whole-pixel size on its display, so the unit below is the narrowest of
+# the exact width and its whole-pixel width at each Windows scaling preset. Excel prints rows taller than
+# their set height, in proportion to it and by up to 4.8 % depending on the theme font (measured at
+# 192 dpi, printing to Microsoft Print to PDF). Each row is counted 0.75 pt taller and a page keeps one
+# row spare: at 100 % print scale that allows rows at least 6.4 % taller than set at every allowed row
+# height and margin. Below 100 % one spare row is a smaller share of the page (2.5 % at the 13 % floor);
+# there Excel's print zoom comes out below the modelled scale, which left 1 to 18 rows to spare in every
+# layout measured at 192 dpi. This rule's margin was measured at 192 dpi only; 96 dpi was measured under
+# the earlier rule, on 15 to 20 pt rows. Excel cannot print below 10 %; its digit can be a fifth wider
+# than the unit, so the reader refuses a sheet that would need less than 13 %.
 DISPLAY_DPIS = (96, 120, 144, 168, 192, 216, 240, 288, 336)
 PRINTED_ROW_ALLOWANCE_POINTS = 0.75
 SPARE_ROWS_PER_PAGE = 1
 MIN_PRINT_SCALE = 0.13
+# Excel's hinted digit is at least 0.926 times the unit over both fonts, every half-point size from 7 to
+# 20 and every Windows scaling preset (486 cases read from GDI), so pictures, text boxes and quantity
+# cells are placed in whole 96-dpi pixels of 0.92 units, never wider than Excel draws the column.
+MIN_HINTED_DIGIT_RATIO = 0.92
+# A quantity column must hold this many digits at the item table's font size; a longer quantity on a
+# quote is refused when the quote is made. Digit advance as a fraction of the font size.
+MIN_QUANTITY_DIGITS = 3
+QUANTITY_DIGIT_EM = 0.55
+# Points of a cell's width that its text cannot use (the cell's own padding).
+CELL_TEXT_PADDING_POINTS = 6
 EMU_PER_MM = 36_000
 EMU_PER_POINT = 12_700
 EMU_PER_PIXEL = 9525
@@ -424,27 +437,79 @@ def print_scale(page: dict[str, Any], grid: dict[str, Any], theme: dict[str, Any
 
 
 def grid_column_pixels(width: float) -> int:
-    """Pixels the renderer gives a visible grid column when it places pictures and text boxes."""
+    """Pixels an Arial 10 sheet gives `width` units, the placement width of the bundled layout."""
     return round(width * 7 + 5)
 
 
-def _check_company_box(page: dict[str, Any], grid: dict[str, Any], theme: dict[str, Any], blocks: list[dict[str, Any]]) -> None:
-    """Refuse a company details box whose margins leave no room inside its cells.
+def _printed_column_pixels(width: float, theme: dict[str, Any]) -> int:
+    """Whole 96-dpi pixels of `width` units at the narrowest digit Excel draws this theme's font with."""
+    return math.floor(width * width_unit_points(theme) * MIN_HINTED_DIGIT_RATIO * 96 / 72)
 
-    The width is the smaller of the renderer's placement width and the printed width of the theme
-    font's digits, so the renderer's own check cannot fail on a definition read here.
-    """
+
+def drawing_column_pixels(column: dict[str, Any], theme: dict[str, Any]) -> int:
+    """Pixels a grid column counts for when pictures and text boxes are placed: 0 when hidden, else the
+    smaller of the Arial 10 placement width and the theme font's printed width. Reader and renderer
+    both use this, so a definition the reader accepts places its drawings inside their cells."""
+    if column["hidden"]:
+        return 0
+    return min(grid_column_pixels(column["width"]), _printed_column_pixels(column["width"], theme))
+
+
+def drawing_width_emu(grid: dict[str, Any], theme: dict[str, Any], first: int, span: int) -> int:
+    """EMU width of the grid columns from column number `first` (1-based) across `span` columns."""
+    columns = grid["columns"][first - 1:first - 1 + span]
+    return sum(drawing_column_pixels(column, theme) for column in columns) * EMU_PER_PIXEL
+
+
+def cell_text_width_points(grid: dict[str, Any], theme: dict[str, Any], first: int, span: int) -> float:
+    """Points text may use across the visible grid columns from `first` across `span`: each column at
+    the smaller of its Arial 10 text width (7 whole pixels a unit, as the bundled layout) and the theme
+    font's printed width, less the cell padding. The renderer sizes quantity cells with this."""
+    columns = [column for column in grid["columns"][first - 1:first - 1 + span] if not column["hidden"]]
+    pixels = sum(min(math.floor(column["width"] * 7), _printed_column_pixels(column["width"], theme)) for column in columns)
+    return pixels * 72 / 96 - CELL_TEXT_PADDING_POINTS
+
+
+def min_quantity_points(size_pt: float) -> float:
+    """Points the shortest quantity a quantity column must hold takes at `size_pt` (summed digit by digit,
+    as the renderer measures a quantity)."""
+    return sum(QUANTITY_DIGIT_EM * size_pt for _ in range(MIN_QUANTITY_DIGITS))
+
+
+def _check_drawings(page: dict[str, Any], grid: dict[str, Any], theme: dict[str, Any], blocks: list[dict[str, Any]]) -> None:
+    """Refuse a logo wider than its block, or a company details box whose margins leave no room inside
+    its cells. Widths are drawing_width_emu, the width the renderer places them in, so a picture or text
+    box never runs past its block's last column (or the print area) in Excel or LibreOffice. A logo may
+    still be taller than its block's rows; it then overlaps the rows below, which never cuts it."""
     for index, block in enumerate(blocks):
-        if block["type"] != "company_details":
+        if block["type"] not in {"logo", "company_details"}:
             continue
-        columns = [column for column in grid["columns"][block["col"] - 1:block["col"] - 1 + block["span"]] if not column["hidden"]]
-        placed = sum(grid_column_pixels(column["width"]) for column in columns) * EMU_PER_PIXEL
-        printed = round(sum(column["width"] for column in columns) * width_unit_points(theme) * EMU_PER_POINT)
+        width = drawing_width_emu(grid, theme, block["col"], block["span"])
+        if block["type"] == "logo":
+            if round(block["logo"]["width_mm"] * EMU_PER_MM) > width:
+                _refuse(
+                    f"blocks[{index}].logo.width_mm",
+                    f"is wider than the logo block at this font and column widths (at most {math.floor(width / EMU_PER_MM * 10) / 10:g} mm)",
+                )
+            continue
         height = block["rows"] * round(page["row_height_pt"] * EMU_PER_POINT)
         box = block["box"]
         left, top, right = (round(box[key] * EMU_PER_MM) for key in ("left_mm", "top_mm", "right_mm"))
-        if left + right >= min(placed, printed) or top >= height:
+        if left + right >= width or top >= height:
             _refuse(f"blocks[{index}].box", "leaves no room for the company details inside its cells")
+
+
+def _check_quantity_column(grid: dict[str, Any], theme: dict[str, Any], blocks: list[dict[str, Any]]) -> None:
+    """Refuse a quantity column narrower than MIN_QUANTITY_DIGITS digits at the item table's font size,
+    measured the way the renderer measures each quote's quantities."""
+    table_index, table = next((index, block) for index, block in enumerate(blocks) if block["type"] == "item_table")
+    size = table["style"].get("size_pt") or theme["size_pt"]
+    for index, column in enumerate(table["columns"]):
+        if column["key"] == "quantity" and min_quantity_points(size) > cell_text_width_points(grid, theme, column["col"], column["span"]):
+            _refuse(
+                f"blocks[{table_index}].columns[{index}]",
+                f"the quantity column is too narrow for {MIN_QUANTITY_DIGITS} digits at {size:g} pt",
+            )
 
 
 def printable_rows_per_page(page: dict[str, Any], grid: dict[str, Any], theme: dict[str, Any]) -> int:
@@ -636,7 +701,8 @@ def read_quote_template(value: Any) -> dict[str, Any]:
     _check_layout(blocks, grid)
     theme = _read_theme(root["theme"])
     _check_page_fit(page, grid, theme, blocks, header_rows)
-    _check_company_box(page, grid, theme, blocks)
+    _check_quantity_column(grid, theme, blocks)
+    _check_drawings(page, grid, theme, blocks)
     return {
         "schema": SCHEMA_ID,
         "name": _text(root["name"], "name", 60, allow_empty=False),
