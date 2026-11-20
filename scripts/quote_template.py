@@ -67,7 +67,7 @@ def _refuse(path: str, message: str) -> None:
 def _object(value: Any, path: str, required: tuple[str, ...], optional: tuple[str, ...] = ()) -> dict[str, Any]:
     if not isinstance(value, dict):
         _refuse(path, "must be an object")
-    unknown = sorted(key for key in value if key not in required and key not in optional)
+    unknown = sorted((key for key in value if key not in required and key not in optional), key=str)
     if unknown:
         _refuse(f"{path}.{unknown[0]}", "is not a known key")
     missing = [key for key in required if key not in value]
@@ -444,7 +444,10 @@ def _parse_float(text: str) -> float:
 def parse_quote_template_json(raw: bytes | str) -> Any:
     """Parse definition JSON strictly: size cap, UTF-8 only, no duplicate keys or NaN."""
     if isinstance(raw, str):
-        raw = raw.encode("utf-8")
+        try:
+            raw = raw.encode("utf-8")
+        except UnicodeEncodeError:
+            _refuse("definition", "contains a lone surrogate character")
     if not isinstance(raw, bytes):
         _refuse("definition", "must be JSON text")
     if len(raw) > MAX_DEFINITION_BYTES:

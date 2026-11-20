@@ -314,6 +314,18 @@ class HostileDefinitionTest(unittest.TestCase):
         self.assert_refused(mutated(lambda d: d.update({"name": "Std\ud800"})), "definition")
         self.assert_refused(mutated(lambda d: d["theme"].update({"\udc00": 1})), "definition")
 
+    def test_lone_surrogates_in_text_and_mixed_unknown_keys_are_refused_with_a_path(self):
+        standard_text = json.dumps(STANDARD_RAW)
+        # A str that holds a lone surrogate cannot be encoded as UTF-8: refused at the definition, not a UnicodeEncodeError.
+        self.assert_refused(standard_text.replace('"Standard"', '"Std\ud800"'), "definition")
+        # Python callers may pass int keys; unknown keys of mixed types are refused as unknown, not with a TypeError.
+        for extra in ({1: 2, "zoom": 3}, {"zoom": 3, 1: 2}):
+            with self.subTest(keys=sorted(map(str, extra))):
+                with self.assertRaises(qt.QuoteTemplateError) as caught:
+                    qt.read_quote_template(mutated(lambda d: d["page"].update(extra)))
+                self.assertTrue(caught.exception.path.startswith("page."), caught.exception.path)
+                self.assertEqual(caught.exception.message, "is not a known key")
+
     def test_reader_names_a_path_for_every_refusal(self):
         error = None
         try:
