@@ -2255,7 +2255,8 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             self.assertIn("Rendered Fidelity Co", first_page["text"])
             for expected in ("Quantity", "Service", "Estimate", "2 sqm", "Rendered coordination service"):
                 self.assertIn(expected, first_page["text"])
-            self.assertRegex(first_page["text"], r"Included")
+            # The Included line prints the word in its own row's Estimate cell, not 0.00.
+            self.assertIn("Rendered coordination service Included", first_page["text"])
             self.assertIsNotNone(first_page["logo_bbox"])
             self.assertIsNotNone(first_page["header_bbox"])
             self.assertTrue(first_page["header_fonts"])
