@@ -709,6 +709,16 @@ the owner-approved CI lane.
   rendered script's `--inflight-save` option starts a delayed draft save that
   is still in flight at Confirm and expects the single pricing-selections
   request to succeed (no false "changed in another tab" refusal).
+- Quote template definitions: run
+  `python -m unittest tests.test_quote_template_schema`. It checks the
+  default-deny reader in `scripts/quote_template.py` against hostile JSON
+  (duplicate keys, NaN, byte order mark, deep nesting, oversize), unknown keys
+  at every level, wrong types and ranges, bad colours and fonts, hidden and
+  control characters, formula-like text kept as plain text, the required item
+  table and totals and the layout rules in `docs/quote-template-schema.md`. It
+  also checks the Standard template against the bundled quotation layout
+  (widths, hidden columns, margins, print titles, page rows, labels, exclusions
+  text and body font), so changing either one alone fails.
 ## Manual price and restored search contract
 
 Output defaults to editable reference prices, read-only FX and derived quoted unit prices.
