@@ -48,7 +48,7 @@ The programme board lists unblocked assigned or active work first in
 Waiting on and In progress. If an owner test is still owed on an earlier
 pull request, the board lists it after that gate.
 
-Both managed workflows pin Toolkit 3.145.0 (`d667ad5`). When an unfinished task
+Both managed workflows pin Toolkit 3.156.0 (`3df9b86`). When an unfinished task
 records no pull request or branch and exactly one open pull request from a
 branch of this repository claims it, the sweep records that pull request, its
 branch and head, and moves the task from planned to active. Several claimants,
