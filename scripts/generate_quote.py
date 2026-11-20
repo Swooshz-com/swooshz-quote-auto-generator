@@ -37,6 +37,11 @@ from typing import Any, Callable
 from xml.dom import minidom
 from xml.etree import ElementTree as ET
 
+if __package__:
+    from . import quote_template
+else:
+    import quote_template
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -161,17 +166,6 @@ HEADER_LOGO_MAX_HEIGHT_EMU = (
 )
 HEADER_LOGO_OFFSET_X_EMU = 4_550_000
 HEADER_LOGO_OFFSET_Y_EMU = 260_000
-QUOTE_LAYOUT_COLUMN_WIDTHS = {
-    1: 6.125,
-    2: 14.25,
-    3: 45.5,
-    4: 22.0,
-    5: 15.5,
-    6: 7.625,
-    7: 15.0,
-    8: 16.375,
-    9: 26.875,
-}
 QUOTE_DATE_MERGE_REF = "A16:C16"
 ET.register_namespace("cp", XMLNS_CP)
 ET.register_namespace("dc", XMLNS_DC)
@@ -201,6 +195,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--template", type=Path, required=True, help="Pricing catalog JSON path.")
     parser.add_argument("--layout-template", type=Path, required=True, help="Customer quotation layout XLSX path.")
+    parser.add_argument(
+        "--quote-template", type=Path,
+        help="Quote template definition JSON (sqag.quote-template.v1). When given, it lays out the XLSX instead of --layout-template.",
+    )
     parser.add_argument("--pdf-mode", choices=("auto", "workbook", "styled", "text", "none"), default="none", help="Optional PDF export mode. Defaults to none; workbook exports the generated XLSX only; auto tries Excel/LibreOffice then styled fallback, styled skips external PDF export, text writes a simple fallback.")
     parser.add_argument("--allow-ambiguous", action="store_true", help="Use the best pricing match even when multiple rows match.")
     return parser.parse_args()
@@ -260,6 +258,88 @@ QUOTE_EXCLUSIONS_COLOR = "FFFF0000"
 class LayoutChunk:
     name: str
     height: int
+
+
+@dataclass(frozen=True)
+class PageModel:
+    """Manual print pages: page 1 ends at first_page_end, later pages hold page_height rows.
+
+    Later pages reserve a header band (gap, repeated item-table header, gap) before
+    body_offset; the last guard_rows of a later page stay clear for optional text.
+    """
+
+    first_page_end: int
+    page_height: int
+    table_header_offset: int
+    currency_offset: int
+    body_offset: int
+    guard_rows: int = OPTIONAL_TEXT_CONTINUATION_END_GUARD_ROWS
+
+    def page_start(self, row_number: int) -> int | None:
+        if row_number <= self.first_page_end:
+            return None
+        first = self.first_page_end + 1
+        return first + ((row_number - first) // self.page_height) * self.page_height
+
+    def page_end(self, row_number: int) -> int:
+        page_start = self.page_start(row_number)
+        if page_start is None:
+            return self.first_page_end
+        return page_start + self.page_height - 1
+
+    def next_page_start(self, row_number: int) -> int:
+        page_start = self.page_start(row_number)
+        if page_start is None:
+            return self.first_page_end + 1
+        return page_start + self.page_height
+
+    def clear_header_band(self, row_number: int) -> int:
+        """Advance later-page content past the reserved header rows."""
+        page_start = self.page_start(row_number)
+        if page_start is not None:
+            return max(row_number, page_start + self.body_offset)
+        return row_number
+
+    def summary_start(self, row_number: int, block_height: int) -> int:
+        row_number = self.clear_header_band(row_number)
+        if row_number + block_height - 1 <= self.page_end(row_number):
+            return row_number
+        return self.next_page_start(row_number) + self.body_offset
+
+    def optional_text_capacity(self) -> int:
+        return self.page_height - self.body_offset - self.guard_rows
+
+    def optional_text_chunk_start(self, row_number: int, chunk: LayoutChunk) -> tuple[int, bool]:
+        candidate_row = row_number
+        row_number = self.clear_header_band(row_number)
+        page_end = self.page_end(row_number)
+        if self.page_start(row_number) is not None:
+            page_end -= self.guard_rows
+        remaining_page_rows = page_end - row_number + 1
+        if chunk.height <= 0 or chunk.height <= remaining_page_rows:
+            return row_number, row_number != candidate_row
+        if chunk.height <= self.optional_text_capacity():
+            return self.next_page_start(row_number) + self.body_offset, True
+        return row_number, row_number != candidate_row
+
+    def break_ids(self, last_row: int) -> list[int]:
+        if last_row <= self.first_page_end:
+            return []
+        break_ids = [self.first_page_end]
+        next_break = self.first_page_end + self.page_height
+        while next_break < last_row:
+            break_ids.append(next_break)
+            next_break += self.page_height
+        return break_ids
+
+
+LEGACY_PAGE = PageModel(
+    first_page_end=FIRST_PRINT_PAGE_END_ROW,
+    page_height=CONTINUATION_PAGE_HEIGHT,
+    table_header_offset=CONTINUATION_TABLE_HEADER_OFFSET,
+    currency_offset=CONTINUATION_CURRENCY_OFFSET,
+    body_offset=CONTINUATION_BODY_OFFSET,
+)
 
 
 @dataclass
@@ -1397,14 +1477,18 @@ def quote_subtotal(entries: list[dict[str, Any]]) -> float:
     return rounded if rounded is not None else 0.0
 
 
-def quantity_text(line: QuoteLine) -> str:
+def quantity_number_text(line: QuoteLine) -> str:
     if line.quantity is None:
         return ""
     if float(line.quantity).is_integer():
-        qty = str(int(line.quantity))
-    else:
-        qty = str(line.quantity)
-    return f"{qty} {line.unit}".strip()
+        return str(int(line.quantity))
+    return str(line.quantity)
+
+
+def quantity_text(line: QuoteLine) -> str:
+    if line.quantity is None:
+        return ""
+    return f"{quantity_number_text(line)} {line.unit}".strip()
 
 
 def build_quote_rows(brief: dict[str, Any], lines: list[QuoteLine]) -> list[list[Any]]:
@@ -2845,25 +2929,15 @@ def formula_cache_amount(value: Any) -> float:
 
 
 def continuation_page_start_for_row(row_number: int) -> int | None:
-    if row_number <= FIRST_PRINT_PAGE_END_ROW:
-        return None
-    return CONTINUATION_PAGE_START_ROW + (
-        (row_number - CONTINUATION_PAGE_START_ROW) // CONTINUATION_PAGE_HEIGHT
-    ) * CONTINUATION_PAGE_HEIGHT
+    return LEGACY_PAGE.page_start(row_number)
 
 
 def manual_page_end_for_row(row_number: int) -> int:
-    page_start = continuation_page_start_for_row(row_number)
-    if page_start is None:
-        return FIRST_PRINT_PAGE_END_ROW
-    return page_start + CONTINUATION_PAGE_HEIGHT - 1
+    return LEGACY_PAGE.page_end(row_number)
 
 
 def next_continuation_page_start(row_number: int) -> int:
-    page_start = continuation_page_start_for_row(row_number)
-    if page_start is None:
-        return CONTINUATION_PAGE_START_ROW
-    return page_start + CONTINUATION_PAGE_HEIGHT
+    return LEGACY_PAGE.next_page_start(row_number)
 
 
 def write_continuation_quote_header(
@@ -2932,18 +3006,11 @@ def ensure_quote_entry_page(
 
 def clear_continuation_header_band(row_number: int) -> int:
     """Advance continuation-page content past the reserved header rows."""
-    page_start = continuation_page_start_for_row(row_number)
-    if page_start is not None:
-        return max(row_number, page_start + CONTINUATION_BODY_OFFSET)
-    return row_number
+    return LEGACY_PAGE.clear_header_band(row_number)
 
 
 def summary_block_start_row(row_number: int, block_height: int) -> int:
-    row_number = clear_continuation_header_band(row_number)
-    if row_number + block_height - 1 <= manual_page_end_for_row(row_number):
-        return row_number
-    page_start = next_continuation_page_start(row_number)
-    return page_start + CONTINUATION_BODY_OFFSET
+    return LEGACY_PAGE.summary_start(row_number, block_height)
 
 
 def layout_chunk_start_row(row_number: int, chunk: LayoutChunk) -> tuple[int, bool]:
@@ -2955,22 +3022,7 @@ def layout_chunk_start_row(row_number: int, chunk: LayoutChunk) -> tuple[int, bo
 
 
 def optional_text_chunk_start_row(row_number: int, chunk: LayoutChunk) -> tuple[int, bool]:
-    candidate_row = row_number
-    row_number = clear_continuation_header_band(row_number)
-    page_end = manual_page_end_for_row(row_number)
-    if continuation_page_start_for_row(row_number) is not None:
-        page_end -= OPTIONAL_TEXT_CONTINUATION_END_GUARD_ROWS
-    remaining_page_rows = page_end - row_number + 1
-    if chunk.height <= 0 or chunk.height <= remaining_page_rows:
-        return row_number, row_number != candidate_row
-    fresh_continuation_capacity = (
-        CONTINUATION_PAGE_HEIGHT
-        - CONTINUATION_BODY_OFFSET
-        - OPTIONAL_TEXT_CONTINUATION_END_GUARD_ROWS
-    )
-    if chunk.height <= fresh_continuation_capacity:
-        return next_continuation_page_start(row_number) + CONTINUATION_BODY_OFFSET, True
-    return row_number, row_number != candidate_row
+    return LEGACY_PAGE.optional_text_chunk_start(row_number, chunk)
 
 
 def optional_text_character_width(character: str) -> int:
@@ -3146,16 +3198,26 @@ def visible_column_width_points(root: ET.Element, first: int, last: int) -> floa
 
 
 def prepare_quantity_lines(
-    entries: list[dict[str, Any]], root: ET.Element, parts: dict[str, bytes],
+    entries: list[dict[str, Any]], root: ET.Element, parts: dict[str, bytes] | None,
+    *, columns: tuple[int, int] | None = (2, 2), font_size: float | None = None,
+    page: PageModel = LEGACY_PAGE,
 ) -> None:
-    """Give quantity and description one shared row budget before page admission."""
-    width = visible_column_width_points(root, 2, 2)
-    selected_font = ooxml_style_text_font(parts, "13")
-    if not selected_font["font_size"]:
-        raise ValueError("Quotation quantity font size is unavailable.")
-    font_size = float(selected_font["font_size"])
+    """Give quantity and description one shared row budget before page admission.
+
+    `columns` is the quantity column range; None means the layout shows no quantity.
+    """
+    if columns is not None:
+        width = visible_column_width_points(root, *columns)
+        if font_size is None:
+            selected_font = ooxml_style_text_font(parts, "13")
+            if not selected_font["font_size"]:
+                raise ValueError("Quotation quantity font size is unavailable.")
+            font_size = float(selected_font["font_size"])
     for entry in entries:
         if entry["kind"] != "item":
+            continue
+        if columns is None:
+            entry["quantity_lines"] = []
             continue
         text = entry["quantity"]
         number = text.split(maxsplit=1)[0] if text else ""
@@ -3168,7 +3230,7 @@ def prepare_quantity_lines(
                 measure_character=quantity_character_width,
             )
         ]
-    capacity = CONTINUATION_PAGE_HEIGHT - CONTINUATION_BODY_OFFSET
+    capacity = page.page_height - page.body_offset
     if any(quote_entry_keep_height(entries, index) > capacity for index in range(len(entries))):
         raise ValueError("A quotation line item exceeds the available page height.")
 
@@ -3184,6 +3246,19 @@ def acceptance_text_lines(
     ] or [[]]
 
 
+@dataclass(frozen=True)
+class SigningColumns:
+    """One side of the signing band: its column range, fonts, cell styles and line length."""
+
+    first: int
+    last: int
+    text_style: str
+    label_style: str
+    text_font: dict[str, str | None]
+    label_font: dict[str, str | None]
+    line_chars: int
+
+
 def write_acceptance_signature(
     root: ET.Element, row_number: int, brief: dict[str, Any],
     acceptance: dict[str, Any], signature: dict[str, Any], company_name: str,
@@ -3192,64 +3267,97 @@ def write_acceptance_signature(
     """Own both acceptance columns, their signature offsets and continuation admission."""
     text_font = ooxml_style_text_font(parts, styles["signature_text"])
     label_font = ooxml_style_text_font(parts, styles["signature_line"])
-    text_size = float(text_font["font_size"] or 11)
-    label_size = float(label_font["font_size"] or 11)
-    if not all(math.isfinite(size) and size > 0 for size in (text_size, label_size)):
-        raise ValueError("Invalid quotation acceptance font size.")
-    widths = (visible_column_width_points(root, 2, 4), visible_column_width_points(root, 5, 9))
+    sides = [
+        SigningColumns(first, last, styles["signature_text"], styles["signature_line"], text_font, label_font, chars)
+        for first, last, chars in ((2, 4, 29), (5, 9, 37))
+    ]
+    return write_signing_band(root, row_number, brief, acceptance, signature, company_name, sides[0], sides[1])
 
-    def pair(left_key: str, left: Any, right_key: str, right: Any, size: float):
-        left_lines = acceptance_text_lines(brief, left_key, left, widths[0], size)
-        right_lines = acceptance_text_lines(brief, right_key, right, widths[1], size)
+
+def write_signing_band(
+    root: ET.Element, row_number: int, brief: dict[str, Any],
+    acceptance: dict[str, Any], signature: dict[str, Any], company_name: str,
+    company_side: SigningColumns | None, customer_side: SigningColumns | None,
+    *, page: PageModel = LEGACY_PAGE, row_height: str = QUOTE_LAYOUT_DEFAULT_ROW_HEIGHT,
+) -> tuple[int, bool]:
+    """Write the company signature (left) and customer acceptance (right) side by side.
+
+    Either side may be absent; each pair of lines shares rows so the signing lines align.
+    """
+    sides = (company_side, customer_side)
+    present = [side for side in sides if side is not None]
+    if not present:
+        return row_number, False
+    sizes = []
+    for side in sides:
+        if side is None:
+            sizes.append((11.0, 11.0))
+            continue
+        side_sizes = (float(side.text_font["font_size"] or 11), float(side.label_font["font_size"] or 11))
+        if not all(math.isfinite(size) and size > 0 for size in side_sizes):
+            raise ValueError("Invalid quotation acceptance font size.")
+        sizes.append(side_sizes)
+    widths = [visible_column_width_points(root, side.first, side.last) if side else 0.0 for side in sides]
+
+    def pair(left_key: str, left: Any, right_key: str, right: Any, label: bool):
+        left_lines = acceptance_text_lines(brief, left_key, left, widths[0], sizes[0][label]) if company_side else []
+        right_lines = acceptance_text_lines(brief, right_key, right, widths[1], sizes[1][label]) if customer_side else []
         return [
             (left_lines[i] if i < len(left_lines) else [],
              right_lines[i] if i < len(right_lines) else [])
             for i in range(max(len(left_lines), len(right_lines)))
         ]
 
+    def signing_line(index: int) -> list[RichTextRun]:
+        side = sides[index]
+        if side is None:
+            return []
+        return [RichTextRun("_" * max(1, min(side.line_chars, int(widths[index] / (sizes[index][1] * 0.6)))))]
+
     text_rows = pair("quoteCompanyName", acceptance.get("company_name") or company_name,
-                     "acceptanceText", acceptance.get("text"), text_size)
+                     "acceptanceText", acceptance.get("text"), False)
     # The three blank rows preserve the existing short-text signature placement.
     gap_rows = [([], []) for _ in range(3)]
-    line_rows = [(
-        [RichTextRun("_" * max(1, min(29, int(widths[0] / (label_size * 0.6)))))],
-        [RichTextRun("_" * max(1, min(37, int(widths[1] / (label_size * 0.6)))))],
-    )]
+    line_rows = [(signing_line(0), signing_line(1))]
     groups = [
-        (text_rows, "signature_text", text_font),
-        (gap_rows, "signature_text", text_font),
-        (line_rows, "signature_line", label_font),
+        (text_rows, False),
+        (gap_rows, False),
+        (line_rows, True),
         (pair("companySignatory", signature.get("company_signatory"),
-              "personLabel", acceptance.get("person_label"), label_size), "signature_line", label_font),
+              "personLabel", acceptance.get("person_label"), True), True),
         (pair("companyTitle", signature.get("company_title"),
-              "stampLabel", acceptance.get("stamp_label"), label_size), "signature_line", label_font),
+              "stampLabel", acceptance.get("stamp_label"), True), True),
         (pair("companyDateLabel", signature.get("company_date_label"),
-              "dateLabel", acceptance.get("date_label"), label_size), "signature_line", label_font),
+              "dateLabel", acceptance.get("date_label"), True), True),
     ]
     groups = [
-        (rows, style, font, 1 if index == 1 else max(
-            1, math.ceil(float(font["font_size"] or 11) * 1.4 / float(QUOTE_LAYOUT_DEFAULT_ROW_HEIGHT)),
+        (rows, label, 1 if index == 1 else max(
+            1, math.ceil(max(
+                float((side.label_font if label else side.text_font)["font_size"] or 11) for side in present
+            ) * 1.4 / float(row_height)),
         ))
-        for index, (rows, style, font) in enumerate(groups)
+        for index, (rows, label) in enumerate(groups)
     ]
-    total_height = max(SIGNATURE_BLOCK_HEIGHT, sum(len(rows) * span for rows, _, _, span in groups))
-    capacity = CONTINUATION_PAGE_HEIGHT - CONTINUATION_BODY_OFFSET - OPTIONAL_TEXT_CONTINUATION_END_GUARD_ROWS
-    if any(span > capacity for _, _, _, span in groups):
+    total_height = max(SIGNATURE_BLOCK_HEIGHT, sum(len(rows) * span for rows, _, span in groups))
+    capacity = page.optional_text_capacity()
+    if any(span > capacity for _, _, span in groups):
         raise ValueError("Quotation acceptance font is too large for a printable page.")
-    row_number, moved = optional_text_chunk_start_row(
+    row_number, moved = page.optional_text_chunk_start(
         row_number, LayoutChunk("acceptance_signature", total_height),
     )
     oversized = total_height > capacity
+    first_col = min(side.first for side in present)
+    last_col = max(side.last for side in present)
     last_row = row_number - 1
-    for group_index, (rows, style, font, span) in enumerate(groups):
+    for group_index, (rows, label, span) in enumerate(groups):
         if oversized:
-            remaining = sum(len(group[0]) * group[3] for group in groups[group_index:])
+            remaining = sum(len(group[0]) * group[2] for group in groups[group_index:])
             keep = remaining if group_index > 0 and remaining <= capacity else len(rows) * span
-            row_number, group_moved = optional_text_chunk_start_row(row_number, LayoutChunk("acceptance_part", keep))
+            row_number, group_moved = page.optional_text_chunk_start(row_number, LayoutChunk("acceptance_part", keep))
             moved = moved or group_moved
-        for left, right in rows:
+        for line_pair in rows:
             if oversized:
-                row_number, line_moved = optional_text_chunk_start_row(row_number, LayoutChunk("acceptance_line", span))
+                row_number, line_moved = page.optional_text_chunk_start(row_number, LayoutChunk("acceptance_line", span))
                 moved = moved or line_moved
             # Replace stale template merges only in the newly owned acceptance row.
             merges = root.find(f"{NS_MAIN}mergeCells")
@@ -3258,19 +3366,21 @@ def write_acceptance_signature(
                     ends = merge.get("ref", "").split(":")
                     start_row, start_col = parse_cell_ref(ends[0])
                     end_row, end_col = parse_cell_ref(ends[-1])
-                    if start_row <= row_number + span - 1 and end_row >= row_number and start_col <= 9 and end_col >= 2:
+                    if start_row <= row_number + span - 1 and end_row >= row_number and start_col <= last_col and end_col >= first_col:
                         merges.remove(merge)
                 merges.set("count", str(len(merges)))
-            for column, runs, columns in ((2, left, "B:D"), (5, right, "E:I")):
-                set_ooxml_rich_text_cell(root, row_number, column, runs, styles[style], **font)
-                first, last = columns.split(":")
-                ensure_merge_ref(root, f"{first}{row_number}:{last}{row_number + span - 1}")
+            for side, runs in zip(sides, line_pair):
+                if side is None:
+                    continue
+                font = side.label_font if label else side.text_font
+                set_ooxml_rich_text_cell(root, row_number, side.first, runs, side.label_style if label else side.text_style, **font)
+                ensure_merge_ref(root, f"{cell_ref(row_number, side.first)}:{cell_ref(row_number + span - 1, side.last)}")
             # Count larger fonts as physical row slots, rather than growing an
             # uncounted row beyond the manual page's capacity.
             sheet_data = root.find(f"{NS_MAIN}sheetData")
             for slot in range(row_number, row_number + span):
                 row = get_or_create_row(sheet_data, slot)
-                row.set("ht", QUOTE_LAYOUT_DEFAULT_ROW_HEIGHT)
+                row.set("ht", row_height)
                 row.set("customHeight", "1")
                 row.attrib.pop("hidden", None)
             last_row = row_number + span - 1
@@ -3292,45 +3402,83 @@ def write_optional_text_block(
     font_name: str | None = None,
     font_size: str | None = None,
     color: str | None = None,
+    number_column: int = 1,
+    last_column: int = 9,
+    max_width: float = OPTIONAL_TEXT_LINE_MAX_WIDTH_EM,
+    page: PageModel = LEGACY_PAGE,
 ) -> tuple[int, int, bool]:
-    lines = wrap_rich_text_runs(runs)
+    lines = wrap_rich_text_runs(runs, max_width=max_width)
     if not lines:
         return row_number, row_number - 1, False
 
-    block_row, moved = optional_text_chunk_start_row(
+    block_row, moved = page.optional_text_chunk_start(
         row_number,
         LayoutChunk(name, admission_height if admission_height is not None else len(lines)),
     )
     row_number = block_row
-    merge_start_column = "A" if text_column == 1 else "B"
     last_row = block_row - 1
     for line_index, line_runs in enumerate(lines):
-        row_number, line_moved = optional_text_chunk_start_row(
+        row_number, line_moved = page.optional_text_chunk_start(
             row_number,
             LayoutChunk(f"{name}_line", 1),
         )
         moved = moved or line_moved
         if number is not None and line_index == 0:
-            set_ooxml_cell(root, row_number, 1, f"{number:.2f}", number_style)
+            set_ooxml_cell(root, row_number, number_column, f"{number:.2f}", number_style)
         set_ooxml_rich_text_cell(
             root, row_number, text_column, line_runs, style,
             font_name=font_name, font_size=font_size, color=color,
         )
-        ensure_merge_ref(root, f"{merge_start_column}{row_number}:I{row_number}")
+        ensure_merge_ref(root, f"{cell_ref(row_number, text_column)}:{cell_ref(row_number, last_column)}")
         last_row = row_number
         row_number += 1
     return row_number, last_row, moved
 
 
-def manual_page_break_ids(last_row: int) -> list[int]:
-    if last_row <= FIRST_PRINT_PAGE_END_ROW:
-        return []
-    break_ids = [FIRST_PRINT_PAGE_END_ROW]
-    next_break = CONTINUATION_PAGE_START_ROW + CONTINUATION_PAGE_HEIGHT - 1
-    while next_break < last_row:
-        break_ids.append(next_break)
-        next_break += CONTINUATION_PAGE_HEIGHT
-    return break_ids
+def write_numbered_text_section(
+    root: ET.Element,
+    row_number: int,
+    heading_runs: list[RichTextRun],
+    item_runs: list[list[RichTextRun]],
+    *,
+    name: str,
+    has_heading: bool,
+    heading_style: str,
+    body_style: str,
+    number_style: str,
+    heading_font: dict[str, str | None],
+    body_font: dict[str, str | None],
+    number_column: int = 1,
+    last_column: int = 9,
+    max_width: float = OPTIONAL_TEXT_LINE_MAX_WIDTH_EM,
+    page: PageModel = LEGACY_PAGE,
+) -> tuple[int, int, bool]:
+    """Write a heading and numbered items (terms or notes); the heading stays with the first item."""
+    moved = False
+    last_row = 0
+    heading_admission_height = len(wrap_rich_text_runs(heading_runs, max_width=max_width))
+    if has_heading and item_runs:
+        first_section_height = heading_admission_height + len(wrap_rich_text_runs(item_runs[0], max_width=max_width))
+        if first_section_height <= page.page_height - page.body_offset:
+            heading_admission_height = first_section_height
+    if has_heading:
+        row_number, last_row, moved = write_optional_text_block(
+            root, row_number, heading_runs, name=f"{name}_heading", text_column=number_column,
+            style=heading_style, admission_height=heading_admission_height,
+            last_column=last_column, max_width=max_width, page=page, **heading_font,
+        )
+    for index, runs in enumerate(item_runs, start=1):
+        row_number, last_row, item_moved = write_optional_text_block(
+            root, row_number, runs, name=name, text_column=number_column + 1, style=body_style,
+            number=index, number_style=number_style, number_column=number_column,
+            last_column=last_column, max_width=max_width, page=page, **body_font,
+        )
+        moved = moved or item_moved
+    return row_number, last_row, moved
+
+
+def manual_page_break_ids(last_row: int, page: PageModel = LEGACY_PAGE) -> list[int]:
+    return page.break_ids(last_row)
 
 
 def ooxml_cell_has_payload(cell: ET.Element) -> bool:
@@ -3356,7 +3504,7 @@ def last_payload_row(root: ET.Element, max_row: int) -> int:
     return result
 
 
-def hide_empty_continuation_guard_rows(root: ET.Element, last_row: int) -> None:
+def hide_empty_continuation_guard_rows(root: ET.Element, last_row: int, page: PageModel = LEGACY_PAGE) -> None:
     """Keep reserved blank padding from forcing an automatic print page."""
     sheet_data = root.find(f"{NS_MAIN}sheetData")
     if sheet_data is None:
@@ -3378,9 +3526,9 @@ def hide_empty_continuation_guard_rows(root: ET.Element, last_row: int) -> None:
         ):
             occupied_merges.append((first_row, final_row))
     rows = {int(row.attrib["r"]): row for row in sheet_data}
-    for page_end in manual_page_break_ids(last_row)[1:]:
+    for page_end in page.break_ids(last_row)[1:]:
         for row_number in range(
-            page_end, page_end - OPTIONAL_TEXT_CONTINUATION_END_GUARD_ROWS, -1
+            page_end, page_end - page.guard_rows, -1
         ):
             if row_number in payload_rows or any(
                 start <= row_number <= end for start, end in occupied_merges
@@ -3390,26 +3538,28 @@ def hide_empty_continuation_guard_rows(root: ET.Element, last_row: int) -> None:
                 rows[row_number].attrib["hidden"] = "1"
 
 
-def printable_last_row(root: ET.Element, last_row: int, manual_pagination_enabled: bool) -> int:
+def printable_last_row(
+    root: ET.Element, last_row: int, manual_pagination_enabled: bool, page: PageModel = LEGACY_PAGE,
+) -> int:
     if not manual_pagination_enabled:
         return last_row
     payload_row = last_payload_row(root, last_row)
     if not payload_row:
         return last_row
-    break_ids = manual_page_break_ids(last_row)
+    break_ids = page.break_ids(last_row)
     if break_ids and break_ids[-1] >= payload_row:
         return payload_row
     return last_row
 
 
-def set_manual_page_breaks(root: ET.Element, last_row: int, enabled: bool) -> None:
+def set_manual_page_breaks(root: ET.Element, last_row: int, enabled: bool, page: PageModel = LEGACY_PAGE) -> None:
     row_breaks = root.find(f"{NS_MAIN}rowBreaks")
     if row_breaks is not None:
         root.remove(row_breaks)
     if not enabled:
         return
 
-    break_ids = manual_page_break_ids(last_row)
+    break_ids = page.break_ids(last_row)
     if not break_ids:
         return
     row_breaks = ET.Element(
@@ -3454,7 +3604,9 @@ def grouped_section_names(brief: dict[str, Any], lines: list[QuoteLine]) -> set[
     }
 
 
-def render_quote_entries(lines: list[QuoteLine], brief: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+def render_quote_entries(
+    lines: list[QuoteLine], brief: dict[str, Any] | None = None, *, description_width: int = 58,
+) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     grouped_sections = grouped_section_names(brief or {}, lines)
     exchange_rate = quote_exchange_rate(brief or {})
@@ -3485,11 +3637,23 @@ def render_quote_entries(lines: list[QuoteLine], brief: dict[str, Any] | None = 
             ) or 0.0
             if line.match_status != "deferred-pricing":
                 detail_amount = None
+        unit_price = line.unit_price_override
+        if unit_price is None and line.matched_price is not None:
+            unit_price = line.matched_price.sale_unit_price
+        shows_unit_price = (
+            unit_price is not None
+            and line.price_mode != "Included"
+            and isinstance(detail_amount, (int, float))
+            and not isinstance(detail_amount, bool)
+        )
         entries.append({
             "kind": "item",
             "number": f"{section_number}.{detail_number}",
             "quantity": quantity_text(line),
-            "description_lines": wrapped_description(customer_quote_description(line.description)),
+            "quantity_number": quantity_number_text(line),
+            "unit": clean_text(line.unit) if line.quantity is not None else "",
+            "unit_price": quote_amount(unit_price, line_quote_exchange_rate(line, exchange_rate)) if shows_unit_price else None,
+            "description_lines": wrapped_description(customer_quote_description(line.description), description_width),
             "amount": detail_amount,
             "deferred_pricing": line.match_status == "deferred-pricing",
         })
@@ -3773,89 +3937,26 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
         optional_text_moved = optional_text_moved or moved
     next_text_row = last_optional_row + 2
 
-    terms_heading = clean_text(brief.get("terms_heading"))
-    payment_terms = brief.get("payment_terms") or []
-    payment_term_runs = brief_rich_text_items(brief, "paymentTerms", payment_terms)
-    if terms_heading or payment_term_runs:
-        heading_runs = brief_rich_text_cell_runs(brief, "termsHeading", terms_heading)
-        heading_admission_height = len(wrap_rich_text_runs(heading_runs))
-        if terms_heading and payment_term_runs:
-            first_term_runs = (
-                payment_term_runs[0]
-                if payment_term_runs
-                else [RichTextRun(clean_text(payment_terms[0]))]
-            )
-            first_section_height = heading_admission_height + len(wrap_rich_text_runs(first_term_runs))
-            if first_section_height <= CONTINUATION_PAGE_HEIGHT - CONTINUATION_BODY_OFFSET:
-                heading_admission_height = first_section_height
-        if terms_heading:
-            next_text_row, last_optional_row, moved = write_optional_text_block(
-                root,
-                next_text_row,
-                heading_runs,
-                name="terms_heading",
-                text_column=1,
-                style=layout_styles["terms_heading"],
-                admission_height=heading_admission_height,
-                **optional_text_fonts["terms_heading"],
-            )
-            optional_text_moved = optional_text_moved or moved
-        for index, runs in enumerate(payment_term_runs, start=1):
-            next_text_row, last_optional_row, moved = write_optional_text_block(
-                root,
-                next_text_row,
-                runs,
-                name="payment_term",
-                text_column=2,
-                style=layout_styles["terms_body"],
-                number=index,
-                number_style=layout_styles["terms_number"],
-                **optional_text_fonts["terms_body"],
-            )
-            optional_text_moved = optional_text_moved or moved
-        if last_optional_row:
-            next_text_row = last_optional_row + 2
-
-    notes_heading = clean_text(brief.get("notes_heading"))
-    standard_notes = brief.get("standard_notes") or []
-    standard_note_runs = brief_rich_text_items(brief, "standardNotes", standard_notes)
-    if notes_heading or standard_note_runs:
-        heading_runs = brief_rich_text_cell_runs(brief, "notesHeading", notes_heading)
-        heading_admission_height = len(wrap_rich_text_runs(heading_runs))
-        if notes_heading and standard_note_runs:
-            first_note_runs = (
-                standard_note_runs[0]
-                if standard_note_runs
-                else [RichTextRun(clean_text(standard_notes[0]))]
-            )
-            first_section_height = heading_admission_height + len(wrap_rich_text_runs(first_note_runs))
-            if first_section_height <= CONTINUATION_PAGE_HEIGHT - CONTINUATION_BODY_OFFSET:
-                heading_admission_height = first_section_height
-        if notes_heading:
-            next_text_row, last_optional_row, moved = write_optional_text_block(
-                root,
-                next_text_row,
-                heading_runs,
-                name="notes_heading",
-                text_column=1,
-                style=layout_styles["terms_heading"],
-                admission_height=heading_admission_height,
-                **optional_text_fonts["terms_heading"],
-            )
-            optional_text_moved = optional_text_moved or moved
-        for index, runs in enumerate(standard_note_runs, start=1):
-            next_text_row, last_optional_row, moved = write_optional_text_block(
-                root,
-                next_text_row,
-                runs,
-                name="standard_note",
-                text_column=2,
-                style=layout_styles["terms_body"],
-                number=index,
-                number_style=layout_styles["terms_number"],
-                **optional_text_fonts["terms_body"],
-            )
-            optional_text_moved = optional_text_moved or moved
+    for heading_key, items_key, rich_heading, rich_items, name in (
+        ("terms_heading", "payment_terms", "termsHeading", "paymentTerms", "payment_term"),
+        ("notes_heading", "standard_notes", "notesHeading", "standardNotes", "standard_note"),
+    ):
+        heading = clean_text(brief.get(heading_key))
+        item_runs = brief_rich_text_items(brief, rich_items, brief.get(items_key) or [])
+        if not (heading or item_runs):
+            continue
+        next_text_row, section_last_row, moved = write_numbered_text_section(
+            root, next_text_row, brief_rich_text_cell_runs(brief, rich_heading, heading), item_runs,
+            name=name, has_heading=bool(heading),
+            heading_style=layout_styles["terms_heading"], body_style=layout_styles["terms_body"],
+            number_style=layout_styles["terms_number"],
+            heading_font=optional_text_fonts["terms_heading"], body_font=optional_text_fonts["terms_body"],
+        )
+        optional_text_moved = optional_text_moved or moved
+        if section_last_row:
+            last_optional_row = section_last_row
+            if name == "payment_term":
+                next_text_row = last_optional_row + 2
 
     manual_pagination_enabled = manual_pagination_enabled or optional_text_moved
     acceptance_candidate_row = last_optional_row + 3 if last_optional_row else next_text_row
@@ -3889,6 +3990,730 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, content in parts.items():
             zf.writestr(name, content)
+
+
+# Quote templates (sqag.quote-template.v1). One checked definition drives the Excel file and,
+# through LibreOffice or Excel conversion, the PDF. The bundled layout's wrap budgets carry
+# over by width: optional text wraps at 104 em across the 123.875 visible width units of B:I,
+# item descriptions at 58 characters across the 63.375 units of C:D.
+TEMPLATE_TEXT_EM_PER_WIDTH_UNIT = OPTIONAL_TEXT_LINE_MAX_WIDTH_EM / 123.875
+TEMPLATE_DESCRIPTION_CHARS_PER_WIDTH_UNIT = 58 / 63.375
+TEMPLATE_DATE_FORMAT = "dd\\ mmmm\\ yyyy"
+TEMPLATE_AMOUNT_FORMAT = "#,##0.00"
+BUILTIN_NUMBER_FORMATS = {"General": 0, "0.00": 2, "#,##0.00": 4}
+EMU_PER_PIXEL = 9525
+EMU_PER_MM = 36_000
+MM_PER_INCH = 25.4
+SPREADSHEET_CONTENT_TYPES = {
+    "xl/workbook.xml": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+    "xl/worksheets/sheet1.xml": "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+    "xl/styles.xml": "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml",
+    "xl/drawings/drawing1.xml": "application/vnd.openxmlformats-officedocument.drawing+xml",
+}
+REL_OFFICE_DOCUMENT = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"
+REL_WORKSHEET = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"
+REL_STYLES = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles"
+REL_DRAWING = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing"
+REL_IMAGE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+
+
+def template_argb(color: str) -> str:
+    return "FF" + color[1:].upper()
+
+
+def template_size_text(size: float) -> str:
+    return f"{size:g}"
+
+
+class TemplateStyleBook:
+    """Owns the generated styles.xml: each distinct cell format is stored once at a fixed index."""
+
+    def __init__(self, theme: dict[str, Any]) -> None:
+        self.theme = theme
+        self._fonts: list[tuple[str, str, bool, bool, str]] = []
+        self._borders: list[tuple[str | None, str | None]] = [(None, None)]
+        self._num_fmts: dict[str, int] = {}
+        self._xfs: list[tuple[int, int, int, str | None, str, bool]] = []
+        self.style()
+
+    def _font_id(self, name: str, size: str, bold: bool, italic: bool, color: str) -> int:
+        key = (name, size, bold, italic, color)
+        if key not in self._fonts:
+            self._fonts.append(key)
+        return self._fonts.index(key)
+
+    def _border_id(self, top: str | None, bottom: str | None) -> int:
+        if (top, bottom) not in self._borders:
+            self._borders.append((top, bottom))
+        return self._borders.index((top, bottom))
+
+    def _num_fmt_id(self, code: str) -> int:
+        if code in BUILTIN_NUMBER_FORMATS:
+            return BUILTIN_NUMBER_FORMATS[code]
+        return self._num_fmts.setdefault(code, 164 + len(self._num_fmts))
+
+    def style(
+        self, *, font: str | None = None, size: float | None = None, bold: bool = False, italic: bool = False,
+        color: str | None = None, horizontal: str | None = None, vertical: str = "center", wrap: bool = False,
+        num_fmt: str = "General", top: str | None = None, bottom: str | None = None,
+    ) -> str:
+        font_id = self._font_id(
+            font or self.theme["font"], template_size_text(size or self.theme["size_pt"]),
+            bold, italic, template_argb(color or self.theme["color"]),
+        )
+        key = (font_id, self._border_id(top, bottom), self._num_fmt_id(num_fmt), horizontal, vertical, wrap)
+        if key not in self._xfs:
+            self._xfs.append(key)
+        return str(self._xfs.index(key))
+
+    def font(self, style_id: str) -> dict[str, str | None]:
+        """Run properties for rich text in a cell of this style (Excel reads runs, not the cell font)."""
+        name, size, _, _, color = self._fonts[self._xfs[int(style_id)][0]]
+        return {"font_name": name, "font_size": size, "color": color}
+
+    def xml(self) -> bytes:
+        root = ET.Element(f"{NS_MAIN}styleSheet")
+        if self._num_fmts:
+            num_fmts = ET.SubElement(root, f"{NS_MAIN}numFmts", {"count": str(len(self._num_fmts))})
+            for code, number in self._num_fmts.items():
+                ET.SubElement(num_fmts, f"{NS_MAIN}numFmt", {"numFmtId": str(number), "formatCode": code})
+        fonts = ET.SubElement(root, f"{NS_MAIN}fonts", {"count": str(len(self._fonts))})
+        for name, size, bold, italic, color in self._fonts:
+            font = ET.SubElement(fonts, f"{NS_MAIN}font")
+            if bold:
+                ET.SubElement(font, f"{NS_MAIN}b")
+            if italic:
+                ET.SubElement(font, f"{NS_MAIN}i")
+            ET.SubElement(font, f"{NS_MAIN}sz", {"val": size})
+            ET.SubElement(font, f"{NS_MAIN}color", {"rgb": color})
+            ET.SubElement(font, f"{NS_MAIN}name", {"val": name})
+            ET.SubElement(font, f"{NS_MAIN}family", {"val": "2"})
+        fills = ET.SubElement(root, f"{NS_MAIN}fills", {"count": "2"})
+        for pattern in ("none", "gray125"):
+            ET.SubElement(ET.SubElement(fills, f"{NS_MAIN}fill"), f"{NS_MAIN}patternFill", {"patternType": pattern})
+        borders = ET.SubElement(root, f"{NS_MAIN}borders", {"count": str(len(self._borders))})
+        for top, bottom in self._borders:
+            border = ET.SubElement(borders, f"{NS_MAIN}border")
+            ET.SubElement(border, f"{NS_MAIN}left")
+            ET.SubElement(border, f"{NS_MAIN}right")
+            for tag, line in (("top", top), ("bottom", bottom)):
+                side = ET.SubElement(border, f"{NS_MAIN}{tag}")
+                if line:
+                    side.attrib["style"] = line
+                    ET.SubElement(side, f"{NS_MAIN}color", {"auto": "1"})
+            ET.SubElement(border, f"{NS_MAIN}diagonal")
+        cell_style_xfs = ET.SubElement(root, f"{NS_MAIN}cellStyleXfs", {"count": "1"})
+        ET.SubElement(cell_style_xfs, f"{NS_MAIN}xf", {"numFmtId": "0", "fontId": "0", "fillId": "0", "borderId": "0"})
+        cell_xfs = ET.SubElement(root, f"{NS_MAIN}cellXfs", {"count": str(len(self._xfs))})
+        for font_id, border_id, num_fmt_id, horizontal, vertical, wrap in self._xfs:
+            xf = ET.SubElement(cell_xfs, f"{NS_MAIN}xf", {
+                "numFmtId": str(num_fmt_id), "fontId": str(font_id), "fillId": "0", "borderId": str(border_id),
+                "xfId": "0", "applyNumberFormat": "1", "applyFont": "1", "applyBorder": "1", "applyAlignment": "1",
+            })
+            alignment = {"vertical": vertical}
+            if horizontal:
+                alignment["horizontal"] = horizontal
+            if wrap:
+                alignment["wrapText"] = "1"
+            ET.SubElement(xf, f"{NS_MAIN}alignment", alignment)
+        cell_styles = ET.SubElement(root, f"{NS_MAIN}cellStyles", {"count": "1"})
+        ET.SubElement(cell_styles, f"{NS_MAIN}cellStyle", {"name": "Normal", "xfId": "0", "builtinId": "0"})
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+class TemplateQuoteRenderer:
+    """Renders one quote with one checked template into a new workbook (standard library only).
+
+    Calculations (line amounts, totals, tax) are the same as every other quote; the template
+    only decides where they sit. All brief and template text is written as inline strings.
+    """
+
+    def __init__(self, template: Any, brief: dict[str, Any], lines: list[QuoteLine]) -> None:
+        self.template = quote_template.read_quote_template(template)
+        self.brief = brief
+        self.lines = lines
+        self.grid = self.template["grid"]["columns"]
+        self.last_col = len(self.grid)
+        self.styles = TemplateStyleBook(self.template["theme"])
+        page = self.template["page"]
+        self.row_height = template_size_text(page["row_height_pt"])
+        self.blocks = self.template["blocks"]
+        self.table = self._block("item_table")
+        top = page["continuation_top_rows"]
+        header_rows = 2 if self.table["currency_row"] else 1
+        self.page = PageModel(
+            first_page_end=page["first_page_rows"],
+            page_height=page["page_rows"],
+            table_header_offset=top,
+            currency_offset=top + 1,
+            body_offset=top + header_rows + 1,
+        )
+        self.root = self._new_worksheet()
+        self.continuation_pages: set[int] = set()
+        self.manual_pagination = False
+        self.optional_text_written = False
+        self.signing_moved = False
+        self.table_rows: tuple[int, int] | None = None
+        self.entries: list[dict[str, Any]] = []
+        self.previous_band: str | None = None
+
+    def _block(self, block_type: str) -> dict[str, Any] | None:
+        return next((block for block in self.blocks if block["type"] == block_type), None)
+
+    def _block_style(self, block: dict[str, Any], **overrides: Any) -> str:
+        style = block.get("style", {})
+        options = {
+            "font": style.get("font"), "size": style.get("size_pt"), "color": style.get("color"),
+            "bold": style.get("bold", False), "italic": style.get("italic", False),
+            "horizontal": style.get("align"),
+        }
+        options.update(overrides)
+        return self.styles.style(**options)
+
+    def _block_size(self, block: dict[str, Any]) -> float:
+        return float(block.get("style", {}).get("size_pt") or self.template["theme"]["size_pt"])
+
+    def _width_units(self, first: int, last: int) -> float:
+        return sum(column["width"] for column in self.grid[first - 1:last] if not column["hidden"])
+
+    def _text_budget(self, first: int, last: int) -> float:
+        return math.floor(self._width_units(first, last) * TEMPLATE_TEXT_EM_PER_WIDTH_UNIT + 1e-9)
+
+    def _new_worksheet(self) -> ET.Element:
+        root = ET.Element(f"{NS_MAIN}worksheet")
+        sheet_pr = ET.SubElement(root, f"{NS_MAIN}sheetPr")
+        ET.SubElement(sheet_pr, f"{NS_MAIN}pageSetUpPr", {"fitToPage": "1"})
+        ET.SubElement(root, f"{NS_MAIN}dimension", {"ref": "A1"})
+        views = ET.SubElement(root, f"{NS_MAIN}sheetViews")
+        view = ET.SubElement(views, f"{NS_MAIN}sheetView", {"tabSelected": "1", "workbookViewId": "0"})
+        ET.SubElement(view, f"{NS_MAIN}selection", {"activeCell": "A1", "sqref": "A1"})
+        ET.SubElement(root, f"{NS_MAIN}sheetFormatPr", {"defaultColWidth": "9.125", "defaultRowHeight": self.row_height})
+        cols = ET.SubElement(root, f"{NS_MAIN}cols")
+        default_style = self.styles.style()
+        for index, column in enumerate(self.grid, start=1):
+            attributes = {
+                "min": str(index), "max": str(index), "width": f"{column['width']:g}",
+                "style": default_style, "customWidth": "1",
+            }
+            if column["hidden"]:
+                attributes["hidden"] = "1"
+            ET.SubElement(cols, f"{NS_MAIN}col", attributes)
+        ET.SubElement(root, f"{NS_MAIN}sheetData")
+        margins = self.template["page"]["margins_mm"]
+        ET.SubElement(root, f"{NS_MAIN}pageMargins", {
+            key: f"{margins[key] / MM_PER_INCH:.6f}" for key in ("left", "right", "top", "bottom", "header", "footer")
+        })
+        ET.SubElement(root, f"{NS_MAIN}pageSetup", {
+            "paperSize": "9", "orientation": self.template["page"]["orientation"],
+            "fitToWidth": "1", "fitToHeight": "0",
+        })
+        return root
+
+    # Header blocks -------------------------------------------------------------------------
+
+    def _render_header(self) -> None:
+        for block in self.blocks:
+            if block["area"] != "header":
+                continue
+            if block["type"] == "client_details":
+                self._render_client_details(block)
+            elif block["type"] == "quote_details":
+                self._render_quote_details(block)
+            elif block["type"] == "free_text":
+                self._render_header_free_text(block)
+
+    def _rich(self, row: int, col: int, runs: list[Any], style: str) -> None:
+        set_ooxml_rich_text_cell(self.root, row, col, runs, style, **self.styles.font(style))
+
+    def _render_client_details(self, block: dict[str, Any]) -> None:
+        client = self.brief.get("client") if isinstance(self.brief.get("client"), dict) else {}
+        col, indent_col = block["col"], block["col"] + block["indent_cols"]
+        bold = self._block_style(block, bold=True)
+        regular = self._block_style(block)
+        row = block["row"]
+        for field in block["fields"]:
+            if field == "client_name":
+                self._rich(row, col, brief_rich_text_cell_runs(self.brief, "clientName", client.get("name", "")), bold)
+                row += 1
+            elif field == "client_address":
+                address = brief_rich_text_lines(self.brief, "clientAddress", client.get("address") or [])
+                for offset, runs in enumerate(address[:block["address_rows"]]):
+                    self._rich(row + offset, col, runs, bold)
+                row += block["address_rows"]
+            elif field == "attention":
+                label = self.template["labels"]["attention"]
+                self._rich(row, col, [RichTextRun(label, bold=True)] if label else [], bold)
+                self._rich(
+                    row + 1, indent_col,
+                    brief_rich_text_cell_runs(self.brief, "clientAttention", client.get("attention", ""), fallback_bold=True), bold,
+                )
+                row += 2
+            elif field == "client_title":
+                self._rich(row, indent_col, brief_rich_text_cell_runs(self.brief, "clientTitle", client.get("title", "")), regular)
+                row += 1
+            else:
+                row += 1
+
+    def _project_number(self) -> str:
+        project = self.brief.get("project") if isinstance(self.brief.get("project"), dict) else {}
+        return clean_text(self.brief.get("project_number") or project.get("number") or "")
+
+    def _render_quote_details(self, block: dict[str, Any]) -> None:
+        project = self.brief.get("project") if isinstance(self.brief.get("project"), dict) else {}
+        col, last = block["col"], block["col"] + block["span"] - 1
+        row = block["row"]
+        for field in block["fields"]:
+            if field == "quote_date":
+                date_style = self._block_style(block, num_fmt=TEMPLATE_DATE_FORMAT, horizontal="left")
+                runs = brief_quote_date_rich_text_runs(self.brief)
+                if runs:
+                    self._rich(row, col, runs, date_style)
+                else:
+                    set_ooxml_cell(self.root, row, col, excel_date_serial(str(self.brief.get("quote_date", ""))), date_style)
+                if last > col:
+                    ensure_merge_ref(self.root, f"{cell_ref(row, col)}:{cell_ref(row, last)}")
+            elif field == "project_title":
+                self._rich(
+                    row, col, brief_rich_text_cell_runs(self.brief, "projectTitle", project.get("title", "")),
+                    self._block_style(block, bold=True),
+                )
+            elif field == "project_number" and self._project_number():
+                label = self.template["labels"]["project_number"]
+                set_ooxml_cell(self.root, row, col, f"{label} {self._project_number()}".strip(), self._block_style(block))
+            row += 1
+
+    def _render_header_free_text(self, block: dict[str, Any]) -> None:
+        texts = ([(block["heading"], True)] if block["heading"] else []) + [(line, False) for line in block["lines"]]
+        color = block["style"].get("color")
+        for offset, (text, bold) in enumerate(texts[:block["rows"]]):
+            row = block["row"] + offset
+            set_ooxml_cell(self.root, row, block["col"], text, self._block_style(block, bold=bold or block["style"].get("bold", False), color=color))
+            if block["span"] > 1:
+                ensure_merge_ref(self.root, f"{cell_ref(row, block['col'])}:{cell_ref(row, block['col'] + block['span'] - 1)}")
+
+    # Body blocks ---------------------------------------------------------------------------
+
+    def _bands(self) -> list[list[dict[str, Any]]]:
+        bands: list[list[dict[str, Any]]] = []
+        for block in self.blocks:
+            if block["area"] != "body":
+                continue
+            if block["beside"] and bands:
+                bands[-1].append(block)
+            else:
+                bands.append([block])
+        return bands
+
+    def _render_body(self) -> int:
+        cursor = self.template["header"]["rows"] + 1
+        for band in self._bands():
+            start = cursor + band[0]["gap_before"]
+            results = []
+            signing = [block for block in band if block["type"] in {"signature", "acceptance"}]
+            if signing:
+                results.append(self._render_signing(start, signing))
+            for block in band:
+                if block not in signing:
+                    results.append(self._render_block(block, start))
+            written = [result for result in results if result is not None]
+            if not written:
+                continue
+            self.previous_band = band[0]["type"]
+            cursor = max(end for _, end in written)
+        return cursor
+
+    def _render_block(self, block: dict[str, Any], start: int) -> tuple[int, int] | None:
+        if block["type"] == "item_table":
+            return self._render_item_table(block, start)
+        if block["type"] == "totals":
+            return self._render_totals(block, start)
+        if block["type"] in {"terms", "notes"}:
+            return self._render_numbered_text(block, start)
+        return self._render_body_free_text(block, start)
+
+    def _table_columns(self) -> dict[str, dict[str, Any]]:
+        return {column["key"]: column for column in self.table["columns"]}
+
+    def _write_table_header(self, row: int) -> None:
+        heading_color = self.template["theme"]["heading_color"]
+        for column in self.table["columns"]:
+            set_ooxml_cell(self.root, row, column["col"], column["label"], self._block_style(
+                self.table, bold=True, color=heading_color, horizontal=column["align"],
+            ))
+        if self.table["currency_row"]:
+            amount = self._table_columns()["amount"]
+            set_ooxml_cell(self.root, row + 1, amount["col"], self.brief.get("currency", "SGD"), self._block_style(
+                self.table, bold=True, color=heading_color, horizontal=amount["align"],
+            ))
+
+    def _ensure_entry_page(self, row: int, height: int) -> int:
+        page = self.page
+
+        def continuation_header(page_start: int) -> int:
+            if page_start not in self.continuation_pages:
+                self.continuation_pages.add(page_start)
+                self._write_table_header(page_start + page.table_header_offset)
+            return page_start + page.body_offset
+
+        page_start = page.page_start(row)
+        if page_start is not None and row < page_start + page.body_offset:
+            row = continuation_header(page_start)
+        if row + height - 1 <= page.page_end(row):
+            return row
+        return continuation_header(page.next_page_start(row))
+
+    def _render_item_table(self, block: dict[str, Any], start: int) -> tuple[int, int]:
+        columns = self._table_columns()
+        description = columns["description"]
+        description_width = max(10, math.floor(
+            self._width_units(description["col"], description["col"] + description["span"] - 1)
+            * TEMPLATE_DESCRIPTION_CHARS_PER_WIDTH_UNIT + 1e-9,
+        ))
+        entries = render_quote_entries(self.lines, self.brief, description_width=description_width)
+        quantity = columns.get("quantity")
+        if "unit" in columns:
+            for entry in entries:
+                if entry["kind"] == "item":
+                    entry["quantity"] = entry["quantity_number"]
+        prepare_quantity_lines(
+            entries, self.root, None,
+            columns=(quantity["col"], quantity["col"] + quantity["span"] - 1) if quantity else None,
+            font_size=self._block_size(block), page=self.page,
+        )
+        self._write_table_header(start)
+        first_body_row = start + (2 if block["currency_row"] else 1)
+
+        def column_style(key: str, **overrides: Any) -> str:
+            return self._block_style(block, horizontal=columns[key]["align"], **overrides)
+
+        amount_col = columns["amount"]["col"]
+        price_style = column_style("amount", num_fmt=TEMPLATE_AMOUNT_FORMAT)
+        row = first_body_row
+        for index, entry in enumerate(entries):
+            row = self._ensure_entry_page(row, quote_entry_keep_height(entries, index))
+            if entry["kind"] == "section":
+                if "position" in columns:
+                    set_ooxml_cell(self.root, row, columns["position"]["col"], entry["number"], column_style("position", bold=True))
+                set_ooxml_cell(self.root, row, description["col"], entry["section"], column_style("description", bold=True))
+                if entry.get("amount") is not None:
+                    set_ooxml_cell(self.root, row, amount_col, entry["amount"], price_style)
+                if entry.get("coverage"):
+                    set_ooxml_cell(self.root, row + 1, amount_col, entry["coverage"], self._block_style(block))
+                row += 2
+                continue
+            height = quote_entry_height(entry)
+            if "position" in columns:
+                set_ooxml_cell(self.root, row, columns["position"]["col"], entry["number"], column_style("position"))
+            set_ooxml_cell(self.root, row, amount_col, entry["amount"], price_style)
+            if "unit" in columns:
+                set_ooxml_cell(self.root, row, columns["unit"]["col"], entry["unit"], column_style("unit"))
+            if "unit_price" in columns:
+                set_ooxml_cell(self.root, row, columns["unit_price"]["col"], entry["unit_price"], column_style("unit_price", num_fmt=TEMPLATE_AMOUNT_FORMAT))
+            for offset in range(height):
+                if quantity and offset < len(entry["quantity_lines"]):
+                    set_ooxml_cell(self.root, row + offset, quantity["col"], entry["quantity_lines"][offset], column_style("quantity"))
+                if offset < len(entry["description_lines"]):
+                    set_ooxml_cell(self.root, row + offset, description["col"], entry["description_lines"][offset], column_style("description"))
+            row += height + 1
+        self.table_rows = (first_body_row, row - 1)
+        self.entries = entries
+        self.manual_pagination = self.manual_pagination or bool(self.continuation_pages)
+        return start, row - 1
+
+    def _render_totals(self, block: dict[str, Any], start: int) -> tuple[int, int]:
+        total_row = self.page.summary_start(start, TOTAL_BLOCK_HEIGHT)
+        self.manual_pagination = self.manual_pagination or total_row != start
+        amount = self._table_columns()["amount"]
+        letter = excel_col(amount["col"] - 1)
+        first_body_row, table_end = self.table_rows
+        sum_end = total_row - 1 if self.previous_band == "item_table" else table_end
+        tax_rate = quote_tax_rate(self.brief)
+        cached_total = round_commercial_cents(sum(formula_cache_amount(entry.get("amount")) for entry in self.entries)) or 0.0
+        cached_tax = round_commercial_cents(cached_total * tax_rate) or 0.0
+        cached_grand = round_commercial_cents(cached_total + cached_tax) or 0.0
+        currency = self.brief.get("currency", "SGD")
+        rows = (
+            (self.template["labels"]["total"], f"SUM({letter}{first_body_row}:{letter}{max(first_body_row, sum_end)})", cached_total, ("thin", None)),
+            (quote_tax_label(self.brief), f"ROUND({letter}{total_row}*{tax_rate:.6f},2)", cached_tax, (None, None)),
+            (quote_total_including_tax_label(self.brief), f"SUM({letter}{total_row}:{letter}{total_row + 1})", cached_grand, ("thin", "double")),
+        )
+        for offset, (label, formula, cached, (top, bottom)) in enumerate(rows):
+            row = total_row + offset
+            set_ooxml_cell(self.root, row, block["label_col"], label, self._block_style(block, bold=True, horizontal="right", top=top, bottom=bottom))
+            set_ooxml_formula(self.root, row, amount["col"], formula, self._block_style(
+                block, bold=True, horizontal="right", num_fmt=TEMPLATE_AMOUNT_FORMAT, top=top, bottom=bottom,
+            ), cached)
+            if block["currency_col"]:
+                set_ooxml_cell(self.root, row, block["currency_col"], currency, self._block_style(block, bold=True, horizontal="center", top=top, bottom=bottom))
+        return total_row, total_row + TOTAL_BLOCK_HEIGHT
+
+    def _render_body_free_text(self, block: dict[str, Any], start: int) -> tuple[int, int] | None:
+        col, last = block["col"], block["col"] + block["span"] - 1
+        line_col = col + 1 if block["span"] > 1 else col
+        max_width = self._text_budget(line_col, last)
+        heading_style = self._block_style(block, bold=True, vertical="top", wrap=True)
+        body_style = self._block_style(block, vertical="top", wrap=True)
+        heading_runs = [RichTextRun(block["heading"])] if block["heading"] else []
+        line_runs = [[RichTextRun(line)] for line in block["lines"]]
+        total_height = sum(len(wrap_rich_text_runs(runs, max_width=max_width)) for runs in ([heading_runs] if heading_runs else []) + line_runs)
+        row, last_row = start, 0
+        for index, (runs, text_col, style) in enumerate(
+            ([(heading_runs, col, heading_style)] if heading_runs else []) + [(runs, line_col, body_style) for runs in line_runs]
+        ):
+            row, last_row, moved = write_optional_text_block(
+                self.root, row, runs, name="free_text", text_column=text_col, style=style,
+                admission_height=total_height if index == 0 else None,
+                last_column=last, max_width=max_width, page=self.page, **self.styles.font(style),
+            )
+            self.manual_pagination = self.manual_pagination or moved
+        if not last_row:
+            return None
+        self.optional_text_written = True
+        return start, last_row + 1
+
+    def _render_numbered_text(self, block: dict[str, Any], start: int) -> tuple[int, int] | None:
+        keys = {
+            "terms": ("terms_heading", "payment_terms", "termsHeading", "paymentTerms", "payment_term"),
+            "notes": ("notes_heading", "standard_notes", "notesHeading", "standardNotes", "standard_note"),
+        }[block["type"]]
+        heading_key, items_key, rich_heading, rich_items, name = keys
+        heading = clean_text(self.brief.get(heading_key))
+        item_runs = brief_rich_text_items(self.brief, rich_items, self.brief.get(items_key) or [])
+        if not (heading or item_runs):
+            return None
+        col, last = block["col"], block["col"] + block["span"] - 1
+        heading_style = self._block_style(block, bold=True, vertical="top", wrap=True)
+        body_style = self._block_style(block, vertical="top", wrap=True)
+        number_style = self._block_style(block, vertical="top", horizontal="left")
+        _, last_row, moved = write_numbered_text_section(
+            self.root, start, brief_rich_text_cell_runs(self.brief, rich_heading, heading), item_runs,
+            name=name, has_heading=bool(heading), heading_style=heading_style, body_style=body_style,
+            number_style=number_style, heading_font=self.styles.font(heading_style), body_font=self.styles.font(body_style),
+            number_column=col, last_column=last, max_width=self._text_budget(col + 1, last), page=self.page,
+        )
+        self.manual_pagination = self.manual_pagination or moved
+        self.optional_text_written = True
+        return start, last_row + 1
+
+    def _render_signing(self, start: int, blocks: list[dict[str, Any]]) -> tuple[int, int]:
+        sides: dict[str, SigningColumns] = {}
+        for block in blocks:
+            style = self._block_style(block)
+            label_style = self._block_style(block, horizontal="left")
+            sides[block["type"]] = SigningColumns(
+                block["col"], block["col"] + block["span"] - 1, style, label_style,
+                self.styles.font(style), self.styles.font(label_style), block["line_chars"],
+            )
+        company = self.brief.get("company") if isinstance(self.brief.get("company"), dict) else {}
+        acceptance = self.brief.get("acceptance") if isinstance(self.brief.get("acceptance"), dict) else {}
+        signature = self.brief.get("signature") if isinstance(self.brief.get("signature"), dict) else {}
+        end, moved = write_signing_band(
+            self.root, start, self.brief, acceptance, signature, clean_text(company.get("name")),
+            sides.get("signature"), sides.get("acceptance"), page=self.page, row_height=self.row_height,
+        )
+        self.signing_moved = self.signing_moved or moved
+        self.manual_pagination = self.manual_pagination or moved
+        return start, end
+
+    # Drawing, package -----------------------------------------------------------------------
+
+    def _column_emu(self, col: int) -> int:
+        column = self.grid[col - 1]
+        return 0 if column["hidden"] else round(column["width"] * 7 + 5) * EMU_PER_PIXEL
+
+    def _row_emu(self) -> int:
+        return round(float(self.row_height) * EMU_PER_POINT)
+
+    def _anchor_marker(self, parent: ET.Element, tag: str, col: int, x: int, row: int, y: int) -> None:
+        """Write a from/to marker for a point x EMU right of column `col` and y EMU below row `row`."""
+        while col < self.last_col and x >= self._column_emu(col):
+            x -= self._column_emu(col)
+            col += 1
+        row_emu = self._row_emu()
+        row += y // row_emu
+        y %= row_emu
+        marker = ET.SubElement(parent, f"{NS_DRAWING}{tag}")
+        for name, value in (("col", col - 1), ("colOff", x), ("row", row - 1), ("rowOff", y)):
+            ET.SubElement(marker, f"{NS_DRAWING}{name}").text = str(value)
+
+    def _rect_emu(self, block: dict[str, Any]) -> tuple[int, int]:
+        width = sum(self._column_emu(col) for col in range(block["col"], block["col"] + block["span"]))
+        return width, block["rows"] * self._row_emu()
+
+    def _logo_anchors(self, page_starts: list[int]) -> tuple[list[ET.Element], dict[str, bytes]]:
+        block = self._block("logo")
+        company = self.brief.get("company") if isinstance(self.brief.get("company"), dict) else {}
+        match = re.match(r"data:(image/(?:jpeg|jpg|png));base64,(.+)", clean_text(company.get("logo_data_url")), flags=re.IGNORECASE | re.DOTALL)
+        if block is None or not match:
+            return [], {}
+        mime_type = match.group(1).lower().replace("image/jpg", "image/jpeg")
+        try:
+            image = base64.b64decode(match.group(2), validate=True)
+        except ValueError:
+            return [], {}
+        if not image:
+            return [], {}
+        logo = block["logo"]
+        rect_width, rect_height = self._rect_emu(block)
+        box_width = round(logo["width_mm"] * EMU_PER_MM)
+        box_height = round(logo["height_mm"] * EMU_PER_MM)
+        width, height = box_width, box_height
+        dimensions = image_dimensions(image, mime_type)
+        if logo["keep_aspect"] and dimensions:
+            width, height = fitted_header_logo_extent(dimensions, (box_width, box_height))
+        x = {"left": 0, "center": max(0, rect_width - width) // 2, "right": max(0, rect_width - width)}[logo["align"]]
+        y = {"top": 0, "middle": max(0, rect_height - height) // 2, "bottom": max(0, rect_height - height)}[logo["valign"]]
+        extension = "png" if mime_type == "image/png" else "jpeg"
+        anchors = []
+        rows = [block["row"]] + ([start + block["row"] - 1 for start in page_starts] if logo["repeat"] else [])
+        for number, row in enumerate(rows, start=1):
+            anchor = ET.Element(f"{NS_DRAWING}oneCellAnchor")
+            self._anchor_marker(anchor, "from", block["col"], x, row, y)
+            ET.SubElement(anchor, f"{NS_DRAWING}ext", {"cx": str(width), "cy": str(height)})
+            pic = ET.SubElement(anchor, f"{NS_DRAWING}pic")
+            nv = ET.SubElement(pic, f"{NS_DRAWING}nvPicPr")
+            ET.SubElement(nv, f"{NS_DRAWING}cNvPr", {"id": str(number + 1), "name": "Header Logo" if number == 1 else f"Header Logo - Page {number}"})
+            ET.SubElement(ET.SubElement(nv, f"{NS_DRAWING}cNvPicPr"), f"{NS_A}picLocks", {"noChangeAspect": "1"})
+            fill = ET.SubElement(pic, f"{NS_DRAWING}blipFill")
+            ET.SubElement(fill, f"{NS_A}blip", {f"{NS_REL}embed": "rId1"})
+            ET.SubElement(ET.SubElement(fill, f"{NS_A}stretch"), f"{NS_A}fillRect")
+            sp_pr = ET.SubElement(pic, f"{NS_DRAWING}spPr")
+            xfrm = ET.SubElement(sp_pr, f"{NS_A}xfrm")
+            ET.SubElement(xfrm, f"{NS_A}off", {"x": "0", "y": "0"})
+            ET.SubElement(xfrm, f"{NS_A}ext", {"cx": str(width), "cy": str(height)})
+            ET.SubElement(ET.SubElement(sp_pr, f"{NS_A}prstGeom", {"prst": "rect"}), f"{NS_A}avLst")
+            ET.SubElement(anchor, f"{NS_DRAWING}clientData")
+            anchors.append(anchor)
+        return anchors, {f"xl/media/header_logo.{extension}": image}
+
+    def _company_details_anchor(self) -> ET.Element | None:
+        block = self._block("company_details")
+        if block is None:
+            return None
+        company = self.brief.get("company") if isinstance(self.brief.get("company"), dict) else {}
+        header_runs = brief_rich_text_lines(self.brief, "headerDetails", company.get("header_lines") or [])
+        lines: list[list[RichTextRun] | None] = []
+        for field in block["fields"]:
+            if field == "header_lines":
+                lines.extend(header_runs)
+            elif field == "project_number" and self._project_number():
+                lines.append([RichTextRun(f"{self.template['labels']['project_number']} {self._project_number()}".strip())])
+            elif field == "blank":
+                lines.append(None)
+        while lines and lines[-1] is None:
+            lines.pop()
+        if not lines:
+            return None
+        style = block["style"]
+        size = str(round(float(style.get("size_pt") or self.template["theme"]["size_pt"]) * 100))
+        color = (style.get("color") or self.template["theme"]["color"])[1:].upper()
+        typeface = style.get("font") or self.template["theme"]["font"]
+        rect_width, rect_height = self._rect_emu(block)
+        anchor = ET.Element(f"{NS_DRAWING}twoCellAnchor")
+        self._anchor_marker(anchor, "from", block["col"], 0, block["row"], 0)
+        self._anchor_marker(anchor, "to", block["col"], rect_width, block["row"], rect_height)
+        shape = ET.SubElement(anchor, f"{NS_DRAWING}sp", {"macro": "", "textlink": ""})
+        nv = ET.SubElement(shape, f"{NS_DRAWING}nvSpPr")
+        ET.SubElement(nv, f"{NS_DRAWING}cNvPr", {"id": "1", "name": "Company Details"})
+        ET.SubElement(nv, f"{NS_DRAWING}cNvSpPr", {"txBox": "1"})
+        sp_pr = ET.SubElement(shape, f"{NS_DRAWING}spPr")
+        ET.SubElement(ET.SubElement(sp_pr, f"{NS_A}prstGeom", {"prst": "rect"}), f"{NS_A}avLst")
+        ET.SubElement(sp_pr, f"{NS_A}noFill")
+        ET.SubElement(ET.SubElement(sp_pr, f"{NS_A}ln"), f"{NS_A}noFill")
+        body = ET.SubElement(shape, f"{NS_DRAWING}txBody")
+        ET.SubElement(body, f"{NS_A}bodyPr", {"vertOverflow": "clip", "wrap": "square", "lIns": "18288", "tIns": "0", "rIns": "0", "bIns": "0", "anchor": "t"})
+        ET.SubElement(body, f"{NS_A}lstStyle")
+        align = {"left": "l", "center": "ctr", "right": "r"}[style.get("align", "left")]
+        for runs in lines:
+            paragraph = ET.SubElement(body, f"{NS_A}p")
+            ET.SubElement(paragraph, f"{NS_A}pPr", {"algn": align})
+            for run in runs or [RichTextRun("")]:
+                drawing_run = ET.SubElement(paragraph, f"{NS_A}r")
+                props = ET.SubElement(drawing_run, f"{NS_A}rPr", {
+                    "lang": "en-US", "sz": size, "b": "1" if run.bold or style.get("bold") else "0",
+                    "i": "1" if run.italic or style.get("italic") else "0",
+                })
+                if run.underline:
+                    props.attrib["u"] = "sng"
+                ET.SubElement(ET.SubElement(props, f"{NS_A}solidFill"), f"{NS_A}srgbClr", {"val": color})
+                ET.SubElement(props, f"{NS_A}latin", {"typeface": typeface})
+                ET.SubElement(drawing_run, f"{NS_A}t").text = run.text
+        ET.SubElement(anchor, f"{NS_DRAWING}clientData")
+        return anchor
+
+    def _package(self, last_print_row: int, page_starts: list[int]) -> dict[str, bytes]:
+        def xml(element: ET.Element) -> bytes:
+            return ET.tostring(element, encoding="utf-8", xml_declaration=True)
+
+        def relationships(*items: tuple[str, str, str]) -> bytes:
+            root = empty_relationships_root()
+            for rel_id, rel_type, target in items:
+                ET.SubElement(root, f"{NS_PACKAGE_REL}Relationship", {"Id": rel_id, "Type": rel_type, "Target": target})
+            return xml(root)
+
+        parts: dict[str, bytes] = {}
+        anchors, media = self._logo_anchors(page_starts)
+        details = self._company_details_anchor()
+        if details is not None:
+            anchors.insert(0, details)
+        if anchors:
+            drawing = ET.Element(f"{NS_DRAWING}wsDr")
+            drawing.extend(anchors)
+            parts["xl/drawings/drawing1.xml"] = xml(drawing)
+            media_rels = [("rId1", REL_IMAGE, "../media/" + name.rsplit("/", 1)[1]) for name in media]
+            parts["xl/drawings/_rels/drawing1.xml.rels"] = relationships(*media_rels)
+            parts.update(media)
+            ET.SubElement(self.root, f"{NS_MAIN}drawing", {f"{NS_REL}id": "rId1"})
+            parts["xl/worksheets/_rels/sheet1.xml.rels"] = relationships(("rId1", REL_DRAWING, "../drawings/drawing1.xml"))
+        parts["xl/worksheets/sheet1.xml"] = serialize_excel_worksheet(self.root)
+        parts["xl/styles.xml"] = self.styles.xml()
+        workbook = ET.Element(f"{NS_MAIN}workbook")
+        ET.SubElement(ET.SubElement(workbook, f"{NS_MAIN}bookViews"), f"{NS_MAIN}workbookView")
+        sheets = ET.SubElement(workbook, f"{NS_MAIN}sheets")
+        ET.SubElement(sheets, f"{NS_MAIN}sheet", {"name": "Quotation", "sheetId": "1", f"{NS_REL}id": "rId1"})
+        workbook_xml = update_print_area(xml(workbook), last_print_row, self.last_col)
+        parts["xl/workbook.xml"] = enable_workbook_recalculation(workbook_xml)
+        parts["xl/_rels/workbook.xml.rels"] = relationships(
+            ("rId1", REL_WORKSHEET, "worksheets/sheet1.xml"), ("rId2", REL_STYLES, "styles.xml"),
+        )
+        parts["_rels/.rels"] = relationships(("rId1", REL_OFFICE_DOCUMENT, "xl/workbook.xml"))
+        types = ET.Element(f"{NS_CONTENT_TYPES}Types")
+        for extension, content_type in (
+            ("rels", "application/vnd.openxmlformats-package.relationships+xml"), ("xml", "application/xml"),
+            ("png", "image/png"), ("jpeg", "image/jpeg"),
+        ):
+            ET.SubElement(types, f"{NS_CONTENT_TYPES}Default", {"Extension": extension, "ContentType": content_type})
+        for name, content_type in SPREADSHEET_CONTENT_TYPES.items():
+            if name in parts:
+                ET.SubElement(types, f"{NS_CONTENT_TYPES}Override", {"PartName": "/" + name, "ContentType": content_type})
+        parts["[Content_Types].xml"] = xml(types)
+        sanitize_core_properties(parts)
+        return parts
+
+    def write(self, path: Path) -> None:
+        self._render_header()
+        last_content_row = self._render_body()
+        manual = self.manual_pagination or last_content_row > self.page.first_page_end
+        last_print_row = printable_last_row(self.root, last_content_row, manual, self.page)
+        trim_layout_worksheet(self.root, last_print_row, self.last_col)
+        sheet_data = self.root.find(f"{NS_MAIN}sheetData")
+        for row_number in range(1, last_print_row + 1):
+            row = get_or_create_row(sheet_data, row_number)
+            row.set("ht", self.row_height)
+            row.set("customHeight", "1")
+        if manual and (self.optional_text_written or self.signing_moved):
+            hide_empty_continuation_guard_rows(self.root, last_print_row, self.page)
+        set_manual_page_breaks(self.root, last_print_row, manual, self.page)
+        page_starts = [break_id + 1 for break_id in self.page.break_ids(last_print_row) if manual and break_id < last_print_row]
+        parts = self._package(last_print_row, page_starts)
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name, content in parts.items():
+                zf.writestr(name, content)
+
+
+def write_template_quote_xlsx(template: Any, path: Path, brief: dict[str, Any], lines: list[QuoteLine]) -> None:
+    """Write the quote with a quote template definition instead of a profile layout workbook."""
+    TemplateQuoteRenderer(template, brief, lines).write(path)
 
 
 def powershell_literal(path: Path) -> str:
@@ -4709,7 +5534,11 @@ def main() -> int:
     rows = build_quote_rows(brief, lines)
     xlsx_path = out_dir / "quotation.xlsx"
     pdf_path = out_dir / "quotation.pdf"
-    if args.layout_template.exists():
+    if args.quote_template:
+        write_template_quote_xlsx(
+            quote_template.parse_quote_template_json(args.quote_template.read_bytes()), xlsx_path, brief, lines,
+        )
+    elif args.layout_template.exists():
         write_quote_layout_xlsx(args.layout_template, xlsx_path, brief, lines)
     else:
         print(f"Quotation layout template not found, writing minimal XLSX fallback: {args.layout_template}")

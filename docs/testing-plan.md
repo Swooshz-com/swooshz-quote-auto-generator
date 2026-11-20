@@ -717,8 +717,22 @@ the owner-approved CI lane.
   control characters, formula-like text kept as plain text, the required item
   table and totals and the layout rules in `docs/quote-template-schema.md`. It
   also checks the Standard template against the bundled quotation layout
-  (widths, hidden columns, margins, print titles, page rows, labels, exclusions
+  (widths, hidden columns, margins, logo repeat, page rows, labels, exclusions
   text and body font), so changing either one alone fails.
+- Quote template rendering: run
+  `python -m unittest tests.test_quote_template_render`. It renders synthetic
+  quotes with the Standard template and with the bundled layout workbook and
+  requires the same cell text, formulas, number formats, merges, column widths,
+  print area, page breaks and hidden rows. It also renders a changed template
+  and checks that added, removed, renamed and reordered table columns, moved
+  header blocks, fonts and colours, logo size, place and repeat, and the totals
+  formulas follow the template; that template and quote text never becomes a
+  live formula; and the `--quote-template` option of `scripts/generate_quote.py`.
+  Its LibreOffice PDF smoke prints Standard and the changed template on the
+  expected number of pages with all text inside the page; it skips locally
+  without LibreOffice and fails in CI if LibreOffice is missing. Changes to the
+  legacy layout path also run `tests.test_generate_quote`,
+  `tests.test_profile_layout_safety` and `tests.test_quote_exclusions`.
 ## Manual price and restored search contract
 
 Output defaults to editable reference prices, read-only FX and derived quoted unit prices.

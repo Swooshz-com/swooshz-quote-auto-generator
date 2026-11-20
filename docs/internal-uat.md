@@ -88,7 +88,7 @@ npm run playwright:install
 - [ ] Confirm the dashboard is the first useful screen.
 - [ ] Confirm New Quote starts a clean quote.
 - [ ] Confirm the Privacy Notice link is reachable.
-- [ ] Confirm the Pricing Reference action is reachable if applicable.
+- [ ] Confirm the Settings action (it opens Pricing Reference) is reachable if applicable.
 
 ### Profile / Pricing Setup
 
