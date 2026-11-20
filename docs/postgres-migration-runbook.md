@@ -23,6 +23,7 @@ chat, logs, screenshots, and command history.
 9. `010_telemetry_attempt_semantics_postgres.sql`
 10. `011_quote_ai_spend_postgres.sql`
 11. `012_quote_api_admission_postgres.sql`
+12. `013_quote_templates_postgres.sql`
 
 Successful applications are recorded in `public.sqag_schema_migrations` with
 the sequence number, migration ID, SHA-256 source checksum, and database
@@ -67,6 +68,25 @@ replays. Older quote saves may remove the coverage marker. On upgrade the
 reported amount remains visible and history is marked partial. A storage
 rollback to a pre-migration backup would also lose charges recorded after the
 backup. Use the normal restore process if that separate action is authorised.
+
+Migration 013 adds `sqag_quote_templates`: a workspace's saved quote templates
+(name, checked definition JSON, fingerprint, save number, default flag) keyed
+by workspace and template ID, and a partial unique index that allows one
+default per workspace. Runtime can select, insert, update and delete template
+rows; maintenance and PUBLIC have no grant. It changes no existing rows and
+seeds nothing: the built-in Standard template lives in the application, never
+in the table. The SQLite migration adds the same table and index.
+
+For rollout, 013 follows 012 in the manifest, so a database at 011 applies 012
+and 013 in order; 013 cannot be applied on its own. The app does not require
+013: until it is applied, the template endpoints answer 503
+(`quote_templates_not_migrated`) and quotes for a profile that chose a
+template use the Standard template (with a note when a saved template is
+missing). A half-built table or a database fault is an error, never this
+fallback. Remove that tolerance once 013 is applied everywhere. Applying 013
+to the rehearsal or live database needs the owner's own OK naming the target
+and the migration checksum. Application rollback can keep the additive table
+and its ledger entry; saved templates simply go unused by the old version.
 
 The runner accepts only an exact ordered prefix of the repository manifest.
 It fails closed for checksum drift, unknown or out-of-order rows, a complete

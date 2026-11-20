@@ -401,7 +401,7 @@ async function verifyOutputModeKeyboardActivation(page,index,outputDir) {
         {variant:'catalog',price:await page.evaluate(()=>fxModeTest.catalog),amount:'180.00',revision:before.revision+2,saves:2});
       const restored=await snapshot();await cell.click();await activate('[data-output-reference-action]',action);assert.deepEqual(await snapshot(),restored,'Already-catalogue restoration is a no-op');
       await cell.click();await editor.fill('1.005');await activate('[data-output-included-action]',action);
-      assert.deepEqual(await page.evaluate(i=>({variant:outputPriceAuthority(state.outputRows[i]).variant,amount:outputCellDisplayValue(state.outputRows[i],'amount'),saves:fxModeTest.saves}),index),{variant:'included',amount:'0.00',saves:3});
+      assert.deepEqual(await page.evaluate(i=>({variant:outputPriceAuthority(state.outputRows[i]).variant,amount:outputCellDisplayValue(state.outputRows[i],'amount'),saves:fxModeTest.saves}),index),{variant:'included',amount:'Included',saves:3});
       assert.equal(await editor.count(),0);outcomes.push({action,quoteOverride:true,restoredCatalogue:true,restoreNoop:true,included:true});
     }
     assert.deepEqual(effects,[]);

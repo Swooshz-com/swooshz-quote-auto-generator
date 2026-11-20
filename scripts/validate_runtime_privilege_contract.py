@@ -68,6 +68,7 @@ RUNTIME_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "sqag_pricing_references": ("SELECT", "INSERT", "UPDATE", "DELETE"),
     "sqag_quote_sessions": ("SELECT", "INSERT", "UPDATE", "DELETE"),
     "sqag_quote_ai_spend": ("SELECT", "INSERT", "UPDATE"),
+    "sqag_quote_templates": ("SELECT", "INSERT", "UPDATE", "DELETE"),
     "sqag_generation_runs": ("SELECT", "INSERT", "UPDATE"),
     "sqag_generation_evidence": ("SELECT", "INSERT"),
     "sqag_audit_events": ("SELECT", "INSERT"),

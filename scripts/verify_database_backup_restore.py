@@ -33,6 +33,7 @@ SQAG_TABLES = (
     "sqag_pricing_references",
     "sqag_quote_sessions",
     "sqag_quote_ai_spend",
+    "sqag_quote_templates",
     "sqag_quote_artifacts",
     "sqag_file_artifacts",
     "sqag_telemetry_source_state",

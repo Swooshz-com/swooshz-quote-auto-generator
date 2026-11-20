@@ -30,6 +30,14 @@ class BasisReviewRegressionsTest(unittest.TestCase):
                                     'Unmatched:Lighting and Electrical'])
         self.assertIn('Booth size 9m x 10.5m (94.5 sqm)', evidence['detectedBooth']['structured'])
         self.assertEqual(evidence['detectedBooth']['unknownDimensions'], [])
+        # Owner-approved display (INT-SQAG-202611200004): the booth size line is bold and about the size of the
+        # "Matched" heading; the card keeps its colours; "Est." matches its quantity's size and colour.
+        booth = evidence['detectedBooth']['style']
+        self.assertGreaterEqual(booth['sizeLine']['fontWeight'], 700)
+        self.assertLessEqual(abs(booth['sizeLine']['fontSize'] - booth['matchedHeading']['fontSize']), 1)
+        self.assertEqual(booth['card'], {'background': 'rgb(247, 251, 255)', 'border': 'rgb(213, 227, 238)',
+                                         'padding': '14px 18px', 'radius': '8px'})
+        self.assertEqual(evidence['estTag']['est'], evidence['estTag']['quantity'])
         self.assertGreaterEqual(evidence['latency']['basisLines'], 60)
         reused, probes = evidence['latency']['reusedProbeNodes'].split('/')
         self.assertEqual(reused, probes)

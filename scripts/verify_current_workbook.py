@@ -52,6 +52,12 @@ def verify_workbook(data, payload, expected_rows, logo, *, template_path=None):
             assert cells[ref]["type"] not in ("s", "inlineStr", "str", "e"), "Non-numeric amount: " + ref
             assert Decimal(cells[ref]["value"]) == expected, "Wrong amount in its own row: " + ref
 
+        def included(ref):
+            # An Included row reads the word, as literal text and never a formula; it adds zero to the total.
+            assert cells[ref]["type"] in ("s", "inlineStr") and cells[ref]["value"] == "Included" and not cells[ref]["formula"], (
+                "Included row does not read Included: " + ref
+            )
+
         assert expected_rows and len(expected_rows) == len(payload["line_items"]), "Missing expected rows"
         row_indices, quantity_indices, subtotal = [], [], Decimal(0)
         for row_index, (actual, expected) in enumerate(zip(payload["line_items"], expected_rows)):
@@ -74,8 +80,12 @@ def verify_workbook(data, payload, expected_rows, logo, *, template_path=None):
                 quantity_indices.append(continuation)
                 continuation += 1
             assert " ".join(quantity_parts) == quantity + " " + expected["unit"], "Wrong quantity/unit in its own row"
-            amount = Decimal(0) if expected["price_mode"] == "Included" else money(Decimal(str(expected["quantity"])) * Decimal(str(expected["unit_price"])))
-            numeric(f"E{index}", amount)
+            if expected["price_mode"] == "Included":
+                amount = Decimal(0)
+                included(f"E{index}")
+            else:
+                amount = money(Decimal(str(expected["quantity"])) * Decimal(str(expected["unit_price"])))
+                numeric(f"E{index}", amount)
             subtotal += amount
         assert len(set(row_indices)) == len(row_indices), "Rows collapsed"
 

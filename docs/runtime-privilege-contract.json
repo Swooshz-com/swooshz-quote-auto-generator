@@ -21,6 +21,7 @@
       "sqag_quote_publication_versions",
       "sqag_quote_ai_spend",
       "sqag_quote_sessions",
+      "sqag_quote_templates",
       "sqag_retention_delete_authorizations",
       "sqag_retention_scan_cursors",
       "sqag_telemetry_events",
@@ -53,6 +54,7 @@
       "sqag_quote_publication_versions_retention_idx",
       "sqag_quote_publication_versions_session_idx",
       "sqag_quote_ai_spend_session_idx",
+      "sqag_quote_templates_default_uidx",
       "sqag_telemetry_events_actor_idx",
       "sqag_telemetry_events_feed_idx",
       "sqag_telemetry_events_retention_idx",
@@ -350,6 +352,14 @@
         "sqag_quote_api_callers",
         "sqag_quote_api_tenants"
       ]
+    },
+    {
+      "path": "migrations/013_quote_templates_postgres.sql",
+      "sequence_no": 12,
+      "sha256": "b4c2b3eaa846ac3ae10f1dd1e101c8d78c683a3ae58161275c8ab4eaa7dfcc14",
+      "tables": [
+        "sqag_quote_templates"
+      ]
     }
   ],
   "database_privileges": {
@@ -368,6 +378,7 @@
     "sqag_profiles": {"privileges": ["SELECT", "INSERT", "UPDATE", "DELETE"]},
     "sqag_pricing_references": {"privileges": ["SELECT", "INSERT", "UPDATE", "DELETE"]},
     "sqag_quote_ai_spend": {"privileges": ["SELECT", "INSERT", "UPDATE"]},
+    "sqag_quote_templates": {"privileges": ["SELECT", "INSERT", "UPDATE", "DELETE"]},
     "sqag_quote_sessions": {"privileges": ["SELECT", "INSERT", "UPDATE", "DELETE"]},
     "sqag_generation_runs": {"privileges": ["SELECT", "INSERT", "UPDATE"]},
     "sqag_generation_evidence": {"privileges": ["SELECT", "INSERT"]},
@@ -438,6 +449,7 @@
       "sqag_quote_publication_artifacts",
       "sqag_quote_publication_versions",
       "sqag_quote_sessions",
+      "sqag_quote_templates",
       "sqag_retention_delete_authorizations",
       "sqag_retention_scan_cursors",
       "sqag_telemetry_events",

@@ -70,7 +70,7 @@ with zipfile.ZipFile(path) as archive:
                     numbers.append(float(value.text or "nan"))
                 except ValueError:
                     pass
-    included_row_has_zero = False
+    included_row_reads_included = False
     for name in sheets:
         sheet = ET.fromstring(archive.read(name))
         for row in sheet.findall(".//m:sheetData/m:row", ns):
@@ -94,16 +94,17 @@ with zipfile.ZipFile(path) as archive:
                         row_numbers.append(float(value.text or "nan"))
                     except ValueError:
                         pass
-            if included_description is not None and included_description in row_text and any(math.isfinite(number) and abs(number) <= 0.011 for number in row_numbers):
-                included_row_has_zero = True
+            # An Included row reads the word Included in its amount cell and carries no amount of its own.
+            if included_description is not None and included_description in row_text and "Included" in row_text and not any(math.isfinite(number) and abs(number) > 0.011 for number in row_numbers):
+                included_row_reads_included = True
     package_xml = "".join(archive.read(name).decode("utf-8", errors="replace") for name in names if name.startswith("xl/") and name.endswith(".xml"))
 all_text = "\\n".join(texts) + package_xml
 missing = [value for value in needles if value not in all_text]
 if missing:
     relevant = [value for value in texts if any(token in value.casefold() for token in ("alpha", "included", "wall rail", "carpet tile"))]
     raise SystemExit("XLSX is missing expected quote text: " + json.dumps({"missing": missing, "relevant_cells": relevant}))
-if included_description is not None and not included_row_has_zero:
-    raise SystemExit("XLSX does not show the Included row at zero amount: " + included_description)
+if included_description is not None and not included_row_reads_included:
+    raise SystemExit("XLSX does not show the Included row as Included: " + included_description)
 for value in expected:
     if not any(math.isfinite(actual) and abs(actual - value) <= 0.011 for actual in numbers):
         raise SystemExit("XLSX is missing expected current total/value: " + str(value))

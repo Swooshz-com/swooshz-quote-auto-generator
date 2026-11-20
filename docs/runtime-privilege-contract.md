@@ -221,6 +221,11 @@ maintenance role has no direct grant on `sqag_quote_ai_spend`. Quote deletion
 removes those records through the composite foreign key after the existing
 quote deletion checks.
 
+The runtime role may select, insert, update and delete saved quote templates in
+`sqag_quote_templates` (migration 013). Maintenance and PUBLIC have no grant.
+Who may change a template is decided by the application's admin check, and
+each change is limited to the caller's workspace.
+
 ## Admission registry column grants
 
 Schema v5 closes `runtime_column_privileges` to two tables. Both have empty

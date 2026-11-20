@@ -29,6 +29,7 @@ MIGRATION_FILE_NAMES = (
     "010_telemetry_attempt_semantics_postgres.sql",
     "011_quote_ai_spend_postgres.sql",
     "012_quote_api_admission_postgres.sql",
+    "013_quote_templates_postgres.sql",
 )
 
 EXPECTED_TABLES = frozenset(
@@ -39,6 +40,7 @@ EXPECTED_TABLES = frozenset(
         "sqag_pricing_references",
         "sqag_quote_sessions",
         "sqag_quote_ai_spend",
+        "sqag_quote_templates",
         "sqag_object_artifacts",
         "sqag_generation_runs",
         "sqag_generation_evidence",
@@ -89,6 +91,7 @@ EXPECTED_INDEXES = frozenset(
         "sqag_telemetry_events_actor_idx",
         "sqag_telemetry_events_retry_uidx",
         "sqag_quote_ai_spend_session_idx",
+        "sqag_quote_templates_default_uidx",
     }
 )
 EXPECTED_TRIGGERS = frozenset(
@@ -461,6 +464,12 @@ TABLE_SPECS = (
             referenced_columns="workspace_id,session_id", on_delete="c")),
     ),
     TableSpec(
+        "sqag_quote_templates",
+        _cols("workspace_id:text", "template_id:text", "name:text", "definition_json:text", "fingerprint:text",
+              "save_number:bigint", "is_default:integer=0", "created_at:text", "updated_at:text"),
+        (_c("p", "workspace_id,template_id"),),
+    ),
+    TableSpec(
         "sqag_profiles",
         _cols("workspace_id:text", "profile_id:text", "payload_json:text", "created_at:text", "updated_at:text"),
         (_c("p", "workspace_id,profile_id"),),
@@ -757,6 +766,7 @@ INDEX_SPECS = (
     _index("sqag_telemetry_events_actor_idx", "sqag_telemetry_events", "workspace_id,actor_tracking_id,occurred_at"),
     _index("sqag_telemetry_events_retry_uidx", "sqag_telemetry_events", "workspace_id,retry_lineage_id,attempt_number", unique=True, predicate="(retry_lineage_id is not null) and (attempt_number is not null)"),
     _index("sqag_quote_ai_spend_session_idx", "sqag_quote_ai_spend", "workspace_id,session_id"),
+    _index("sqag_quote_templates_default_uidx", "sqag_quote_templates", "workspace_id", unique=True, predicate="(is_default = 1)"),
     _index('sqag_quote_api_tenants_workspace_idx', 'sqag_quote_api_tenants', ('workspace_id', 'tenant_id'), unique=False),
     _index('sqag_quote_api_callers_credential_uidx', 'sqag_quote_api_callers', ('credential_id',), unique=True),
     _index('sqag_quote_api_callers_subject_uidx', 'sqag_quote_api_callers', ('owner_subject',), unique=True),
@@ -941,6 +951,11 @@ MIGRATION_OBJECTS = (
         indexes=tuple(item for item in INDEX_SPECS if item.table_name in {"sqag_quote_api_tenants", "sqag_quote_api_callers"}),
         triggers=tuple(TRIGGER_SPECS[-2:]),
         routines=tuple(spec for spec in ROUTINE_SPECS if spec.source_migration_id == MIGRATION_FILE_NAMES[10]),
+    ),
+    MigrationObjectSpec(
+        MIGRATION_FILE_NAMES[11],
+        tables=(TABLE_SPECS_BY_NAME["sqag_quote_templates"],),
+        indexes=(INDEX_SPECS_BY_NAME["sqag_quote_templates_default_uidx"],),
     ),
 )
 
