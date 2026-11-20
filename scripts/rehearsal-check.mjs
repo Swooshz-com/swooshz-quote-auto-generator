@@ -834,6 +834,7 @@ async function walkQuote(run, sessionId) {
   }
   await freshPage(run);
   await openDashboard(run);
+  await run.page.locator(`#dashboardSessionsList [data-quote-session-id="${sessionId}"]`).waitFor({ state: "attached", timeout: 20000 });
   const opened = await run.page.evaluate((id) => modifyDashboardQuote(id), sessionId);
   assert(opened === true, "The quote did not reopen.");
   await run.page.locator("#panel-analysis.is-active").waitFor({ state: "visible", timeout: 30000 });
@@ -850,6 +851,8 @@ async function liveWalk(run, manifest) {
   await run.step("quote list matches the dashboard", async () => {
     list = await quoteList(run);
     await openDashboard(run);
+    // The dashboard fetches its list after the page shows; a timeout falls through to the count check.
+    await run.page.waitForFunction((count) => state.quoteSessions.length >= count, list.length, { timeout: 20000 }).catch(() => {});
     const shown = await run.page.evaluate(() => state.quoteSessions.map((session) => session.session_id));
     const listed = list.map((session) => session.session_id);
     assert(shown.length === listed.length && listed.every((id) => shown.includes(id)), `The dashboard holds ${shown.length} quotes, the API lists ${listed.length}.`);
