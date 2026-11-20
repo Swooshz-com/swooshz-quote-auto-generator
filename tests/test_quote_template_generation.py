@@ -95,6 +95,34 @@ class QuoteTemplateResolutionTest(unittest.TestCase):
         self.assertTrue(standard.record["builtin"])
 
 
+class QuoteTemplateEvidenceCompactionTest(unittest.TestCase):
+    def test_an_oversized_run_record_compacts_the_template_definition_before_the_brief(self):
+        standard = quote_template.load_standard_quote_template()
+        record = {"id": "tpl-" + "a" * 32, "name": "Standard copy", "save_number": 3, "builtin": False,
+                  "sha256": quote_template.quote_template_fingerprint(standard), "note": ""}
+        definition_size, definition_sha = s.forensic_json_fingerprint(standard)
+
+        def manifest(padding):
+            return {"generation_schema_version": 1, "job_id": "job-template-compaction",
+                    "quote_template": {**record, "definition": copy.deepcopy(standard)},
+                    "normalized_brief": {"notes": "synthetic " + "x" * padding},
+                    "approved_basis": [], "output_rows": [], "artifacts": [], "artifacts_durable": False}
+
+        # Size the brief so the record is over the limit by half the definition: compacting the definition
+        # alone must bring it under, and nothing after it in the order may be touched.
+        limit = s.MAX_GENERATION_MANIFEST_BYTES - s.FORENSIC_MANIFEST_ENVELOPE_RESERVE_BYTES
+        base_size, _ = s.forensic_json_fingerprint(manifest(0))
+        oversized = manifest(limit - base_size + definition_size // 2)
+        self.assertGreater(s.forensic_json_fingerprint(oversized)[0], limit)
+        compacted = s.compact_generation_canonical_manifest(oversized)
+        self.assertEqual(compacted["evidence_compaction"]["compacted_fields"], ["quote_template.definition"])
+        summary = compacted["quote_template"]["definition"]
+        self.assertTrue(summary["snapshot_compacted"])
+        self.assertEqual((summary["canonical_size_bytes"], summary["canonical_sha256"]), (definition_size, definition_sha))
+        self.assertEqual({key: value for key, value in compacted["quote_template"].items() if key != "definition"}, record)
+        self.assertEqual(compacted["normalized_brief"], oversized["normalized_brief"])
+
+
 class QuoteTemplateGenerationTest(unittest.TestCase):
     """Real generator runs through the web job path with a profile that names a template."""
 
@@ -186,17 +214,26 @@ class QuoteTemplateGenerationTest(unittest.TestCase):
         self.assertEqual(result["quote_template"], expected)
         self.assertEqual(manifest["quote_template"], {**expected, "definition": saved["definition"]})
 
+    def download(self, result):
+        url = next(item["url"] for item in result["files"] if item["name"] == "quotation.xlsx")
+        with mock.patch.object(s, "configured_output_root", return_value=self.root / "out"), \
+                tw.LocalRunnerServer() as runner:
+            return tw.local_http_get_bytes(runner, url)
+
     def test_editing_or_deleting_the_template_never_changes_an_old_quote(self):
         saved = self.store.create(definition("Original", total_label="Original sum"))
-        _, xlsx, manifest, _ = self.generate(saved["id"])
+        first, xlsx, manifest, _ = self.generate(saved["id"])
         before, recorded = xlsx.read_bytes(), copy.deepcopy(manifest["quote_template"])
+        self.assertEqual(self.download(first), (200, before))
         edited = self.store.update(saved["id"], definition("Edited", total_label="Edited sum"), 1)
         self.assertEqual(xlsx.read_bytes(), before)
+        self.assertEqual(self.download(first), (200, before))
         _, second_xlsx, second_manifest, _ = self.generate(saved["id"])
         self.assertIn("Edited sum", sheet_text(second_xlsx))
         self.assertEqual(second_manifest["quote_template"]["save_number"], 2)
         self.store.delete(saved["id"], edited["save_number"])
         self.assertEqual(xlsx.read_bytes(), before)
+        self.assertEqual(self.download(first), (200, before))
         self.assertEqual(recorded["definition"]["name"], "Original")
         result, third_xlsx, third_manifest, _ = self.generate(saved["id"])
         self.assertEqual(result["quote_template"]["id"], "standard")
@@ -210,6 +247,102 @@ class QuoteTemplateGenerationTest(unittest.TestCase):
         text = sheet_text(xlsx)
         self.assertNotIn("SUM(A1:A9)</f>", text)
         self.assertIn("SUM(A1:A9)", text)
+
+
+class DatabaseProfileTemplateTest(unittest.TestCase):
+    """The rehearsal and live path: the profile and its template choice are read from the database.
+
+    The generator subprocess is stubbed as in the web suite's database generation tests, so these
+    check which template the job passes and records; QuoteTemplateGenerationTest covers the workbook.
+    """
+
+    platform_consume_payload = tw.WebappServerTest.platform_consume_payload
+    platform_auth_session = tw.WebappServerTest.platform_auth_session
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        url = f"sqlite:///{(self.root / 'sqag.sqlite3').as_posix()}"
+        env = {"SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": url,
+               "QUOTE_DATA_ROOT": str(self.root / "data"), "QUOTE_OUTPUT_ROOT": str(self.root / "output"),
+               "QUOTE_TMP_ROOT": str(self.root / "tmp"), "QUOTE_LOG_ROOT": str(self.root / "logs")}
+        patcher = mock.patch.dict(os.environ, env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        s.apply_sqag_storage_migrations(url)
+        self.session = self.platform_auth_session("workspace-template-profiles")
+        self.storage = s.app_storage_for_auth_session(self.session)
+        self.storage.save_pricing_reference(tw.workspace_pricing_reference("workspace-pricing"))
+        self.store = s.QuoteTemplateStore(self.storage)
+
+    def stored(self, profile_id):
+        return self.storage._read_payload("sqag_profiles", "profile_id", profile_id)
+
+    def generate(self, profile_id):
+        payload = tw.payload_with_workspace_pricing("workspace-pricing")
+        payload["profile_id"] = profile_id
+        for key in ("company", "tax", "quote_text", "signature", "rich_text"):
+            payload.pop(key, None)
+        captured = {}
+
+        def run(command, **kwargs):
+            tw.write_generator_diagnostic_fixture(command)
+            captured["command"] = list(command)
+            if "--quote-template" in command:
+                path = Path(command[command.index("--quote-template") + 1])
+                captured["template"] = json.loads(path.read_text(encoding="utf-8"))
+            return s.subprocess.CompletedProcess(args=[], returncode=0, stdout="Wrote quotation.xlsx\n", stderr="")
+
+        with mock.patch.object(s.subprocess, "run", side_effect=run):
+            result = s.run_quote_job(payload, output_root=self.root / "out", tmp_root=self.root / "tmp",
+                                     auth_session=self.session)
+        self.assertEqual(result["status"], "completed", result)
+        return result, captured
+
+    def test_saved_profiles_choose_the_template_and_saves_without_a_choice_keep_it(self):
+        saved = self.store.create(definition("Linked look", total_label="Linked total"))
+        linked = tw.workspace_profile_with_layout("linked-profile")
+        linked["quote_template_id"] = saved["id"]
+        self.storage.save_profile(linked)
+        result, captured = self.generate("linked-profile")
+        self.assertEqual(captured["template"], saved["definition"])
+        self.assertEqual({key: result["quote_template"][key] for key in ("id", "name", "save_number", "note")},
+                         {"id": saved["id"], "name": "Linked look", "save_number": 1, "note": ""})
+
+        # A save from a screen without the template control (today's Company Profile screen) keeps the link.
+        update = {key: value for key, value in linked.items() if key != "quote_template_id"}
+        update["label"] = "Linked profile renamed"
+        self.storage.save_profile(update, operation="update", revision=self.stored("linked-profile")["_revision"])
+        self.assertEqual((self.stored("linked-profile")["label"], self.stored("linked-profile")["quote_template_id"]),
+                         ("Linked profile renamed", saved["id"]))
+        self.assertEqual(self.generate("linked-profile")[1]["template"]["name"], "Linked look")
+
+        # After the template is deleted the profile's quotes use Standard and say why.
+        self.store.delete(saved["id"], 1)
+        result, captured = self.generate("linked-profile")
+        self.assertEqual((result["quote_template"]["id"], result["quote_template"]["note"]),
+                         ("standard", s.QUOTE_TEMPLATE_DELETED_NOTE))
+        self.assertEqual(captured["template"], quote_template.load_standard_quote_template())
+
+    def test_profiles_with_their_own_workbook_stay_legacy_and_new_ones_follow_the_default(self):
+        self.storage.save_profile(tw.workspace_profile_with_layout("legacy-profile"))
+        self.assertNotIn("quote_template_id", self.stored("legacy-profile"))
+        result, captured = self.generate("legacy-profile")
+        self.assertNotIn("--quote-template", captured["command"])
+        self.assertNotIn("quote_template", result)
+
+        fresh = tw.workspace_profile_with_layout("fresh-profile")
+        for key in ("_pack_assets", "pack", "profile_pack"):
+            fresh.pop(key, None)
+        created = self.storage.save_profile(fresh, operation="create")
+        self.assertEqual(self.stored(created["id"])["quote_template_id"], "default")
+        result, captured = self.generate(created["id"])
+        self.assertEqual(result["quote_template"]["id"], "standard")
+        self.assertEqual(captured["template"]["name"], "Standard")
+        workspace_default = self.store.create(definition("Workspace look"))
+        self.store.set_default(workspace_default["id"])
+        self.assertEqual(self.generate(created["id"])[0]["quote_template"]["id"], workspace_default["id"])
 
 
 if __name__ == "__main__":

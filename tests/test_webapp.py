@@ -222,7 +222,7 @@ def valid_payload():
         "company": {
             "name": "Sample Quotation Co Pte Ltd",
             "header_details": "Sample Quotation Co Pte Ltd\nDynamic header address\nDynamic bank detail",
-            "logo_data_url": "data:image/jpeg;base64,ZmFrZS1sb2dv",
+            "logo_data_url": SANITIZED_LOGO_DATA_URL,
         },
         "tax": {
             "label": "GST",
@@ -40978,7 +40978,7 @@ main().catch((error) => {
                     "company": {
                         "name": "Synthetic Imported Quote Co Pte Ltd",
                         "header_details": "Fixture address only",
-                        "logo_data_url": "data:image/png;base64,ZmFrZS1sb2dvLWltcG9ydA==",
+                        "logo_data_url": SANITIZED_LOGO_DATA_URL,
                     },
                     "quote_text": {
                         "payment_terms": ["70% payment upon confirmation."],
@@ -41014,12 +41014,12 @@ main().catch((error) => {
         self.assertEqual(body["company_id"], webapp.DEFAULT_COMPANY_ID)
         self.assertEqual(body["workspace"]["company"]["display_name"], "Quote Generator Workspace")
         self.assertEqual(body["profile"]["id"], "default-import")
-        self.assertEqual(body["profile"]["defaults"]["company"]["logo_data_url"], "data:image/png;base64,ZmFrZS1sb2dvLWltcG9ydA==")
+        self.assertEqual(body["profile"]["defaults"]["company"]["logo_data_url"], SANITIZED_LOGO_DATA_URL)
         self.assertTrue(default_store_exists)
         self.assertEqual(stored_profiles["items"][0]["defaults"]["company"]["name"], "Synthetic Imported Quote Co Pte Ltd")
-        self.assertEqual(stored_profiles["items"][0]["defaults"]["company"]["logo_data_url"], "data:image/png;base64,ZmFrZS1sb2dvLWltcG9ydA==")
+        self.assertEqual(stored_profiles["items"][0]["defaults"]["company"]["logo_data_url"], SANITIZED_LOGO_DATA_URL)
         loaded_profile = next(item for item in settings_body["company_profiles"] if item["id"] == "default-import")
-        self.assertEqual(loaded_profile["defaults"]["company"]["logo_data_url"], "data:image/png;base64,ZmFrZS1sb2dvLWltcG9ydA==")
+        self.assertEqual(loaded_profile["defaults"]["company"]["logo_data_url"], SANITIZED_LOGO_DATA_URL)
 
     def test_company_profile_export_endpoint_embeds_saved_layout_pack(self):
         profile = webapp.normalize_profile_payload({

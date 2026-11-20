@@ -9,6 +9,7 @@ from unittest import mock
 
 from scripts import quote_template
 from tests import test_internal_password_auth_webapp as auth_http
+from tests import test_webapp as tw
 from webapp import server as s
 
 
@@ -150,12 +151,72 @@ class QuoteTemplatePermissionsTest(unittest.TestCase):
         payload.pop("_revision")
         inspection._upsert_payload("sqag_profiles", "profile_id", shared["id"], payload)
         update = {"operation": "update", "id": shared["id"], "revision": 0, "defaults": {}, "quote_template_id": template_id}
-        self.assertEqual(self.call(operator, "POST", profiles, update)[0], 404)
+        # Staff get 404, not 403: the shared-profile write rule answers as if the profile were not theirs to
+        # change, the same as for any other shared-profile edit, so linking a template reveals nothing new.
+        unlinked = inspection._read_payload("sqag_profiles", "profile_id", shared["id"])
+        status, body = self.call(operator, "POST", profiles, update)
+        self.assertEqual(status, 404, body)
+        self.assertEqual(inspection._read_payload("sqag_profiles", "profile_id", shared["id"]), unlinked)
+        self.assertEqual(unlinked["quote_template_id"], "default")
         status, body = self.call(admin, "POST", profiles, update)
         self.assertEqual(status, 200, body)
         self.assertEqual(inspection._read_payload("sqag_profiles", "profile_id", shared["id"])["quote_template_id"], template_id)
         listed = self.call(operator, "GET", profiles)[1]["company_profiles"]
         self.assertEqual({p["id"]: p.get("quote_template_id") for p in listed}[shared["id"]], template_id)
+
+
+class QuoteTemplateViewerHttpTest(unittest.TestCase):
+    """Viewers exist only as platform workspace members, so this row runs a platform session over HTTP."""
+
+    platform_launch_env = tw.WebappServerTest.platform_launch_env
+    platform_consume_payload = tw.WebappServerTest.platform_consume_payload
+    platform_auth_session = tw.WebappServerTest.platform_auth_session
+    http_json = tw.WebappServerTest.http_json
+
+    def test_viewers_are_refused_on_every_route_and_change_nothing(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        url = "sqlite:///" + (Path(directory.name) / "viewer.sqlite3").as_posix()
+        workspace = "workspace-template-viewer"
+        env = self.platform_launch_env(SQAG_STORAGE_MODE="database", SQAG_ARTIFACT_STORAGE_MODE="database",
+                                       SQAG_DATABASE_URL=url, QUOTE_DATA_ROOT=str(Path(directory.name) / "data"),
+                                       QUOTE_LOG_ROOT=str(Path(directory.name) / "logs"))
+
+        def headers(session):
+            cookie = f"{s.SESSION_COOKIE_NAME}={s.signed_cookie_value(session)}"
+            return cookie, {s.configured_csrf_header_name(): s.csrf_token_for_cookie_header(cookie)}
+
+        with mock.patch.dict(os.environ, env, clear=True):
+            s.apply_sqag_storage_migrations(url)
+            store = s.QuoteTemplateStore(s.DatabaseSqagStorage(url, workspace, "admin", "seed"))
+            seed = store.create(definition("Seed"))
+            viewer_cookie, viewer_headers = headers(self.platform_auth_session(workspace, "viewer", "template-viewer"))
+            owner_cookie, owner_headers = headers(self.platform_auth_session(workspace, "owner", "template-owner"))
+            base = "/api/settings/quote-templates"
+            routes = (
+                ("list", "GET", base, None),
+                ("read saved", "GET", f"{base}/{seed['id']}", None),
+                ("read standard", "GET", f"{base}/standard", None),
+                ("check draft", "POST", f"{base}/preview", {"definition": definition("Draft")}),
+                ("create", "POST", base, {"definition": definition("New")}),
+                ("update", "POST", f"{base}/{seed['id']}", {"definition": definition("Renamed"), "save_number": 1}),
+                ("set default", "POST", f"{base}/default", {"template_id": seed["id"]}),
+                ("delete", "DELETE", f"{base}/{seed['id']}?save_number=1", None),
+            )
+            with mock.patch.object(s, "validated_platform_auth_session", side_effect=lambda session: session), \
+                    tw.LocalRunnerServer() as runner:
+                for action, method, route, body in routes:
+                    with self.subTest(action=action):
+                        response = self.http_json(runner, method, route, cookie=viewer_cookie, body=body,
+                                                  headers=viewer_headers)
+                        self.assertEqual(response["status"], 403, response["text"])
+                        self.assertEqual(response["body"]["errors"], ["You do not have permission to perform this action."])
+                        self.assertNotIn("Seed", response["text"])
+                        self.assertEqual(store.list(), [seed])
+                # The same harness lets a workspace owner list, so the refusals above are the viewer's role.
+                listed = self.http_json(runner, "GET", base, cookie=owner_cookie, headers=owner_headers)
+                self.assertEqual(listed["status"], 200, listed["text"])
+                self.assertEqual([item["name"] for item in listed["body"]["templates"]], ["Standard", "Seed"])
 
 
 if __name__ == "__main__":

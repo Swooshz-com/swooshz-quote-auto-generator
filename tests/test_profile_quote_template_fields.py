@@ -32,6 +32,15 @@ class ProfileQuoteTemplateFieldsTest(unittest.TestCase):
         ):
             with self.subTest(label=label), self.assertRaisesRegex(ValueError, "Profile logo must be a PNG or JPEG image"):
                 s.normalize_profile_payload(profile(logo_data_url=url))
+        for label, url in (
+            ("jpeg bytes called png", data_url("image/png", JPEG)),
+            ("png bytes called jpeg", data_url("image/jpeg", PNG)),
+            ("gif bytes called png", data_url("image/png", b"GIF89a" + b"\x00" * 32)),
+            ("text called jpeg", data_url("image/jpeg", b"not an image")),
+            ("empty png", "data:image/png;base64,"),
+        ):
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, "Profile logo must be a PNG or JPEG image"):
+                s.normalize_profile_payload(profile(logo_data_url=url))
         oversized = data_url("image/png", PNG + b"\x00" * s.MAX_PROFILE_LOGO_BYTES)
         with self.assertRaisesRegex(ValueError, "^Profile logo is larger than 2 MB"):
             s.normalize_profile_payload(profile(logo_data_url=oversized))

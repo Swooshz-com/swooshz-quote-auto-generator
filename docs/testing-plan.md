@@ -748,16 +748,23 @@ the owner-approved CI lane.
   tests.test_quote_template_generation tests.test_profile_quote_template_fields`.
   Storage runs on SQLite and, where `SQAG_TEST_POSTGRES_*` is set (CI), on a
   disposable PostgreSQL 17 database as the runtime role: the template limit
-  checked inside the save transaction, concurrent saves at the last free slot,
-  stale save numbers, one default per workspace, permanent deletes, workspace
-  isolation and the app before migration 013. Permissions use real loopback
-  HTTP: staff list templates, only admins read, check, save, delete or set the
-  default, signed-out and CSRF-less calls change nothing, and template links
-  never open another member's personal profile. Generation runs the real
-  generator through the job path: which template a profile gets (including the
-  note when its template was deleted), the run record, old quotes unchanged
-  after the template is edited or deleted, and a profile with no template
-  choice producing the same workbook as before. Migration changes also run
+  checked inside the save transaction, two saves forced to meet at the last
+  free slot (both are saved if the workspace lock is removed), stale save
+  numbers, one default per workspace, permanent deletes, workspace isolation and
+  the app before migration 013. Permissions use real loopback HTTP: staff list
+  templates, only admins read, check, save, delete or set the default,
+  platform viewers are refused on every route, signed-out and CSRF-less calls
+  change nothing, template links never open another member's personal profile,
+  and staff linking a shared profile get 404 with nothing changed. Generation
+  runs the real generator through the job path: which template a profile gets
+  (including the note when its template was deleted), the run record, old
+  quotes downloaded byte-identical over HTTP after the template is edited or
+  deleted, and a profile with no template choice producing the same workbook as
+  before. Database profiles are read through the job path too: a linked
+  profile, a save without the template field keeping the link, new profiles
+  without their own workbook following the workspace default, and an oversized
+  run record compacting the template definition first. Profile logos must start
+  with the PNG or JPEG file signature they declare. Migration changes also run
   `tests.test_admission_schema_compatibility`,
   `tests.test_postgres_migration_ledger` and
   `tests.test_runtime_privilege_contract`.

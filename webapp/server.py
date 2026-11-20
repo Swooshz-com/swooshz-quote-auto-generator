@@ -8444,15 +8444,24 @@ def sanitize_profile_defaults(value: Any) -> dict[str, Any]:
     return sanitized if isinstance(sanitized, dict) else {}
 
 
+PROFILE_LOGO_SIGNATURES = {"png": b"\x89PNG\r\n\x1a\n", "jpeg": b"\xff\xd8\xff", "jpg": b"\xff\xd8\xff"}
+
+
 def check_profile_logo_data_url(defaults: dict[str, Any]) -> None:
-    """Refuse a saved profile logo that is not a PNG or JPEG data URL within MAX_PROFILE_LOGO_BYTES."""
+    """Refuse a saved profile logo that is not a PNG or JPEG data URL within MAX_PROFILE_LOGO_BYTES.
+
+    The bytes must start with the declared type's file signature, so a renamed file is refused too.
+    """
     company = defaults.get("company") if isinstance(defaults.get("company"), dict) else {}
     data_url = company.get("logo_data_url")
     if data_url in (None, ""):
         return
-    if not re.fullmatch(r"data:image/(?:png|jpeg|jpg);base64,[A-Za-z0-9+/=]*", str(data_url), flags=re.IGNORECASE):
+    declared = re.fullmatch(r"data:image/(png|jpeg|jpg);base64,[A-Za-z0-9+/=]*", str(data_url), flags=re.IGNORECASE)
+    if not declared:
         raise ValueError("Profile logo must be a PNG or JPEG image.")
-    decode_data_url_bytes(data_url, MAX_PROFILE_LOGO_BYTES, "Profile logo")
+    raw = decode_data_url_bytes(data_url, MAX_PROFILE_LOGO_BYTES, "Profile logo")
+    if not raw.startswith(PROFILE_LOGO_SIGNATURES[declared.group(1).lower()]):
+        raise ValueError("Profile logo must be a PNG or JPEG image.")
 
 
 def safe_profile_pack_filename(value: Any, fallback: str, allowed_suffixes: set[str]) -> str:
