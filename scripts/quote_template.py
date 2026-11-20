@@ -28,6 +28,8 @@ MAX_FREE_TEXT_BLOCKS = 10
 MAX_TABLE_COLUMNS = 8
 MIN_GRID_COLUMNS = 4
 MAX_GRID_COLUMNS = 12
+# Longest number text accepted in definition JSON; every real value is far shorter.
+MAX_NUMBER_CHARACTERS = 32
 STANDARD_TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "templates" / "quote-template" / "standard.json"
 
 # Fonts installed in the deploy image and checked by CI before PDF rendering
@@ -85,7 +87,8 @@ def _integer(value: Any, path: str, low: int, high: int) -> int:
 def _number(value: Any, path: str, low: float, high: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         _refuse(path, "must be a number")
-    if not math.isfinite(value) or not low <= value <= high:
+    in_range = low <= value <= high if isinstance(value, int) else math.isfinite(value) and low <= value <= high
+    if not in_range:
         _refuse(path, f"must be between {low:g} and {high:g}")
     return float(value)
 
@@ -393,12 +396,18 @@ def _check_layout(blocks: list[dict[str, Any]], grid: dict[str, Any]) -> None:
         _refuse("blocks", "the totals block must come after the item table")
     table = next(block for block in blocks if block["type"] == "item_table")
     totals = next(block for block in blocks if block["type"] == "totals")
-    amount_col = next(column["col"] for column in table["columns"] if column["key"] == "amount")
-    if not totals["col"] <= amount_col <= totals["col"] + totals["span"] - 1:
+    amount = next(column for column in table["columns"] if column["key"] == "amount")
+    amount_cols = set(range(amount["col"], amount["col"] + amount["span"]))
+    if not totals["col"] <= amount["col"] <= totals["col"] + totals["span"] - 1:
         _refuse("blocks", "the totals block must cover the item table's amount column")
-    if amount_col in {totals["label_col"], totals["currency_col"]}:
+    if amount_cols & {totals["label_col"], totals["currency_col"]}:
         _refuse("blocks", "totals labels and currency need their own columns, not the amount column")
+    if totals["label_col"] == totals["currency_col"]:
+        _refuse("blocks", "totals labels and currency need separate columns")
     hidden = {index + 1 for index, column in enumerate(grid["columns"]) if column["hidden"]}
+    for index, block in enumerate(blocks):
+        if set(range(block["col"], block["col"] + block["span"])) <= hidden:
+            _refuse(f"blocks[{index}]", "sits only on hidden grid columns")
     for column in table["columns"]:
         if column["col"] in hidden:
             _refuse("blocks", f"the {column['key']} column starts on a hidden grid column")
@@ -419,6 +428,19 @@ def _reject_constant(name: str) -> Any:
     _refuse("definition", f"uses {name}, which is not a number")
 
 
+def _parse_int(text: str) -> int:
+    if len(text) > MAX_NUMBER_CHARACTERS:
+        _refuse("definition", "has a number with too many digits")
+    return int(text)
+
+
+def _parse_float(text: str) -> float:
+    value = float(text) if len(text) <= MAX_NUMBER_CHARACTERS else math.inf
+    if not math.isfinite(value):
+        _refuse("definition", "has a number with too many digits")
+    return value
+
+
 def parse_quote_template_json(raw: bytes | str) -> Any:
     """Parse definition JSON strictly: size cap, UTF-8 only, no duplicate keys or NaN."""
     if isinstance(raw, str):
@@ -434,7 +456,10 @@ def parse_quote_template_json(raw: bytes | str) -> Any:
     if text.startswith("\ufeff"):
         _refuse("definition", "starts with a byte order mark")
     try:
-        return json.loads(text, object_pairs_hook=_reject_duplicate_keys, parse_constant=_reject_constant)
+        return json.loads(
+            text, object_pairs_hook=_reject_duplicate_keys, parse_constant=_reject_constant,
+            parse_int=_parse_int, parse_float=_parse_float,
+        )
     except RecursionError:
         _refuse("definition", "is nested too deeply")
     except json.JSONDecodeError as exc:
@@ -454,7 +479,11 @@ def read_quote_template(value: Any) -> dict[str, Any]:
             encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
         except (TypeError, ValueError, RecursionError):
             _refuse("definition", "must contain only JSON values")
-        if len(encoded.encode("utf-8")) > MAX_DEFINITION_BYTES:
+        try:
+            size = len(encoded.encode("utf-8"))
+        except UnicodeEncodeError:
+            _refuse("definition", "contains a lone surrogate character")
+        if size > MAX_DEFINITION_BYTES:
             _refuse("definition", f"is larger than {MAX_DEFINITION_BYTES // 1024} KiB")
         value = copy.deepcopy(value)
     root = _object(value, "definition", ("schema", "name", "page", "header", "grid", "theme", "labels", "blocks"))

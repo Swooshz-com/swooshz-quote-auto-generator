@@ -30,7 +30,8 @@ only and writes all text as inline strings.
   keys, no `NaN` or `Infinity`, no nesting deep enough to exhaust the parser.
   An already-parsed object must hold only JSON values and obeys the same size cap.
 - **Numbers:** whole numbers must be JSON integers (`true` and `61.0` are refused);
-  every number must be finite and inside its range.
+  every number must be finite and inside its range. Number text longer than 32
+  characters is refused, so huge numbers fail with a path, not a crash.
 - **Text:** trimmed and NFC-normalised. Any control, format (including bidi
   overrides and zero-width characters), surrogate, private-use, unassigned,
   line-separator or paragraph-separator character is refused. Text that starts
@@ -107,10 +108,13 @@ Item-table column keys: `position`, `quantity`, `unit`, `description`,
 required. Columns sit inside the table block, must not overlap, and must not
 start on a hidden grid column.
 
+Every block must cover at least one visible grid column.
+
 Totals rules: the totals block comes after the item table, covers the item
 table's `amount` column (totals amounts are written there), and keeps its label
-and currency on their own visible columns. Prices, quantities, tax and totals are
-calculated exactly as for every other quote; a template only places them.
+(and currency, if any) on separate visible columns, neither of them a cell of
+the amount column (including the second cell of a two-column amount). Prices,
+quantities, tax and totals are calculated exactly as for every other quote; a template only places them.
 
 ## Standard template
 

@@ -24,6 +24,8 @@ import quote_template as qt  # noqa: E402
 
 M = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 XDR = "{http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing}"
+A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+EMU_PER_MM = 36_000
 BUNDLED_LAYOUT = ROOT / "templates" / "quote-layout" / "quotation-layout.xlsx"
 FIXTURE_CATALOG = (
     ROOT / "tests" / "fixtures" / "quote-generator" / "pricing-references"
@@ -130,6 +132,57 @@ def workbook_summary(path, grid_columns=None):
     }
 
 
+def near_black(rgb):
+    """Print colours at or below #222222 as black: the bundled layout prints its Service header in
+    #222222 and the other headers in #000000, while a template has one heading colour."""
+    rgb = rgb.upper()
+    return "000000" if all(int(rgb[index:index + 2], 16) <= 0x22 for index in (0, 2, 4)) else rgb
+
+
+def appearance_summary(path):
+    """How text and the logo look: each text run's font, size, bold, italic and colour, and where each
+    logo picture starts and how big it is (to 0.1 mm)."""
+    with zipfile.ZipFile(path) as archive:
+        sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+        styles = ET.fromstring(archive.read("xl/styles.xml"))
+        drawing = archive.read("xl/drawings/drawing1.xml") if "xl/drawings/drawing1.xml" in archive.namelist() else None
+    fonts = styles.find(f"{M}fonts").findall(f"{M}font")
+    xfs = styles.find(f"{M}cellXfs").findall(f"{M}xf")
+
+    def font_props(node, base):
+        if node is None:
+            return base
+        name = node.find(f"{M}rFont") if node.find(f"{M}rFont") is not None else node.find(f"{M}name")
+        size, bold, italic, color = (node.find(f"{M}{tag}") for tag in ("sz", "b", "i", "color"))
+        return (
+            name.get("val") if name is not None else base[0],
+            float(size.get("val")) if size is not None else base[1],
+            bold.get("val", "1") != "0" if bold is not None else base[2],
+            italic.get("val", "1") != "0" if italic is not None else base[3],
+            near_black((color.get("rgb") or "")[-6:]) if color is not None and color.get("rgb") else base[4],
+        )
+
+    text_fonts = {}
+    for cell in sheet.iter(f"{M}c"):
+        if cell.get("t") != "inlineStr" or not "".join(node.text or "" for node in cell.iter(f"{M}t")):
+            continue
+        base = font_props(fonts[int(xfs[int(cell.get("s", "0"))].get("fontId"))], ("", 0.0, False, False, "000000"))
+        runs = [run for run in cell.findall(f"{M}is/{M}r") if run.findtext(f"{M}t")]
+        text_fonts[cell.get("r")] = sorted({font_props(run.find(f"{M}rPr"), base) for run in runs} or {base})
+    pictures = []
+    if drawing is not None:
+        for anchor in ET.fromstring(drawing):
+            if anchor.find(f"{XDR}pic") is None:
+                continue
+            marker = anchor.find(f"{XDR}from")
+            extent = anchor.find(f"{XDR}pic/{XDR}spPr/{A}xfrm/{A}ext")
+            pictures.append((
+                tuple(int(marker.findtext(f"{XDR}{tag}")) for tag in ("col", "colOff", "row", "rowOff")),
+                tuple(round(int(extent.get(axis)) / (EMU_PER_MM / 10)) for axis in ("cx", "cy")),
+            ))
+    return {"text_fonts": text_fonts, "pictures": sorted(pictures)}
+
+
 def render(definition, brief, lines):
     tmp = tempfile.TemporaryDirectory()
     path = Path(tmp.name) / "quotation.xlsx"
@@ -186,19 +239,59 @@ def custom_template():
     }
 
 
+def full_summary(path, grid_columns):
+    return {**workbook_summary(path, grid_columns), **appearance_summary(path)}
+
+
 class StandardTemplateEquivalenceTest(unittest.TestCase):
-    def test_standard_template_matches_the_bundled_layout(self):
-        standard = qt.load_standard_quote_template()
-        grid_columns = len(standard["grid"]["columns"])
+    @classmethod
+    def setUpClass(cls):
+        cls.standard = qt.load_standard_quote_template()
+        cls.grid_columns = len(cls.standard["grid"]["columns"])
+        cls.legacy = {}
         for name, (brief, lines) in EQUIVALENCE_CASES.items():
-            with self.subTest(case=name), tempfile.TemporaryDirectory() as tmp:
-                legacy_path, template_path = Path(tmp) / "legacy.xlsx", Path(tmp) / "template.xlsx"
-                quote.write_quote_layout_xlsx(BUNDLED_LAYOUT, legacy_path, copy.deepcopy(brief), lines)
-                quote.write_template_quote_xlsx(standard, template_path, copy.deepcopy(brief), lines)
-                legacy = workbook_summary(legacy_path, grid_columns)
-                template = workbook_summary(template_path, grid_columns)
-                for key in legacy:
-                    self.assertEqual(template[key], legacy[key], key)
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "legacy.xlsx"
+                quote.write_quote_layout_xlsx(BUNDLED_LAYOUT, path, copy.deepcopy(brief), lines)
+                cls.legacy[name] = full_summary(path, cls.grid_columns)
+
+    def template_summaries(self, definition):
+        summaries = {}
+        for name, (brief, lines) in EQUIVALENCE_CASES.items():
+            tmp, path = render(definition, copy.deepcopy(brief), lines)
+            self.addCleanup(tmp.cleanup)
+            summaries[name] = full_summary(path, self.grid_columns)
+        return summaries
+
+    def test_standard_template_matches_the_bundled_layout(self):
+        for name, template in self.template_summaries(self.standard).items():
+            with self.subTest(case=name):
+                for key, legacy_value in self.legacy[name].items():
+                    self.assertEqual(template[key], legacy_value, key)
+
+    def test_changes_to_the_standard_template_are_caught(self):
+        # Each change is a valid template, so only the comparison with the bundled layout can catch it.
+        def block(definition, block_type):
+            return next(item for item in definition["blocks"] if item["type"] == block_type)
+
+        changes = {
+            "logo moves right": (lambda d: block(d, "logo")["logo"].update({"align": "right"}), "pictures"),
+            "logo shrinks": (lambda d: block(d, "logo")["logo"].update({"height_mm": 15}), "pictures"),
+            "logo stops repeating": (lambda d: block(d, "logo")["logo"].update({"repeat": False}), "pictures"),
+            "totals move down": (lambda d: block(d, "totals").update({"gap_before": 3}), "cells"),
+            "totals label moves": (lambda d: block(d, "totals").update({"col": 3, "span": 4, "label_col": 3}), "cells"),
+            "signature line shortens": (lambda d: block(d, "signature").update({"line_chars": 20}), "cells"),
+            "terms font grows": (lambda d: block(d, "terms")["style"].update({"size_pt": 11}), "text_fonts"),
+            "attention label changes": (lambda d: d["labels"].update({"attention": "Attn:"}), "cells"),
+            "address rows drop": (lambda d: block(d, "client_details").update({"address_rows": 3}), "cells"),
+        }
+        for name, (change, key) in changes.items():
+            with self.subTest(change=name):
+                definition = copy.deepcopy(self.standard)
+                change(definition)
+                definition = qt.read_quote_template(definition)
+                summaries = self.template_summaries(definition)
+                self.assertTrue(any(summaries[case][key] != self.legacy[case][key] for case in summaries), key)
 
     def test_multi_page_case_really_paginates(self):
         brief, lines = EQUIVALENCE_CASES["multi_page_sections"]
