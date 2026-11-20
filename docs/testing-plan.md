@@ -709,7 +709,7 @@ the owner-approved CI lane.
   rendered script's `--inflight-save` option starts a delayed draft save that
   is still in flight at Confirm and expects the single pricing-selections
   request to succeed (no false "changed in another tab" refusal).
-- Quote template definitions (#167): run
+- Quote template definitions: run
   `python -m unittest tests.test_quote_template_schema`. It checks the
   default-deny reader in `scripts/quote_template.py` against hostile JSON
   (duplicate keys, NaN, byte order mark, deep nesting, oversize), unknown keys
@@ -719,7 +719,7 @@ the owner-approved CI lane.
   also checks the Standard template against the bundled quotation layout
   (widths, hidden columns, margins, logo repeat, page rows, labels, exclusions
   text and body font), so changing either one alone fails.
-- Quote template rendering (#167): run
+- Quote template rendering: run
   `python -m unittest tests.test_quote_template_render`. It renders synthetic
   quotes with the Standard template and with the bundled layout workbook and
   requires the same cell text, formulas, number formats, merges, column widths,
