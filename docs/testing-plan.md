@@ -709,7 +709,7 @@ the owner-approved CI lane.
   rendered script's `--inflight-save` option starts a delayed draft save that
   is still in flight at Confirm and expects the single pricing-selections
   request to succeed (no false "changed in another tab" refusal).
-- Quote template definitions (#167): run
+- Quote template definitions: run
   `python -m unittest tests.test_quote_template_schema`. It checks the
   default-deny reader in `scripts/quote_template.py` against hostile JSON
   (duplicate keys, NaN, byte order mark, deep nesting, oversize), unknown keys
