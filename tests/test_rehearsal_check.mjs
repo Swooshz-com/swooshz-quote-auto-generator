@@ -8,7 +8,7 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
-import { checkBaseUrl, parseArgs, readOnlyRequestContext, ReadOnlyViolation, scrub, UsageError } from "../scripts/rehearsal-check.mjs";
+import { checkBaseUrl, parseArgs, PRICING_SAVE_TIMEOUT_MS, readOnlyRequestContext, ReadOnlyViolation, scrub, UsageError } from "../scripts/rehearsal-check.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const python = process.env.PYTHON || process.env.PYTHON_EXECUTABLE || (process.platform === "win32" ? "python" : "python3");
@@ -149,6 +149,23 @@ async function loggingProxy(upstream) {
   return { proxy, log, origin: `http://127.0.0.1:${proxy.address().port}` };
 }
 
+// The test databases and app roles on the disposable PostgreSQL service, so a
+// run can prove the harness removed what it created.
+function postgresLeftovers() {
+  const code = [
+    "import os, psycopg",
+    "url = 'postgresql://%s@%s:%s/postgres' % (os.environ['SQAG_TEST_POSTGRES_USER'], os.environ['SQAG_TEST_POSTGRES_HOST'], os.environ['SQAG_TEST_POSTGRES_PORT'])",
+    "with psycopg.connect(url) as c:",
+    "    dbs = [r[0] for r in c.execute(\"select datname from pg_catalog.pg_database where datname like 'sqag_ci_database_mode_%'\")]",
+    "    roles = [r[0] for r in c.execute(\"select rolname from pg_catalog.pg_roles where rolname in ('sqag_runtime', 'sqag_migrator', 'sqag_maintenance')\")]",
+    "print(' '.join(sorted(dbs)) + '|' + ' '.join(sorted(roles)))",
+  ].join("\n");
+  const probe = spawnSync(python, ["-c", code], { cwd: root, encoding: "utf8" });
+  assert.equal(probe.status, 0, `PostgreSQL probe failed: ${probe.stderr}`);
+  const [dbs, roles] = probe.stdout.trim().split("|");
+  return { databases: dbs.split(" ").filter(Boolean), roles: roles.split(" ").filter(Boolean) };
+}
+
 async function startHarness(dirs, storage) {
   // The harness takes the repository root first, then its data folders.
   const child = spawn(python, [path.join(root, "tests", "internal_password_browser_harness.py"), root, dirs.data, dirs.output, dirs.tmp, dirs.logs, dirs.pricing, "--storage", storage], {
@@ -182,16 +199,19 @@ async function runAllProfiles(t, storage) {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "sqag-rehearsal-test-"));
   const dirs = Object.fromEntries(["data", "output", "tmp", "logs", "pricing", "results"].map((name) => [name, path.join(base, name)]));
   await Promise.all(Object.values(dirs).map((dir) => fs.mkdir(dir, { recursive: true })));
+  const before = storage === "database" ? postgresLeftovers() : null;
   const harness = await startHarness(dirs, storage);
   const front = await loggingProxy(harness.origin);
+  const aiFlags = ["--ai-ok", "--ai-ledger", path.join(dirs.results, "ai-ledger.json")];
   const storageFlags = storage === "file" ? ["--file-storage"] : [];
   let stopped = false;
   try {
-    const result = async (profile, extra = []) => {
-      const file = path.join(dirs.results, `${profile}.json`);
+    const result = async (profile, extra = [], name = profile) => {
+      const file = path.join(dirs.results, `${name}.json`);
       const outcome = await run(["--profile", profile, "--base-url", front.origin, "--allow-loopback-http", ...storageFlags, "--result", file, ...extra]);
       const text = await fs.readFile(file, "utf8");
       for (const value of Object.values(credentials)) assert.ok(!text.includes(value), `${profile} result holds a credential`);
+      assert.ok(!text.includes("Rehearsal Synthetic"), `${name} result holds quote text`);
       assert.ok(!/https?:\/\//.test(text), `${profile} result holds a URL`);
       const parsed = JSON.parse(text);
       const failed = parsed.steps.filter((step) => step.status === "fail").map((step) => `${step.name}: ${step.error}`);
@@ -207,18 +227,49 @@ async function runAllProfiles(t, storage) {
     assert.deepEqual(live.parsed.write_requests, [{ method: "POST", path: "/login" }]);
     assert.deepEqual(front.log.filter((line) => !/^(GET|HEAD) /.test(line)), ["POST /login"], "live-readonly sent a write to the server");
     front.log.length = 0;
-    const seed = await result("seed");
+    const seed = await result("seed", aiFlags);
     assert.ok(front.log.some((line) => line === "POST /api/settings/pricing-references"), "seed did not save the pricing reference");
+    // The new pricing reference's AI enrichment is counted against the run's US$1 cap.
+    assert.deepEqual(seed.parsed.ai_budget, { cap_usd: 1, spent_usd: 0.1, within_cap: true, entries: [{ label: "pricing reference enrichment", usd: 0.1, source: "fixed amount, cost not reported per quote" }] });
     assert.ok(seed.parsed.seed.published_session_id && seed.parsed.seed.draft_session_id && seed.parsed.seed.pricing_reference_id);
     if (storage === "database") {
       // Database mode refuses generation without a saved company profile.
       assert.ok(front.log.some((line) => line === "POST /api/settings/profiles"), "seed did not save the company profile");
       assert.match(String(seed.parsed.seed.company_profile_id), /^[A-Za-z0-9_-]+$/);
       assert.equal(step(seed.parsed, "company profile").status, "pass");
+      // A rerun on the same database reuses the profile and pricing reference (the d07c910 rehearsal needed two seeds).
+      const again = await result("seed", aiFlags, "seed-again");
+      assert.deepEqual(step(again.parsed, "company profile").detail, { company_profile_id: seed.parsed.seed.company_profile_id, reused: true });
+      assert.equal(step(again.parsed, "pricing reference").detail.reused, true);
+      assert.equal(again.parsed.ai_budget.spent_usd, 0.1, "a reused pricing reference must not count again");
     } else {
       assert.equal(seed.parsed.seed.company_profile_id, null);
       assert.equal(step(seed.parsed, "company profile").status, "skipped");
     }
+    // The live-data walk (Pass A and Pass B) on the seeded quotes, read-only on every channel.
+    const manifestFile = path.join(dirs.results, "live-cases.json");
+    const committed = JSON.parse(await fs.readFile(path.join(root, "deploy", "rehearsal", "live-cases.json"), "utf8"));
+    await fs.writeFile(manifestFile, JSON.stringify({
+      ...committed,
+      approval: { approved: true, approved_at: "2026-11-20", record: "0000000" },
+      cases: [{ id: seed.parsed.seed.published_session_id, reasons: ["generated"] }, { id: seed.parsed.seed.draft_session_id, reasons: ["draft"] }],
+    }));
+    front.log.length = 0;
+    const targetsFile = path.join(dirs.results, "targets.json");
+    const walk = await result("live-readonly", ["--manifest", manifestFile, "--targets-out", targetsFile], "live-walk");
+    assert.deepEqual(front.log.filter((line) => !/^(GET|HEAD) /.test(line)), ["POST /login"], "the live-data walk sent a write to the server");
+    assert.equal(step(walk.parsed, "no write attempted").status, "pass");
+    const published = step(walk.parsed, "quote 1 reopens read-only").detail;
+    assert.equal(published.id, seed.parsed.seed.published_session_id);
+    assert.equal(published.generated, true);
+    assert.equal(published.xlsx_sha256, seed.parsed.seed.published_exports.xlsx_sha256);
+    assert.equal(published.pdf_sha256, seed.parsed.seed.published_exports.pdf_sha256);
+    assert.ok(published.bad_blocks === 0 && published.empty_booth_boxes === 0 && published.missing_quantity_boxes === 0, JSON.stringify(published));
+    assert.equal(step(walk.parsed, "quote 2 reopens read-only").detail.generated, false);
+    const targets = JSON.parse(await fs.readFile(targetsFile, "utf8"));
+    assert.deepEqual(targets.quote_ids.slice(0, 2), [seed.parsed.seed.published_session_id, seed.parsed.seed.draft_session_id]);
+    assert.ok(targets.quote_ids.every((id) => /^quote-[0-9a-f]{24}$/.test(id)));
+    assert.ok(!JSON.stringify(targets).includes("Rehearsal Synthetic"), "the targets file holds quote text");
     const asset = path.join(dirs.results, "app.js");
     const verify = await result("verify", ["--seed-file", seed.file, "--no-ai", "--asset-out", asset]);
     const served = step(verify.parsed, "served app.js").detail;
@@ -233,6 +284,7 @@ async function runAllProfiles(t, storage) {
     const exit = await harness.stop();
     stopped = true;
     assert.equal(exit.code, storage === "database" ? 0 : null, `harness did not stop cleanly: ${harness.stderr()}`);
+    if (before) assert.deepEqual(postgresLeftovers(), before, "the harness left a test database or app role behind");
   } finally {
     front.proxy.close();
     if (!stopped) await harness.stop();
@@ -252,6 +304,11 @@ test("seed, verify, reopen and live-readonly pass against a local database-stora
 }, (t) => {
   assert.ok(postgresConfigured, "CI must provide the disposable PostgreSQL service for the database-mode run");
   return runAllProfiles(t, "database");
+});
+
+test("the pricing-reference save waits up to 120 s for AI enrichment", () => {
+  // The d07c910 rehearsal's save took about 36 s; the old 30 s limit failed it.
+  assert.equal(PRICING_SAVE_TIMEOUT_MS, 120000);
 });
 
 test("--file-storage is refused outside a loopback test server", () => {

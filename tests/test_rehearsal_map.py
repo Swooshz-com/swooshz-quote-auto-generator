@@ -18,18 +18,22 @@ import scripts.check_rehearsal_map as checker  # noqa: E402
 MAP = ROOT / "deploy" / "rehearsal" / "resources.json"
 COMPOSE = ROOT / "deploy" / "rehearsal" / "compose.yaml"
 SETTINGS = ROOT / "deploy" / "internal" / "release-settings.json"
+COPY_COMPOSE = ROOT / "deploy" / "rehearsal" / "compose-live-copy.yaml"
+MANIFEST = ROOT / "deploy" / "rehearsal" / "live-cases.json"
+COPY_SCRIPT = ROOT / "scripts" / "copy_live_objects_to_rehearsal.py"
 
 
 class RehearsalMapTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.base = Path(self.tmp.name)
-        for source in (MAP, COMPOSE, SETTINGS):
+        for source in (MAP, COMPOSE, SETTINGS, COPY_COMPOSE, MANIFEST, COPY_SCRIPT):
             target = self.base / source.relative_to(ROOT)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
         self.map_path = self.base / MAP.relative_to(ROOT)
         self.compose_path = self.base / COMPOSE.relative_to(ROOT)
+        self.copy_compose_path = self.base / COPY_COMPOSE.relative_to(ROOT)
         self.data = json.loads(MAP.read_text(encoding="utf-8"))
 
     def tearDown(self) -> None:
@@ -175,6 +179,54 @@ class RehearsalMapTests(unittest.TestCase):
                     resource["created_by"] = resource["created_by"].replace(needle, "")
             errors = self.check_with(data)
             self.assertTrue(any("neon-branch created_by" in e for e in errors), needle)
+
+    def check_copy_compose(self, old: str, new: str) -> list[str]:
+        text = COPY_COMPOSE.read_text(encoding="utf-8")
+        self.assertIn(old, text)
+        self.copy_compose_path.write_text(text.replace(old, new), encoding="utf-8")
+        return checker.run_checks(self.map_path)
+
+    def test_live_copy_app_keeps_the_rehearsal_shape_with_identity_run_values_only(self) -> None:
+        cases = [
+            ('SQAG_INTERNAL_WORKSPACE_ID: "${SQAG_INTERNAL_WORKSPACE_ID}"', 'SQAG_INTERNAL_WORKSPACE_ID: "ws-live"', "SQAG_INTERNAL_WORKSPACE_ID must be set as"),
+            ('SQAG_INTERNAL_ALLOWED_EMAILS_ADMIN: "${SQAG_INTERNAL_ALLOWED_EMAILS_ADMIN}"', 'SQAG_INTERNAL_ALLOWED_EMAILS_ADMIN: "owner@example.com"', "ALLOWED_EMAILS_ADMIN must be set as"),
+            ('SQAG_OBJECT_STORAGE_BUCKET: "sqag-rehearsal"', 'SQAG_OBJECT_STORAGE_BUCKET: "sqag-live"', "SQAG_OBJECT_STORAGE_BUCKET must equal"),
+            ('pull_policy: never', 'pull_policy: always', "service settings must equal"),
+            ('  quote-rehearsal-copy:', '  quote-internal:', "exactly one service"),
+            ('      PORT: "8765"\n', '      PORT: "8765"\n      SQAG_EXTRA: "x"\n', "env names must be"),
+            ('# Map: deploy/rehearsal/resources.json', '# Map for quote-internal', "refers to live name"),
+        ]
+        for old, new, expected in cases:
+            errors = self.check_copy_compose(old, new)
+            self.assertTrue(any(expected in e for e in errors), (expected, errors))
+
+    def test_live_copy_section_rules(self) -> None:
+        cases = [
+            (lambda d: d.pop("live_copy"), "live_copy must describe"),
+            (lambda d: d["live_copy"].update(ai_cap_usd=2), "ai_cap_usd must be 1"),
+            (lambda d: d["live_copy"].update(app_service="quote-rehearsal"), "app_service must say rehearsal and differ"),
+            (lambda d: d["live_copy"]["run_names"].pop(), "run_names must be exactly"),
+            (lambda d: d["live_copy"]["run_values"].pop("SQAG_INTERNAL_WORKSPACE_ID"), "must say where SQAG_INTERNAL_WORKSPACE_ID"),
+            (lambda d: d["live_copy"].update(copy_script="scripts/missing.py"), "copy_script must name a file"),
+        ]
+        for change, expected in cases:
+            data = copy.deepcopy(self.data)
+            change(data)
+            errors = self.check_with(data)
+            self.assertTrue(any(expected in e for e in errors), (expected, errors))
+
+    def test_data_branch_resets_its_own_passwords_and_stays_a_rehearsal_branch(self) -> None:
+        for needle, _step in checker.DATA_BRANCH_CREATE_STEPS:
+            data = copy.deepcopy(self.data)
+            branch = next(r for r in data["resources"] if r["id"] == "neon-data-branch")
+            branch["created_by"] = branch["created_by"].replace(needle, "")
+            self.assertTrue(any("neon-data-branch created_by" in e for e in self.check_with(data)), needle)
+        data = copy.deepcopy(self.data)
+        branch = next(r for r in data["resources"] if r["id"] == "neon-data-branch")
+        branch["delete"] = "Delete the branch."
+        self.assertTrue(any("neon-data-branch delete" in e for e in self.check_with(data)))
+        branch["branch_type"] = "full copy"
+        self.assertTrue(any("branch_type must start" in e for e in self.check_with(data)))
 
     def test_service_changes_go_through_the_deploy_api(self) -> None:
         data = copy.deepcopy(self.data)

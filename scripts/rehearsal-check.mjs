@@ -5,14 +5,27 @@
 //   node scripts/rehearsal-check.mjs --profile seed|verify|reopen|live-readonly
 //        --base-url https://<host> --result <file.json>
 //        [--seed-file <seed result.json>] [--asset-out <app.js file>] [--no-ai]
+//        [--ai-ok --ai-ledger <run ledger.json> [--ai-cap-usd 1]]
+//        [--manifest deploy/rehearsal/live-cases.json [--targets-out <file.json> [--targets-only]]]
 //        [--allow-loopback-http [--file-storage]]
+//
+// Paid AI (seed's pricing-reference enrichment, verify's image analysis) needs
+// --ai-ok and a ledger file shared by every check in the run; the run stops
+// before a call that could pass the cap (at most US$1, scripts/lib/ai-budget.mjs).
+// verify --no-ai needs neither.
+// live-readonly with --manifest is the live-data walk (Pass A on the copy of
+// live, Pass B on live): it reopens the manifest quotes and the newest quotes
+// the login owns, checks their files, blocks, booth box and quantity boxes,
+// and fails if anything tried to write. --targets-only stops after writing the
+// target ids (for the bucket copy) and the manifest candidates.
 //
 // Credentials come from the environment only, never arguments:
 //   SQAG_REHEARSAL_LOGIN_EMAIL, SQAG_REHEARSAL_LOGIN_PASSWORD: the rehearsal app's
 //     sign-in for seed, verify and reopen (the rehearsal host has no proxy auth,
-//     so the app's sign-in is its access control)
+//     so the app's sign-in is its access control), and for live-readonly on a
+//     rehearsal host (Pass A on the copy of live, with the copy's run login)
 //   SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_EMAIL, SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_PASSWORD:
-//     the operator's live sign-in for live-readonly, fed from the laptop credential
+//     the operator's live sign-in for live-readonly on any other host, fed from the laptop credential
 //     store with `toolkit env run`, so rehearsal logins never reach live
 //   SQAG_REHEARSAL_LIVE_HOSTS (comma-separated hosts that writing profiles refuse)
 // live-readonly is read-only on every channel the script opens: the browser
@@ -27,6 +40,8 @@
 // The result file holds metadata only: step status, timings, opaque ids and hashes.
 import { signIn } from "./internal-password-browser-test.mjs";
 import { pdfFontNames, unexpectedPdfFonts, validatePdf, validateXlsx } from "./lib/artifact-checks.mjs";
+import { AI_CAP_MAX_USD, AI_PRICING_ENRICHMENT_USD, AiCapError, loadBudget, reportedUsd, saveBudget } from "./lib/ai-budget.mjs";
+import { derivedReasons, ManifestError, targetsDocument, validateManifest, walkTargets } from "./lib/live-cases.mjs";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -38,8 +53,11 @@ const fixtureDir = path.join(root, "tests", "fixtures", "quote-generator", "pric
 const layoutFixture = path.join(root, "tests", "fixtures", "quote-generator", "profiles", "synthetic-exhibition-fixture-template", "quotation-layout.xlsx");
 const RESULT_SCHEMA = "sqag-rehearsal-check/v1";
 const PROFILES = ["seed", "verify", "reopen", "live-readonly"];
-const VALUE_FLAGS = new Set(["--profile", "--base-url", "--result", "--seed-file", "--asset-out"]);
-const BOOLEAN_FLAGS = new Map([["--no-ai", "noAi"], ["--allow-loopback-http", "allowLoopbackHttp"], ["--file-storage", "fileStorage"]]);
+const VALUE_FLAGS = new Set(["--profile", "--base-url", "--result", "--seed-file", "--asset-out", "--manifest", "--targets-out", "--ai-ledger", "--ai-cap-usd"]);
+const BOOLEAN_FLAGS = new Map([
+  ["--no-ai", "noAi"], ["--allow-loopback-http", "allowLoopbackHttp"], ["--file-storage", "fileStorage"],
+  ["--ai-ok", "aiOk"], ["--targets-only", "targetsOnly"],
+]);
 const REHEARSAL_LOGIN_ENV = { email: "SQAG_REHEARSAL_LOGIN_EMAIL", password: "SQAG_REHEARSAL_LOGIN_PASSWORD" };
 const LIVE_LOGIN_ENV = { email: "SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_EMAIL", password: "SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_PASSWORD" };
 const CREDENTIAL_ENV = [...Object.values(REHEARSAL_LOGIN_ENV), ...Object.values(LIVE_LOGIN_ENV)];
@@ -65,7 +83,7 @@ const GENERATION_TIMEOUT_MS = 120000;
 const SAVE_TIMEOUT_MS = 30000;
 // The pricing-reference save runs AI enrichment on a real server (about 36 s
 // on the d07c910 rehearsal), so it gets a longer limit than other saves.
-const PRICING_SAVE_TIMEOUT_MS = 120000;
+export const PRICING_SAVE_TIMEOUT_MS = 120000;
 
 export class UsageError extends Error {}
 export class ReadOnlyViolation extends Error {}
@@ -86,7 +104,7 @@ export function scrub(value) {
 
 export function parseArgs(argv, env = process.env) {
   const credentialValues = CREDENTIAL_ENV.map((name) => env[name]).filter((value) => typeof value === "string" && value.length >= 4);
-  const options = { noAi: false, allowLoopbackHttp: false, fileStorage: false };
+  const options = { noAi: false, allowLoopbackHttp: false, fileStorage: false, aiOk: false, targetsOnly: false };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = String(argv[index]);
     if (credentialValues.some((value) => arg.includes(value))) {
@@ -114,9 +132,50 @@ export function parseArgs(argv, env = process.env) {
   if (!options.result) throw new UsageError("--result is required");
   if (["verify", "reopen"].includes(options.profile) && !options.seedFile) throw new UsageError(`--seed-file is required for ${options.profile}`);
   if (options.fileStorage && !options.allowLoopbackHttp) throw new UsageError("--file-storage is only for a loopback test server");
+  checkWalkFlags(options);
+  checkAiFlags(options);
   options.baseUrl = checkBaseUrl(options.baseUrl, options.profile, options.allowLoopbackHttp, env);
-  options.credentials = readCredentials(env, options.profile === "live-readonly" ? LIVE_LOGIN_ENV : REHEARSAL_LOGIN_ENV);
+  options.credentials = readCredentials(env, loginNames(options.profile, options.baseUrl));
   return options;
+}
+
+// Credentials follow the host: the live sign-in only ever goes to a host that
+// does not say rehearsal, so Pass A's walk on the copy of live (a rehearsal
+// host) signs in with the copy's run-only login, never live's password.
+export function loginNames(profile, baseUrl) {
+  if (profile !== "live-readonly") return REHEARSAL_LOGIN_ENV;
+  return new URL(baseUrl).hostname.toLowerCase().includes("rehearsal") ? REHEARSAL_LOGIN_ENV : LIVE_LOGIN_ENV;
+}
+
+function checkWalkFlags(options) {
+  const walk = options.profile === "live-readonly";
+  if (!walk && (options.manifest || options.targetsOut || options.targetsOnly)) {
+    throw new UsageError("--manifest, --targets-out and --targets-only are for live-readonly only");
+  }
+  if (options.targetsOut && !options.manifest) throw new UsageError("--targets-out needs --manifest");
+  if (options.targetsOnly && !options.targetsOut) throw new UsageError("--targets-only needs --targets-out");
+}
+
+// Paid AI runs only with the owner's OK and a run ledger, refused before any request.
+export function aiNeeded(options) {
+  return options.profile === "seed" || (options.profile === "verify" && !options.noAi);
+}
+
+function checkAiFlags(options) {
+  const needed = aiNeeded(options);
+  if (!needed) {
+    if (options.aiOk || options.aiLedger || options.aiCapUsd) {
+      throw new UsageError(`--ai-ok, --ai-ledger and --ai-cap-usd are only for paid AI runs (seed, verify without --no-ai)`);
+    }
+    return;
+  }
+  if (!options.aiOk) throw new UsageError(`profile ${options.profile} can make paid AI calls: add --ai-ok (the owner's OK) and --ai-ledger, or use --no-ai`);
+  if (!options.aiLedger) throw new UsageError("--ai-ok needs --ai-ledger <file> shared by every check in the run");
+  const cap = options.aiCapUsd === undefined ? AI_CAP_MAX_USD : Number(options.aiCapUsd);
+  if (!/^[0-9]+(\.[0-9]{1,2})?$/.test(String(options.aiCapUsd ?? cap)) || !(cap > 0) || cap > AI_CAP_MAX_USD) {
+    throw new UsageError(`--ai-cap-usd must be above 0 and at most ${AI_CAP_MAX_USD}`);
+  }
+  options.aiCapUsd = cap;
 }
 
 export function checkBaseUrl(raw, profile, allowLoopbackHttp, env = process.env) {
@@ -390,6 +449,9 @@ async function seedPricingPack(run, fixture) {
   const profiles = await getJson(run.api, `${run.baseUrl}/api/profiles`, "Profiles");
   const existing = (profiles.pricing_references || []).find((item) => item.label === PACK_LABEL);
   if (existing) return { pricing_reference_id: existing.id, reused: true };
+  // A new pricing reference runs AI enrichment on a server with an AI key.
+  run.budget.admit("pricing reference enrichment", AI_PRICING_ENRICHMENT_USD);
+  run.budget.record("pricing reference enrichment", AI_PRICING_ENRICHMENT_USD, "fixed amount, cost not reported per quote");
   const body = await postJson(run, "/api/settings/pricing-references", {
     id: PACK_ID, source: "", label: PACK_LABEL,
     description: "Synthetic rehearsal-only pricing reference.",
@@ -504,13 +566,21 @@ async function seedBasis(run, sessionId, fixture) {
   assert(body.status === "saved" && body.quote_session?.session_id === sessionId, "The basis was not saved.");
 }
 
+// Every browser context the run opens. In live-readonly each one gets the
+// read-only guard before its first page exists.
+async function newContext(run, options) {
+  const context = await run.browser.newContext(options);
+  if (run.readOnly) await context.route("**/*", browserGuard(run));
+  return context;
+}
+
 // A fresh browser context restores the quote from the server, not from this
 // browser's own saved state, as a user on another computer would see it.
 async function freshPage(run) {
   const { cookies } = await run.context.storageState();
   const storageState = { cookies, origins: [] };
   const previous = run.context;
-  run.context = await run.browser.newContext({ acceptDownloads: true, storageState });
+  run.context = await newContext(run, { acceptDownloads: true, storageState });
   run.page = await run.context.newPage();
   attachTrace(run, run.page);
   await previous.close().catch(() => {});
@@ -665,42 +735,157 @@ async function aiAnalysis(run, images) {
   const sessionId = await createQuoteDraft(run, images, projectNumber);
   await reopenQuote(run, sessionId).catch(() => {});
   const jobsBefore = run.trace.jobs.length;
+  run.budget.admit("AI image analysis");
   // The same app function the analysis Start button calls.
   await run.page.evaluate(() => confirmStartAnalysis("standard"));
-  const terminal = await waitForJob(run, "draft", jobsBefore, AI_DRAFT_TIMEOUT_MS);
+  let terminal;
+  try {
+    terminal = await waitForJob(run, "draft", jobsBefore, AI_DRAFT_TIMEOUT_MS);
+  } finally {
+    // The quote's own spend record, whether or not the job finished.
+    const spent = await quoteSession(run, sessionId).then((value) => reportedUsd(value.ai_spend?.total), () => null);
+    run.budget.record("AI image analysis", spent, "quote ai_spend");
+  }
   assert(terminal.status === "completed", `AI image analysis ended ${terminal.status}.`);
   const readback = await waitUntil(async () => {
     const value = await quoteSession(run, sessionId);
     return (value.draft_state?.quoteBasisSections || []).length > 0 ? value : null;
   }, "the AI basis to be saved", 30000);
-  return { basis_sections: readback.draft_state.quoteBasisSections.length };
+  return { basis_sections: readback.draft_state.quoteBasisSections.length, ai_usd: run.budget.entries.at(-1).usd };
 }
 
-async function liveReadonly(run) {
+// The browser half of the read-only guard: only reads and the sign-in form go
+// out; anything else is aborted before it is sent and recorded.
+export function browserGuard(run) {
   const { writes, blocked } = run.readOnly;
-  await run.context.route("**/*", async (route) => {
+  return async (route) => {
     const request = route.request();
     const url = new URL(request.url());
     const method = request.method();
-    if (method === "GET" || method === "HEAD" || (method === "POST" && url.origin === run.baseUrl && url.pathname === "/login")) {
+    if (READ_METHODS.has(method) || (method === "POST" && url.origin === run.baseUrl && url.pathname === "/login")) {
       if (method === "POST") writes.push({ method, path: url.pathname });
       return route.continue();
     }
     blocked.push({ channel: "browser", method, path: blockedPath(url.toString(), run.baseUrl) });
     return route.abort();
+  };
+}
+
+// A refused write is a failure: on the copy it means the app would write to
+// live when the same walk runs there.
+export function assertNoWriteAttempted(readOnly) {
+  const refused = readOnly.blocked.length;
+  assert(refused === 0, `The read-only walk tried ${refused} write${refused === 1 ? "" : "s"} (refused before sending).`);
+  assert(readOnly.writes.every((entry) => entry.method === "POST" && entry.path === "/login"), "A write other than the sign-in form was sent.");
+  return { refused_writes: 0, sign_in_posts: readOnly.writes.length };
+}
+
+async function quoteList(run) {
+  const body = await getJson(run.api, `${run.baseUrl}/api/quote-sessions`, "Quote list");
+  const list = body.quote_sessions ?? body.sessions ?? body.items;
+  assert(Array.isArray(list), "The quote list response has no list.");
+  return list;
+}
+
+// What a person checks by eye on a reopened quote, read from the page only:
+// every block has one tick-all and one X, a Detected booth box has content or
+// is absent, and every included line with no quantity has a quantity box.
+export async function basisPageChecks(page) {
+  return page.evaluate(() => {
+    const surface = document.querySelector("#basisReviewSurface");
+    const blocks = surface ? [...surface.querySelectorAll(".basis-review-item")] : [];
+    const badBlocks = blocks.filter((item) => item.querySelectorAll('.basis-section-heading [data-basis-section-action="Include"]').length !== 1
+      || item.querySelectorAll('.basis-section-heading [data-basis-section-action="Exclude"]').length !== 1).length;
+    const booths = surface ? [...surface.querySelectorAll(".basis-visual-display")] : [];
+    const emptyBooths = booths.filter((box) => !box.innerText.replace("Detected booth", "").trim()).length;
+    let blankLines = 0;
+    let missingBoxes = 0;
+    if (blocks.length && typeof state === "object" && Array.isArray(state.quoteBasisSections)) {
+      for (const section of state.quoteBasisSections) {
+        (section.lines || []).forEach((line, index) => {
+          const blank = line.quantity === undefined || line.quantity === null || String(line.quantity).trim() === "";
+          if (!blank || normalizeBasisTag(line.tag) !== "Include") return;
+          const row = surface.querySelector(`[data-basis-section="${CSS.escape(section.id)}"][data-basis-line-index="${index}"][data-basis-tag="Exclude"]`)?.closest("li");
+          if (!row) return;
+          blankLines += 1;
+          if (!row.querySelector("[data-basis-quantity-edit]")) missingBoxes += 1;
+        });
+      }
+    }
+    return { blocks: blocks.length, bad_blocks: badBlocks, booth_boxes: booths.length, empty_booth_boxes: emptyBooths, blank_quantity_lines: blankLines, missing_quantity_boxes: missingBoxes };
   });
+}
+
+async function walkQuote(run, sessionId) {
+  const readback = await quoteSession(run, sessionId);
+  const detail = { generated: readback.status?.quote_generated === true };
+  if (detail.generated) {
+    // Existing files only: a GET of what is already stored, hashed against its record.
+    const xlsx = await download(run, readback.exports?.xlsx, "xlsx");
+    const pdf = await download(run, readback.exports?.pdf, "pdf");
+    Object.assign(detail, { xlsx_sha256: xlsx.sha256, pdf_sha256: pdf.sha256 });
+  }
+  await freshPage(run);
+  await openDashboard(run);
+  const opened = await run.page.evaluate((id) => modifyDashboardQuote(id), sessionId);
+  assert(opened === true, "The quote did not reopen.");
+  await run.page.locator("#panel-analysis.is-active").waitFor({ state: "visible", timeout: 30000 });
+  const page = await basisPageChecks(run.page);
+  assert(page.bad_blocks === 0, `${page.bad_blocks} block(s) lack exactly one tick-all and one X.`);
+  assert(page.empty_booth_boxes === 0, "A Detected booth box is empty.");
+  assert(page.missing_quantity_boxes === 0, `${page.missing_quantity_boxes} line(s) with no quantity have no quantity box.`);
+  return { ...detail, ...page };
+}
+
+async function liveWalk(run, manifest) {
+  const { ids, newest } = manifest;
+  let list = [];
+  await run.step("quote list matches the dashboard", async () => {
+    list = await quoteList(run);
+    await openDashboard(run);
+    const shown = await run.page.evaluate(() => state.quoteSessions.map((session) => session.session_id));
+    const listed = list.map((session) => session.session_id);
+    assert(shown.length === listed.length && listed.every((id) => shown.includes(id)), `The dashboard holds ${shown.length} quotes, the API lists ${listed.length}.`);
+    return { quotes: listed.length, own: list.filter((session) => !session.dashboard_summary_only).length };
+  });
+  const own = list.filter((session) => !session.dashboard_summary_only);
+  await run.step("walk targets", () => {
+    for (const id of ids) {
+      const entry = list.find((session) => session.session_id === id);
+      assert(entry, "A manifest quote is not listed.");
+      assert(!entry.dashboard_summary_only, "A manifest quote is not owned by this login, so it cannot be reopened.");
+    }
+    const value = walkTargets(ids, own, newest);
+    run.result.targets = value;
+    return { manifest: ids.length, newest: value.length - ids.length };
+  });
+  if (run.options.targetsOut) {
+    await run.step("targets file", async () => {
+      const candidates = [];
+      for (const session of own.slice(0, 30)) {
+        const detail = await quoteSession(run, session.session_id);
+        candidates.push({ id: session.session_id, ...derivedReasons(detail) });
+      }
+      await fs.writeFile(run.options.targetsOut, JSON.stringify(targetsDocument(run.result.targets, candidates), null, 2) + "\n", "utf8");
+      return { candidates: candidates.length };
+    });
+  }
+  if (run.options.targetsOnly) return;
+  for (const [index, id] of run.result.targets.entries()) {
+    await run.step(`quote ${index + 1} reopens read-only`, async () => ({ id, ...(await walkQuote(run, id)) }));
+  }
+}
+
+async function liveReadonly(run) {
   await run.step("sign in", () => signInBrowser(run));
   await run.step("session", async () => {
     const session = await getJson(run.api, `${run.baseUrl}/api/session`, "Session");
     assert(session.authenticated === true, "The session is not authenticated.");
   });
-  await run.step("quote list loads", async () => {
-    const body = await getJson(run.api, `${run.baseUrl}/api/quote-sessions`, "Quote list");
-    const list = body.quote_sessions ?? body.sessions ?? body.items;
-    assert(Array.isArray(list), "The quote list response has no list.");
-    return { quotes: list.length };
-  });
+  await run.step("quote list loads", async () => ({ quotes: (await quoteList(run)).length }));
+  if (run.options.manifestIds) await liveWalk(run, run.options.manifestIds);
   await run.step("served app.js", () => capturedAppJs(run));
+  await run.step("no write attempted", () => assertNoWriteAttempted(run.readOnly));
 }
 
 export async function runChecks(options, playwright) {
@@ -720,7 +905,7 @@ export async function runChecks(options, playwright) {
     });
     browser = await run.playwright.chromium.launch({ headless: true });
     run.browser = browser;
-    run.context = await browser.newContext({ acceptDownloads: true });
+    run.context = await newContext(run, { acceptDownloads: true });
     if (options.profile === "live-readonly") {
       await liveReadonly(run);
     } else {
@@ -768,12 +953,29 @@ export async function runChecks(options, playwright) {
   return run.result;
 }
 
+// File inputs, read before any request so a bad manifest or ledger stops the run.
+export async function loadRunInputs(options) {
+  if (options.manifest) {
+    let manifest;
+    try {
+      manifest = JSON.parse(await fs.readFile(options.manifest, "utf8"));
+    } catch {
+      throw new UsageError("--manifest is unreadable");
+    }
+    // Listing candidates for the owner to approve is the one use of an unapproved manifest.
+    options.manifestIds = validateManifest(manifest, { requireApproval: !options.targetsOnly });
+  }
+  if (aiNeeded(options)) options.budget = await loadBudget(options.aiLedger, { ok: options.aiOk, capUsd: options.aiCapUsd });
+  return options;
+}
+
 async function main(argv) {
   let options;
   try {
     options = parseArgs(argv);
+    await loadRunInputs(options);
   } catch (error) {
-    if (error instanceof UsageError) {
+    if (error instanceof UsageError || error instanceof ManifestError || error instanceof AiCapError) {
       console.error(`rehearsal-check: ${error.message}`);
       return 2;
     }
@@ -781,6 +983,7 @@ async function main(argv) {
   }
   const playwright = await import("playwright");
   const result = await runChecks(options, playwright);
+  if (options.budget) await saveBudget(options.aiLedger, options.budget);
   await fs.writeFile(options.result, JSON.stringify(result, null, 2) + "\n", "utf8");
   console.log(JSON.stringify({ profile: result.profile, result: result.result, steps: result.steps.length }));
   return result.result === "pass" ? 0 : 1;

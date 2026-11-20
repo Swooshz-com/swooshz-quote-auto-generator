@@ -41,6 +41,16 @@ create, test, delete, with no new decisions per run.
   (offline checks), `scripts/clear_rehearsal_bucket.py` (empties the
   rehearsal bucket), `scripts/rehearsal-check.mjs` (checks against the
   rehearsal or live URL) and `scripts/verify_release_identity.py` (identity).
+- **Live-data check:** step 8 tests the candidate on a copy of live data
+  before live switches (Pass A: `deploy/rehearsal/compose-live-copy.yaml`,
+  `scripts/copy_live_objects_to_rehearsal.py`), then walks live read-only
+  after the switch (Pass B). Both walk the quotes in
+  `deploy/rehearsal/live-cases.json` (opaque quote ids the owner approves)
+  plus the operator's newest quotes, reopen each one, check its files are
+  unchanged and check every block, the booth box and the quantity boxes.
+  If Pass B fails, `scripts/live_rollback.py` pins and deploys the previous
+  image. Paid AI on a run is capped at US$1 (`scripts/lib/ai-budget.mjs`) and
+  never starts without `--ai-ok`.
 
 ### One-time rehearsal setup
 
@@ -70,6 +80,14 @@ by each run.
    `toolkit env edit`. Only the live read-only check reads them, through
    `toolkit env run`, so the values never pass through a chat or a command
    line, and the rehearsal's synthetic logins never reach live.
+8. An R2 token with Object Read only on live's bucket, in the laptop
+   credential store under the `live-r2-readonly` entry names in the map. Only
+   the copy script reads it. The owner creates it.
+9. The quote manifest `deploy/rehearsal/live-cases.json` approved by the
+   owner: its `approval` names the date and the issue comment or commit that
+   approved the listed quote ids. A walk refuses an unapproved manifest.
+10. The owner's OK for paid AI on each run (`--ai-ok`), capped at US$1 for
+    the whole run by one ledger file shared by every check.
 
 The owner's standing scope confirmation for this flow lets each run create and
 delete the resources the map names as rehearsal, and copy live's migration
@@ -197,13 +215,16 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
    $env:SQAG_REHEARSAL_LIVE_HOSTS = "<live host>"
    $rehearsal = "https://quote-rehearsal.<server-ip>.sslip.io"
    $out = "_tmp\deploy-$short-out"
-   node scripts\rehearsal-check.mjs --profile seed --base-url $rehearsal --result "$out\seed.json"
+   $ledger = "$out\ai-ledger.json"
+   node scripts\rehearsal-check.mjs --profile seed --base-url $rehearsal --result "$out\seed.json" --ai-ok --ai-ledger $ledger
    ```
 
-   It saves the synthetic pricing reference, makes a quote to XLSX and PDF
+   It saves the synthetic pricing reference (waiting up to 120 seconds for
+   the save) and a synthetic company profile, makes a quote to XLSX and PDF
    and a saved draft, and records their ids and file hashes in `seed.json`.
-   Saving the pricing reference makes one small AI call when the app has an
-   AI key. A damaged pricing reference has no app route, so its fail-closed
+   A rerun reuses the saved company profile. Saving the pricing reference
+   makes one small AI call when the app has an AI key; the ledger counts it
+   as US$0.10 because the app does not report its cost. A damaged pricing reference has no app route, so its fail-closed
    message stays covered by the unit tests only. Each later profile writes its
    own result file; a failed step holds promotion.
 
@@ -215,12 +236,14 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
 
 6. **Upgrade.** Set `REHEARSAL_IMAGE_ID` to the candidate image id, redeploy
    and run
-   `node scripts\rehearsal-check.mjs --profile verify --base-url $rehearsal --seed-file "$out\seed.json" --result "$out\verify.json" --asset-out "$out\rehearsal-app.js"`.
+   `node scripts\rehearsal-check.mjs --profile verify --base-url $rehearsal --seed-file "$out\seed.json" --result "$out\verify.json" --asset-out "$out\rehearsal-app.js" --ai-ok --ai-ledger $ledger`.
    It signs in, reopens every seed item and checks their files are unchanged,
    makes a new quote to XLSX and PDF, validates both, checks the PDF uses only
    the release fonts (Carlito and Liberation Sans), runs AI image analysis on
-   a test image and captures the served `app.js`. `--no-ai` skips the paid
-   call on a rerun.
+   a test image and captures the served `app.js`. It refuses to start the
+   analysis if the run could pass the cap, and an analysis whose cost the app
+   does not report stops every later paid call. `--no-ai` (without the AI
+   flags) skips the paid call on a rerun.
 
 7. **Rollback drill.** Set `REHEARSAL_IMAGE_ID` back to the current image,
    redeploy and run the reopen profile (result `reopen-rollback.json`). Then
@@ -228,6 +251,65 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
    `reopen-forward.json`). Any failed check holds promotion.
 
 8. **Promote after the owner approves the tested image id.**
+   - **Pass A: the candidate on a copy of live data**, before anything on
+     live changes. Every write goes to the copy.
+     - Create the Neon branch `rehearsal-copy-<short>` of live's default
+       branch with data, as the map's `neon-data-branch` says: record the
+       time, reset the roles' passwords on that branch only and apply the
+       candidate's pending migrations to it as in step 5.
+     - On the branch, read the one `workspace_id` in
+       `public.sqag_quote_sessions` (an opaque id; read nothing else).
+     - In Coolify, create the service `quote-rehearsal-copy` from
+       `deploy/rehearsal/compose-live-copy.yaml` with the host
+       `quote-rehearsal-copy.<server-ip>.sslip.io`. Set its values as for
+       `quote-rehearsal` in step 3, with `REHEARSAL_IMAGE_ID` the candidate,
+       the branch's runtime URL, a newly generated admin password and the
+       map's `live_copy` run values: the workspace id, the operator's own
+       sign-in email (twice) and `[]` for the identity bindings, or the one
+       row the owner supplies. Derive the proxy subnet as in step 3 and wait
+       for health.
+     - List the walk targets. On a host that says rehearsal the walk signs in
+       with the rehearsal names, so live's password never reaches the copy:
+
+       ```powershell
+       $copy = "https://quote-rehearsal-copy.<server-ip>.sslip.io"
+       $env:SQAG_REHEARSAL_LOGIN_EMAIL = "<the operator's own sign-in email>"
+       $env:SQAG_REHEARSAL_LOGIN_PASSWORD = <the copy's generated admin password>
+       node scripts\rehearsal-check.mjs --profile live-readonly --base-url $copy --manifest deploy\rehearsal\live-cases.json --targets-out "$out\walk-targets.json" --targets-only --result "$out\copy-targets.json"
+       ```
+
+       `walk-targets.json` holds quote ids and counts only. Its `candidates`
+       list (reason codes, section and line counts) is what the owner picks
+       manifest cases from.
+     - Copy those quotes' files from live's bucket into the rehearsal bucket,
+       plan first. The script reads live with the read-only token, writes only
+       to `sqag-rehearsal` and reports counts only:
+
+       ```powershell
+       $env:SQAG_LIVE_COPY_DATABASE_URL = <the copy branch's runtime URL>
+       $r2 = "SWOOSHZ_SQAG_LIVE_R2_READONLY_ENDPOINT_URL,SWOOSHZ_SQAG_LIVE_R2_READONLY_ACCESS_KEY_ID,SWOOSHZ_SQAG_LIVE_R2_READONLY_SECRET_ACCESS_KEY,SWOOSHZ_SQAG_REHEARSAL_R2_ENDPOINT_URL,SWOOSHZ_SQAG_REHEARSAL_R2_ACCESS_KEY_ID,SWOOSHZ_SQAG_REHEARSAL_R2_SECRET_ACCESS_KEY"
+       node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names $r2 -- python scripts\copy_live_objects_to_rehearsal.py --targets "$out\walk-targets.json" --source-bucket <live bucket> --expect-dest-bucket sqag-rehearsal --mode plan --confirm-live-read --report "$out\copy-plan.json"
+       node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names $r2 -- python scripts\copy_live_objects_to_rehearsal.py --targets "$out\walk-targets.json" --source-bucket <live bucket> --expect-dest-bucket sqag-rehearsal --mode copy --confirm-live-read --report "$out\copy.json"
+       ```
+
+     - Walk the copy before anything writes to it, then run the writing
+       checks on it under the same ledger:
+
+       ```powershell
+       node scripts\rehearsal-check.mjs --profile live-readonly --base-url $copy --manifest deploy\rehearsal\live-cases.json --targets-out "$out\pass-a-targets.json" --result "$out\pass-a.json" --asset-out "$out\copy-app.js"
+       node scripts\rehearsal-check.mjs --profile seed --base-url $copy --result "$out\copy-seed.json" --ai-ok --ai-ledger $ledger
+       node scripts\rehearsal-check.mjs --profile verify --base-url $copy --seed-file "$out\copy-seed.json" --result "$out\copy-verify.json" --ai-ok --ai-ledger $ledger
+       ```
+
+       The walk reopens every manifest quote and the newest quotes the login
+       owns, checks their saved XLSX and PDF are unchanged, that every block
+       has its own tick and X, the booth box is filled and every line has a
+       quantity box, and fails if anything tried to write. Pass A passes only
+       if all three pass, `pass-a-targets.json` lists the same ids as
+       `walk-targets.json` and `copy-app.js` has the same hash as
+       `rehearsal-app.js`. Any failure holds promotion.
+     - Delete the `quote-rehearsal-copy` service and the
+       `rehearsal-copy-<short>` branch now. Step 9 empties the bucket.
    - Live migrations first, if any, in the runbook order and with their own
      approval.
    - Compare live's env names with the settings file without reading values.
@@ -243,8 +325,10 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      Fix a missing or unexpected name only with the owner's approval for that
      env change.
    - Commit the one-line image pin and its source comment on the
-     `deployment/internal` branch and deploy in Coolify.
-   - Run the live read-only check. It reads the live sign-in from
+     `deployment/internal` branch and deploy in Coolify. The owner's deploy
+     approval also covers the automatic rollback below.
+   - **Pass B: the live read-only walk.** Run the live read-only check with
+     the same manifest. It reads the live sign-in from
      `SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_EMAIL` and
      `SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_PASSWORD` only, never the rehearsal
      names, and `toolkit env run` feeds them from the credential store to
@@ -252,10 +336,11 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
 
      ```powershell
      Remove-Item Env:SQAG_REHEARSAL_LOGIN_EMAIL, Env:SQAG_REHEARSAL_LOGIN_PASSWORD -ErrorAction SilentlyContinue
-     node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_EMAIL,SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_PASSWORD -- node scripts\rehearsal-check.mjs --profile live-readonly --base-url https://<live host> --result "$out\live-readonly.json" --asset-out "$out\live-app.js"
+     node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_EMAIL,SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_PASSWORD -- node scripts\rehearsal-check.mjs --profile live-readonly --base-url https://<live host> --manifest deploy\rehearsal\live-cases.json --targets-out "$out\pass-b-targets.json" --result "$out\live-readonly.json" --asset-out "$out\live-app.js"
      ```
 
-     It signs in, loads the quote list and captures the served `app.js`.
+     It signs in, loads the quote list, walks the same quotes as Pass A and
+     captures the served `app.js`. It makes no AI call.
      Every channel it opens is read-only: the browser and its own API
      requests send only reads and the sign-in form, refuse anything else
      before it is sent, and list both in the result, so it creates nothing.
@@ -263,7 +348,23 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      `scripts/verify_release_identity.py` with the expected source commit and
      image id and `--served-asset "$out\live-app.js"`; its hash must equal
      the rehearsal's `rehearsal-app.js`.
-   - If any live check fails, pin the previous image id and deploy again.
+   - Roll back automatically unless Pass B fully passed. From a clean
+     checkout of `deployment/internal` (still pinned to the candidate), run:
+
+     ```powershell
+     node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names COOLIFY_SWOOSHZ_API_URL,COOLIFY_SWOOSHZ_API_TOKEN -- python scripts\live_rollback.py --pass-b-result "$out\live-readonly.json" --candidate-image <candidate image id> --candidate-source <candidate commit> --previous-image <current image id from step 1> --previous-source <its source commit> --deploy-checkout <deployment/internal checkout> --live-app-uuid <live app uuid> --record "$out\rollback.json" --execute
+     ```
+
+     Exit 0 keeps the candidate. Exit 10 means it pinned the previous image,
+     pushed the pin and Coolify finished deploying it: run Pass B again on the
+     previous image and record the release as failed. Exit 2 refused before
+     any effect and exit 1 failed part way: live may still run the candidate,
+     so pin the previous image by hand and deploy at once. A failed
+     identity check also means pinning the previous image and deploying again.
+   - When a live migration is applied, move `LIVE_MIGRATION_HEAD` in
+     `tests/disposable_database_mode.py` and the expected head in
+     `tests/test_disposable_database_mode.py` in the next change, so CI keeps
+     testing live's schema.
 
 9. **Delete and record.**
    - Empty the rehearsal bucket: run the map's `clear_setup`, then its
@@ -272,8 +373,8 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      service in Coolify and the `rehearsal-<short>` Neon branch. The bucket
      itself stays. Never delete anything whose name does not say rehearsal.
    - Drop the run's generated secrets.
-   - Store the build record, the preflight outputs and every check result in
-     the evidence store, then remove the worktree with `git worktree remove`.
+   - Store the build record, the preflight outputs, every check result, the
+     copy reports, the AI ledger and any rollback record in the evidence store, then remove the worktree with `git worktree remove`.
    - Image retention: keep the current, previous and candidate images. Removing
      any other image or old container is a separate owner-approved server
      action.

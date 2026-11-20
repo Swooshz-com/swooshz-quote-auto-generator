@@ -245,7 +245,7 @@ or deployment behaviour changes accompany this test.
 - Runs `npm run playwright:smoke` and `npm run playwright:alpha-smoke`, plus `npm run playwright:smoke -- --recovery-only` in a separate
   process with fresh quote state. The isolated `npm run playwright:smoke -- --terminal-only` step checks live
   needs-review, blocked, failed and interrupted polling without reload. `npm run playwright:rehearsal-check` runs
-  `scripts/rehearsal-check.mjs` (seed, verify without AI, reopen, live-readonly) against a loopback
+  `scripts/rehearsal-check.mjs` (seed, verify without AI, reopen, live-readonly and the live-data walk) against a loopback
   synthetic server behind a logging proxy, checks at the server that live-readonly sends no write, and checks
   its argument, base-URL and read-only refusals. It runs every profile twice: once on a file-storage server,
   and once on a database-storage server in live's modes (`SQAG_STORAGE_MODE=database`,
@@ -320,7 +320,10 @@ or deployment behaviour changes accompany this test.
   remote check, `scripts/rehearsal-check.mjs`, is tested by the browser job's
   `npm run playwright:rehearsal-check` step against loopback synthetic servers only (file
   storage and database storage); CI never reaches the rehearsal or live app. No trigger, secret or required
-  check changes.
+  check changes. The live-data end-to-end test (#390: Pass A on a copy of live before the switch, Pass B
+  read-only on live after it, `scripts/copy_live_objects_to_rehearsal.py`, `scripts/live_rollback.py`) is
+  part of that manual procedure, run from the laptop; CI runs only its offline and loopback tests
+  (`tests/test_live_e2e.mjs` in the same npm step, the Python tests in the unittest step).
 - All six maintained inference operations require `OPENROUTER_API_KEY` and
   explicit `OPENROUTER_<SUFFIX>_MODEL`,
   `OPENROUTER_<SUFFIX>_REASONING_EFFORT` and

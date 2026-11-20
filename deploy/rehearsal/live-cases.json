@@ -1,0 +1,21 @@
+{
+  "schema": "sqag-live-cases/v1",
+  "purpose": "Quotes the live-data walk reopens on every redeploy (Pass A on the copy of live, Pass B on live), plus the newest quotes the signed-in login owns. Opaque quote ids and fixed reason codes only: never a name, file name or note. The owner approves the list once and every change; approval.record is the issue comment id or store commit of that approval.",
+  "approval": {
+    "approved": false,
+    "approved_at": null,
+    "record": null
+  },
+  "newest_own_quotes": 3,
+  "reason_codes": {
+    "generated": "Has a current XLSX and PDF, so the walk downloads and hashes both.",
+    "draft": "Not generated yet; the walk reopens the saved draft.",
+    "large": "40 or more basis lines.",
+    "many-sections": "8 or more basis sections.",
+    "pdf-brief": "Built from a PDF brief.",
+    "image-brief": "Built from booth images.",
+    "older": "Created more than 90 days ago, so it was saved by an older release.",
+    "owner-pick": "The owner chose it; the reason is in the approval record."
+  },
+  "cases": []
+}
