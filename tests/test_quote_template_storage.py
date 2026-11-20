@@ -228,7 +228,8 @@ class SqliteQuoteTemplateStoreTest(QuoteTemplateStoreContract, unittest.TestCase
 class PostgresQuoteTemplateStoreTest(QuoteTemplateStoreContract, unittest.TestCase):
     """Runs as the real runtime role against a database built by the real migration runner."""
 
-    setUpClass = ledger.PostgresMigrationLedgerIntegrationTest.setUpClass
+    # Rebind the ledger's class setup to this class so psycopg, sql and the manifest land here.
+    setUpClass = classmethod(ledger.PostgresMigrationLedgerIntegrationTest.setUpClass.__func__)
     _create_roles = ledger.PostgresMigrationLedgerIntegrationTest._create_roles
     create_database = ledger.PostgresMigrationLedgerIntegrationTest.create_database
     _cleanup_fixture = ledger.PostgresMigrationLedgerIntegrationTest._cleanup_fixture
