@@ -1012,7 +1012,11 @@ The same rendered check then reloads a browser recovery copy saved without
 quote: the copy stays on screen but must not write, the existing "Quote not
 saved" dialog tells staff at once to reopen the quote, Download shows the same
 message instead of doing nothing, and the server record is byte-for-byte
-unchanged with no quote-session POST sent.
+unchanged with no quote-session POST sent. A copy left on the Dashboard (Back to
+Dashboard, or a new sign-in that ends there) is held just as firmly but quietly:
+no dialog over the Dashboard on that load or the next, no write, and Modify
+quote then opens the saved quote without a warning. A copy of a quote the server
+never saw keeps saving as new, and its expected 404 lookup logs no error.
 
 
 ## Current quotation links and completed jobs
