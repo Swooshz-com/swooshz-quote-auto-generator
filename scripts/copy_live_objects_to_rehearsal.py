@@ -2,14 +2,20 @@
 """Copy the object files of a few live quotes into the rehearsal bucket (laptop only).
 
 Run on the operator's laptop so the rehearsal app on the Neon data branch can reopen
-those quotes. Secrets come from the credential store through toolkit env run (names only):
+those quotes. SQAG_LIVE_COPY_DATABASE_URL is the data branch's per-run URL, set in the
+session only (never stored). The bucket tokens, and NEON_API_KEY for the guard's branch
+check, come from the credential store through toolkit env run (names only):
 
-    node "<toolkit>/repo/scripts/toolkit-env.cjs" run --names SQAG_LIVE_COPY_DATABASE_URL,SWOOSHZ_SQAG_LIVE_R2_READONLY_ENDPOINT_URL,SWOOSHZ_SQAG_LIVE_R2_READONLY_ACCESS_KEY_ID,SWOOSHZ_SQAG_LIVE_R2_READONLY_SECRET_ACCESS_KEY,SWOOSHZ_SQAG_REHEARSAL_R2_ENDPOINT_URL,SWOOSHZ_SQAG_REHEARSAL_R2_ACCESS_KEY_ID,SWOOSHZ_SQAG_REHEARSAL_R2_SECRET_ACCESS_KEY -- python scripts/copy_live_objects_to_rehearsal.py --targets <targets.json> --source-bucket <live bucket> --expect-dest-bucket sqag-rehearsal --mode plan --confirm-live-read
+    node "<toolkit>/repo/scripts/toolkit-env.cjs" run --names NEON_API_KEY,SWOOSHZ_SQAG_LIVE_R2_READONLY_ENDPOINT_URL,SWOOSHZ_SQAG_LIVE_R2_READONLY_ACCESS_KEY_ID,SWOOSHZ_SQAG_LIVE_R2_READONLY_SECRET_ACCESS_KEY,SWOOSHZ_SQAG_REHEARSAL_R2_ENDPOINT_URL,SWOOSHZ_SQAG_REHEARSAL_R2_ACCESS_KEY_ID,SWOOSHZ_SQAG_REHEARSAL_R2_SECRET_ACCESS_KEY -- python scripts/copy_live_objects_to_rehearsal.py --targets <targets.json> --source-bucket <live bucket> --expect-dest-bucket sqag-rehearsal --mode plan --confirm-live-read
 
 --targets is JSON: {"schema": "sqag-live-walk-targets/v1", "quote_ids": ["quote-<24 hex>"]}.
 Run --mode plan first (reads rows and source heads, writes nothing), then --mode copy;
 copy is safe to repeat. Output is counts only. Exit: 0 ok, 1 mismatch or storage error,
 2 refused before any call.
+
+Before any database or bucket call, the run checks SQAG_LIVE_COPY_DATABASE_URL with
+scripts/neon_branch_guard.py and refuses (exit 2) a host that is Neon's default (production)
+branch. The guard's one line goes to stderr; stdout stays the JSON report.
 """
 
 from __future__ import annotations
@@ -25,6 +31,10 @@ from typing import Any, Mapping, NamedTuple
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from scripts import neon_branch_guard  # noqa: E402 (needs the path setup above)
+
 DEFAULT_MAP = ROOT / "deploy" / "rehearsal" / "resources.json"
 TARGETS_SCHEMA = "sqag-live-walk-targets/v1"
 QUOTE_ID = re.compile(r"quote-[0-9a-f]{24}")
@@ -109,6 +119,17 @@ def check_buckets(source_bucket: str, dest_bucket: str, map_path: Path) -> None:
         raise Refusal("rehearsal map is unreadable") from None
     if dest_bucket != mapped or "rehearsal" not in dest_bucket:
         raise Refusal("destination bucket is not the rehearsal map's bucket")
+
+
+def check_production_guard(env: Mapping[str, str], map_path: Path) -> None:
+    """Refuse a database URL that names Neon's default (production) branch. Runs before any call."""
+    try:
+        rehearsal_map = neon_branch_guard.load_map(map_path)
+        neon_branch_guard.check_database_target(
+            env[DB_URL_ENV].strip(), rehearsal_map, neon_branch_guard.neon_client_from_env(env)
+        )
+    except neon_branch_guard.GuardRefusal as exc:
+        raise Refusal(f"production database guard refused: {exc}") from None
 
 
 def make_db(env: Mapping[str, str]) -> Any:
@@ -289,6 +310,7 @@ def run(
         source_bucket = args.source_bucket.strip()
         dest_bucket = args.expect_dest_bucket.strip()
         check_buckets(source_bucket, dest_bucket, args.map)
+        check_production_guard(env, args.map)
         conn = (db_factory or make_db)(env)
         objects = plan_objects(read_rows(conn, quote_ids))
         report.update(objects=len(objects), bytes=sum(o.size for o in objects), keys_sha256=keys_digest(objects))

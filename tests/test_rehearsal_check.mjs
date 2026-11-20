@@ -166,6 +166,28 @@ function postgresLeftovers() {
   return { databases: dbs.split(" ").filter(Boolean), roles: roles.split(" ").filter(Boolean) };
 }
 
+// Row counts of every app table in the harness's database (the one test
+// database the run created), so a walk can prove it wrote nothing, telemetry
+// included.
+function tableRowCounts() {
+  const code = [
+    "import os, json, psycopg",
+    "base = 'postgresql://%s@%s:%s/' % (os.environ['SQAG_TEST_POSTGRES_USER'], os.environ['SQAG_TEST_POSTGRES_HOST'], os.environ['SQAG_TEST_POSTGRES_PORT'])",
+    "with psycopg.connect(base + 'postgres') as c:",
+    "    dbs = [r[0] for r in c.execute(\"select datname from pg_catalog.pg_database where datname like 'sqag_ci_database_mode_%'\")]",
+    "assert len(dbs) == 1, dbs",
+    "counts = {}",
+    "with psycopg.connect(base + dbs[0]) as c:",
+    "    tables = [r[0] for r in c.execute(\"select tablename from pg_catalog.pg_tables where schemaname = 'public' and tablename like 'sqag_%' order by tablename\")]",
+    "    for t in tables:",
+    "        counts[t] = c.execute('select count(*) from public.\"%s\"' % t).fetchone()[0]",
+    "print(json.dumps(counts))",
+  ].join("\n");
+  const probe = spawnSync(python, ["-c", code], { cwd: root, encoding: "utf8" });
+  assert.equal(probe.status, 0, `PostgreSQL row count failed: ${probe.stderr}`);
+  return JSON.parse(probe.stdout.trim());
+}
+
 async function startHarness(dirs, storage) {
   // The harness takes the repository root first, then its data folders.
   const child = spawn(python, [path.join(root, "tests", "internal_password_browser_harness.py"), root, dirs.data, dirs.output, dirs.tmp, dirs.logs, dirs.pricing, "--storage", storage], {
@@ -246,30 +268,63 @@ async function runAllProfiles(t, storage) {
       assert.equal(seed.parsed.seed.company_profile_id, null);
       assert.equal(step(seed.parsed, "company profile").status, "skipped");
     }
+    assert.ok(seed.parsed.seed.excel_only_session_id && /^[0-9a-f]{64}$/.test(seed.parsed.seed.excel_only_xlsx_sha256), "seed made no Excel-only quote");
     // The live-data walk (Pass A and Pass B) on the seeded quotes, read-only on every channel.
     const manifestFile = path.join(dirs.results, "live-cases.json");
     const committed = JSON.parse(await fs.readFile(path.join(root, "deploy", "rehearsal", "live-cases.json"), "utf8"));
     await fs.writeFile(manifestFile, JSON.stringify({
       ...committed,
       approval: { approved: true, approved_at: "2026-11-20", record: "0000000" },
-      cases: [{ id: seed.parsed.seed.published_session_id, reasons: ["generated"] }, { id: seed.parsed.seed.draft_session_id, reasons: ["draft"] }],
+      cases: [
+        { id: seed.parsed.seed.published_session_id, reasons: ["generated"] },
+        { id: seed.parsed.seed.excel_only_session_id, reasons: ["generated"] },
+        { id: seed.parsed.seed.draft_session_id, reasons: ["draft"] },
+      ],
     }));
+    // Pass A (the copy of live): downloads each available file and checks it against its record.
     front.log.length = 0;
     const targetsFile = path.join(dirs.results, "targets.json");
-    const walk = await result("live-readonly", ["--manifest", manifestFile, "--targets-out", targetsFile], "live-walk");
-    assert.deepEqual(front.log.filter((line) => !/^(GET|HEAD) /.test(line)), ["POST /login"], "the live-data walk sent a write to the server");
-    assert.equal(step(walk.parsed, "no write attempted").status, "pass");
-    const published = step(walk.parsed, "quote 1 reopens read-only").detail;
+    const countsBeforeA = storage === "database" ? tableRowCounts() : null;
+    const passA = await result("live-readonly", ["--manifest", manifestFile, "--targets-out", targetsFile, "--download-files", "--click-budget"], "pass-a");
+    assert.deepEqual(front.log.filter((line) => !/^(GET|HEAD) /.test(line)), ["POST /login"], "Pass A sent a write to the server");
+    assert.equal(step(passA.parsed, "no write attempted").status, "pass");
+    assert.equal(passA.parsed.downloaded_files, true);
+    const published = step(passA.parsed, "quote 1 reopens read-only").detail;
     assert.equal(published.id, seed.parsed.seed.published_session_id);
     assert.equal(published.generated, true);
-    assert.equal(published.xlsx_sha256, seed.parsed.seed.published_exports.xlsx_sha256);
-    assert.equal(published.pdf_sha256, seed.parsed.seed.published_exports.pdf_sha256);
+    assert.deepEqual([published.files.xlsx.sha256, published.files.xlsx.downloaded], [seed.parsed.seed.published_exports.xlsx_sha256, true]);
+    assert.deepEqual([published.files.pdf.sha256, published.files.pdf.downloaded], [seed.parsed.seed.published_exports.pdf_sha256, true]);
     assert.ok(published.bad_blocks === 0 && published.empty_booth_boxes === 0 && published.missing_quantity_boxes === 0, JSON.stringify(published));
-    assert.equal(step(walk.parsed, "quote 2 reopens read-only").detail.generated, false);
+    // The Excel-only quote (the app's default output) passes on its XLSX; its missing PDF is recorded, not failed.
+    const excelOnly = step(passA.parsed, "quote 2 reopens read-only").detail;
+    assert.equal(excelOnly.id, seed.parsed.seed.excel_only_session_id);
+    assert.deepEqual([excelOnly.generated, excelOnly.files.xlsx.sha256, excelOnly.files.pdf.available], [true, seed.parsed.seed.excel_only_xlsx_sha256, false]);
+    assert.equal(step(passA.parsed, "quote 3 reopens read-only").detail.generated, false);
+    // The click probe ran on the largest manifest quotes; its saves were answered in the browser, never sent.
+    const clickSteps = passA.parsed.steps.filter((entry) => /^click budget on quote [0-9]+$/.test(entry.name));
+    assert.ok(clickSteps.length >= 1 && clickSteps.every((entry) => entry.status === "pass"), JSON.stringify(clickSteps));
+    const probed = clickSteps[0].detail;
+    assert.ok([seed.parsed.seed.published_session_id, seed.parsed.seed.excel_only_session_id].includes(probed.id));
+    assert.ok(probed.samples.length >= 4 && probed.samples.every((sample) => sample.clicks === 1 && sample.indexed_db_puts === 0 && sample.rebuilt_rows === 0), JSON.stringify(probed.samples));
+    assert.ok(probed.stubbed_saves > 0, "no click took the quote save path, so the save stub was not tested");
     const targets = JSON.parse(await fs.readFile(targetsFile, "utf8"));
-    assert.deepEqual(targets.quote_ids.slice(0, 2), [seed.parsed.seed.published_session_id, seed.parsed.seed.draft_session_id]);
+    assert.deepEqual(targets.quote_ids.slice(0, 3), [seed.parsed.seed.published_session_id, seed.parsed.seed.excel_only_session_id, seed.parsed.seed.draft_session_id]);
     assert.ok(targets.quote_ids.every((id) => /^quote-[0-9a-f]{24}$/.test(id)));
     assert.ok(!JSON.stringify(targets).includes("Rehearsal Synthetic"), "the targets file holds quote text");
+    if (countsBeforeA) {
+      // Downloads write telemetry rows, which is why only Pass A on the copy downloads.
+      assert.ok(tableRowCounts().sqag_telemetry_events > countsBeforeA.sqag_telemetry_events, "the row count did not see Pass A's download telemetry");
+    }
+    // Pass B (live): no download, no candidate list; live's recorded hashes must equal Pass A's.
+    front.log.length = 0;
+    const countsBeforeB = storage === "database" ? tableRowCounts() : null;
+    const passB = await result("live-readonly", ["--manifest", manifestFile, "--expect-files", passA.file], "pass-b");
+    assert.deepEqual(front.log.filter((line) => !/^(GET|HEAD) /.test(line)), ["POST /login"], "Pass B sent a write to the server");
+    assert.deepEqual(front.log.filter((line) => line.includes("/download/")), [], "Pass B downloaded a file on live");
+    assert.equal(passB.parsed.downloaded_files, false);
+    assert.equal(passB.parsed.compared_with_pass_a, true);
+    for (const n of [1, 2]) assert.equal(step(passB.parsed, `quote ${n} reopens read-only`).detail.pass_a, "same files");
+    if (countsBeforeB) assert.deepEqual(tableRowCounts(), countsBeforeB, "Pass B wrote rows to the database (telemetry included)");
     const asset = path.join(dirs.results, "app.js");
     const verify = await result("verify", ["--seed-file", seed.file, "--no-ai", "--asset-out", asset]);
     const served = step(verify.parsed, "served app.js").detail;

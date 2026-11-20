@@ -6,6 +6,7 @@ the decision, the refusals before any effect and the order of the effects.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import tempfile
@@ -28,6 +29,10 @@ COMPOSE = (
     f'    image: "{CANDIDATE}"\n'
     "    pull_policy: never\n"
 )
+LIVE_URL = "https://quote-internal.example.test"
+SWITCHED_AT = "2026-11-21T03:00:00Z"
+WALK_FACTS = {"walked_origin_sha256": hashlib.sha256(LIVE_URL.encode("utf-8")).hexdigest(),
+              "started_at": "2026-11-21T03:05:00.000Z", "downloaded_files": False, "compared_with_pass_a": True}
 PASSING_STEPS = ["sign in", "quote list loads", "quote list matches the dashboard", "walk targets",
                  "quote 1 reopens read-only", "served app.js", "no write attempted"]
 
@@ -86,12 +91,13 @@ class LiveRollbackTests(unittest.TestCase):
 
     def walk(self, result: str = "pass", steps=PASSING_STEPS, failed: str = "", **extra) -> None:
         body = {"schema": "sqag-rehearsal-check/v1", "profile": "live-readonly", "result": result,
-                "steps": [{"name": name, "status": "fail" if name == failed else "pass"} for name in steps], **extra}
+                "steps": [{"name": name, "status": "fail" if name == failed else "pass"} for name in steps], **WALK_FACTS, **extra}
         self.result.write_text(json.dumps(body), encoding="utf-8")
 
     def go(self, *extra: str, git=None, coolify=None, **overrides: str) -> tuple[int, dict]:
         values = {"--candidate-image": CANDIDATE, "--candidate-source": CANDIDATE_SRC, "--previous-image": PREVIOUS,
-                  "--previous-source": PREVIOUS_SRC, "--live-app-uuid": "abc123def456", **overrides}
+                  "--previous-source": PREVIOUS_SRC, "--live-app-uuid": "abc123def456",
+                  "--live-url": LIVE_URL, "--switched-at": SWITCHED_AT, **overrides}
         argv = ["--pass-b-result", str(self.result), "--deploy-checkout", str(self.checkout), "--record", str(self.record)]
         for key, value in values.items():
             argv += [key, value]
@@ -116,6 +122,11 @@ class LiveRollbackTests(unittest.TestCase):
             "walk not run (no manifest)": lambda: self.walk(steps=["sign in", "quote list loads", "served app.js", "no write attempted"]),
             "write refused": lambda: self.walk(failed="no write attempted"),
             "no quote reopened": lambda: self.walk(steps=[s for s in PASSING_STEPS if not s.startswith("quote 1")]),
+            "walked another host (the copy)": lambda: self.walk(walked_origin_sha256=hashlib.sha256(b"https://quote-rehearsal-copy.example.test").hexdigest()),
+            "walked before the switch (an old result)": lambda: self.walk(started_at="2026-11-21T02:59:59.000Z"),
+            "no start time": lambda: self.walk(started_at=None),
+            "Pass A result (downloaded files)": lambda: self.walk(downloaded_files=True, compared_with_pass_a=False),
+            "not compared with Pass A": lambda: self.walk(compared_with_pass_a=False),
         }
         for label, prepare in cases.items():
             with self.subTest(label):
@@ -125,6 +136,19 @@ class LiveRollbackTests(unittest.TestCase):
                 code, record = self.go()
                 self.assertEqual((code, record["decision"], record["status"]), (3, "rollback", "planned"), label)
                 self.assertEqual(self.calls, [], "a plan without --execute has no effect")
+
+    def test_live_url_and_switch_time_must_be_well_formed(self) -> None:
+        self.walk()
+        self.assertEqual(self.go("--execute")[0], 0)
+        # The same origin written with a trailing slash or default port is still live's.
+        self.assertEqual(self.go("--execute", **{"--live-url": "https://QUOTE-INTERNAL.example.test:443/"})[0], 0)
+        for overrides in ({"--live-url": "http://quote-internal.example.test"}, {"--live-url": "https://quote-internal.example.test/app"},
+                          {"--switched-at": "yesterday"}, {"--switched-at": "2026-11-21T03:00:00"}):
+            with self.subTest(overrides):
+                self.calls.clear()
+                code, record = self.go("--execute", **overrides)
+                self.assertEqual((code, record["status"]), (2, "refused"))
+                self.assertEqual(self.calls, [])
 
     def test_rollback_pins_the_previous_image_then_pushes_then_deploys(self) -> None:
         self.walk(result="fail")

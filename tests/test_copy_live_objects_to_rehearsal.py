@@ -27,6 +27,30 @@ from webapp import object_storage  # noqa: E402
 MAP_BUCKET = json.loads((ROOT / "deploy" / "rehearsal" / "resources.json").read_text(encoding="utf-8"))["storage"][
     "bucket"
 ]
+PRODUCTION_ENDPOINT = "ep-weathered-king-az5onvhs"
+PRODUCTION_HOST = f"{PRODUCTION_ENDPOINT}.c-3.ap-southeast-1.aws.neon.tech"
+PRODUCTION_POOLER_HOST = f"{PRODUCTION_ENDPOINT}-pooler.c-3.ap-southeast-1.aws.neon.tech"
+# A temp map with the production guard section, so the guard's rules run against a fixture
+# and not against whatever the real map holds.
+GUARD_DIR = tempfile.TemporaryDirectory()
+GUARD_MAP = Path(GUARD_DIR.name) / "rehearsal-map.json"
+GUARD_MAP.write_text(
+    json.dumps(
+        {
+            "storage": {"bucket": MAP_BUCKET},
+            "production_guard": {
+                "neon_project": "swooshz-sqag",
+                "branch_prefix": "rehearsal-",
+                "forbidden_endpoints": [
+                    {"name": "live default branch compute", "endpoint_id": PRODUCTION_ENDPOINT,
+                     "branch_id": "br-blue-breeze-azlylkzw"}
+                ],
+                "source": "test fixture",
+            },
+        }
+    ),
+    encoding="utf-8",
+)
 SCHEMA = "sqag-live-walk-targets/v1"
 QUOTE_A = "quote-" + "a" * 24
 QUOTE_B = "quote-" + "b" * 24
@@ -37,7 +61,11 @@ KEY_1 = f"workspaces/{WORKSPACE}/quote/{QUOTE_A}/booth/{PLANTED_NAME}"
 KEY_2 = f"workspaces/{WORKSPACE}/quote/{QUOTE_B}/render/render-02.png"
 PAYLOAD_1 = b"booth render bytes one"
 PAYLOAD_2 = b"booth render bytes two"
-DB_URL = "postgresql://runtime-user:planted-db-password@db.example.test/neondb?sslmode=require"
+DB_URL = (
+    "postgresql://runtime-user:planted-db-password@ep-fake-rehearsal-000001.c-3.ap-southeast-1.aws.neon.tech"
+    "/neondb?sslmode=require"
+)
+REHEARSAL_GUARD_LINE = "target host ep-fake-rehearsal-000001.c-3.ap-southeast-1.aws.neon.tech branch not checked\n"
 LIVE_ENDPOINT = "https://live-r2.example.test"
 REHEARSAL_ENDPOINT = "https://rehearsal-r2.example.test"
 LIVE_KEY_ID = "live-key-id-planted"
@@ -225,7 +253,10 @@ def argv_for(
     dest: str = MAP_BUCKET,
     extra: list[str] | None = None,
 ) -> list[str]:
-    argv = ["--targets", str(targets), "--source-bucket", source, "--expect-dest-bucket", dest, "--mode", mode]
+    argv = [
+        "--targets", str(targets), "--source-bucket", source, "--expect-dest-bucket", dest, "--mode", mode,
+        "--map", str(GUARD_MAP),
+    ]
     if confirm:
         argv.append("--confirm-live-read")
     return argv + (extra or [])
@@ -247,6 +278,7 @@ class CopyLiveObjectsTests(unittest.TestCase):
         self.source = source if source is not None else FakeS3(live_objects())
         self.dest = dest if dest is not None else FakeS3()
         self.opened = []
+        self.stderr = io.StringIO()
 
         def opener(name: str, value: Any):
             def factory(_env: Mapping[str, str]) -> Any:
@@ -255,13 +287,29 @@ class CopyLiveObjectsTests(unittest.TestCase):
 
             return factory
 
-        return copy_script.run(
-            argv,
-            base_env() if env is None else env,
-            db_factory=opener("db", self.db),
-            source_factory=opener("source", self.source),
-            dest_factory=opener("dest", self.dest),
-        )
+        with contextlib.redirect_stderr(self.stderr):
+            return copy_script.run(
+                argv,
+                base_env() if env is None else env,
+                db_factory=opener("db", self.db),
+                source_factory=opener("source", self.source),
+                dest_factory=opener("dest", self.dest),
+            )
+
+    def test_production_branch_host_is_refused_before_any_call(self) -> None:
+        for host in (PRODUCTION_HOST, PRODUCTION_POOLER_HOST):
+            with self.subTest(host):
+                url = f"postgresql://runtime-user:planted-db-password@{host}/neondb?sslmode=require"
+                code, report = self.run_script(
+                    argv_for(self.targets, "copy"), env={**base_env(), copy_script.DB_URL_ENV: url}
+                )
+                self.assertEqual((code, report["status"]), (2, "refused"), report)
+                self.assertEqual(report["error"], "production database guard refused: target is a recorded production endpoint")
+                self.assertIn(f"target host {host} branch not checked\n", self.stderr.getvalue())
+                self.assertEqual((self.opened, self.db.statements), ([], []))
+                self.assertEqual((self.source.calls, self.dest.calls), ([], []))
+                for text in (json.dumps(report), self.stderr.getvalue()):
+                    self.assertNotIn("planted-db-password", text)
 
     def test_refusals_stop_before_any_db_or_storage_call(self) -> None:
         cases: list[tuple[str, list[str], dict[str, str]]] = [
@@ -457,8 +505,8 @@ class CopyLiveObjectsTests(unittest.TestCase):
         written = report_path.read_text(encoding="utf-8")
         self.assertEqual(set(json.loads(printed)), REPORT_KEYS)
         self.assertEqual(json.loads(written), json.loads(printed))
-        self.assertEqual(err.getvalue(), "")
-        for text in (printed, written):
+        self.assertEqual(err.getvalue(), REHEARSAL_GUARD_LINE)
+        for text in (printed, written, err.getvalue()):
             for planted in PLANTED:
                 self.assertNotIn(planted, text)
 

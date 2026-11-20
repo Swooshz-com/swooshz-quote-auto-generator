@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import { AI_CAP_MAX_USD, AiBudget, AiCapError, loadBudget, reportedUsd, saveBudget } from "../scripts/lib/ai-budget.mjs";
 import { derivedReasons, ManifestError, REASON_CODES, targetsDocument, validateManifest, walkTargets } from "../scripts/lib/live-cases.mjs";
-import { assertNoWriteAttempted, basisPageChecks, browserGuard, loadRunInputs, parseArgs, UsageError } from "../scripts/rehearsal-check.mjs";
+import { assertNoWriteAttempted, basisPageChecks, browserGuard, compareWithPassA, DB_GUARD_MAX_AGE_MS, exportFacts, loadRunInputs, needsDbGuard, parseArgs, readDbGuard, readPassAFiles, savedAck, saveStub, UsageError } from "../scripts/rehearsal-check.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const script = path.join(root, "scripts", "rehearsal-check.mjs");
@@ -24,6 +24,17 @@ const credentials = {
 };
 const env = { ...process.env, ...credentials };
 const id = (digit) => `quote-${String(digit).repeat(24)}`;
+
+// A passing production-branch guard result (scripts/neon_branch_guard.py) for a rehearsal branch.
+async function guardFile(overrides = {}) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sqag-db-guard-"));
+  const file = path.join(dir, "guard.json");
+  await fs.writeFile(file, JSON.stringify({
+    schema: "sqag-db-guard/v1", status: "pass", host: "ep-quiet-copy-a1b2c3.example.test", endpoint_id: "ep-quiet-copy-a1b2c3",
+    branch_name: "rehearsal-copy-abc1234", branch_default: false, neon_api: "checked", checked_at: new Date().toISOString(), reason: null, ...overrides,
+  }));
+  return file;
+}
 
 async function manifest(overrides = {}) {
   const base = JSON.parse(await fs.readFile(committedManifest, "utf8"));
@@ -137,7 +148,7 @@ test("one ledger caps the whole run across seed and verify", async () => {
 });
 
 test("paid-AI profiles refuse to start without the owner's OK flag", () => {
-  const rehearsal = ["--base-url", "https://quote-rehearsal.example.test", "--result", "r.json"];
+  const rehearsal = ["--base-url", "https://quote-rehearsal.example.test", "--result", "r.json", "--db-guard", "g.json"];
   const refused = [
     [["--profile", "seed"], /--ai-ok/],
     [["--profile", "verify", "--seed-file", "s.json"], /--ai-ok/],
@@ -166,18 +177,143 @@ test("live's sign-in goes only to a host that is not a rehearsal; the copy of li
     SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_EMAIL: "live-operator" + "@" + "example.test",
     SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_PASSWORD: "synthetic-live-password",
   };
-  const walk = (host) => parseArgs(["--profile", "live-readonly", "--base-url", host, "--result", "r.json"], split).credentials.password;
+  const walk = (host) => parseArgs(["--profile", "live-readonly", "--base-url", host, "--result", "r.json", "--db-guard", "g.json"], split).credentials.password;
   assert.equal(walk("https://quote-rehearsal-copy.example.test"), "synthetic-copy-run-password");
   assert.equal(walk("https://quote-internal.example.test"), "synthetic-live-password");
   const noLive = { ...split, SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_EMAIL: "", SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_PASSWORD: "" };
-  assert.equal(parseArgs(["--profile", "live-readonly", "--base-url", "https://quote-rehearsal-copy.example.test", "--result", "r.json"], noLive).credentials.password, "synthetic-copy-run-password");
+  assert.equal(parseArgs(["--profile", "live-readonly", "--base-url", "https://quote-rehearsal-copy.example.test", "--result", "r.json", "--db-guard", "g.json"], noLive).credentials.password, "synthetic-copy-run-password");
 });
 
 test("the walk refuses an unapproved manifest unless it only lists candidates", async () => {
-  const live = ["--profile", "live-readonly", "--base-url", "https://quote-internal.example.test", "--result", "r.json", "--manifest", committedManifest];
-  await assert.rejects(loadRunInputs(parseArgs(live, env)), /not approved/);
-  const listing = await loadRunInputs(parseArgs([...live, "--targets-out", "t.json", "--targets-only"], env));
+  const copy = ["--profile", "live-readonly", "--base-url", "https://quote-rehearsal-copy.example.test", "--result", "r.json", "--manifest", committedManifest, "--db-guard", await guardFile()];
+  await assert.rejects(loadRunInputs(parseArgs(copy, env)), /not approved/);
+  const listing = await loadRunInputs(parseArgs([...copy, "--targets-out", "t.json", "--targets-only"], env));
   assert.deepEqual(listing.manifestIds, { ids: [], newest: 3, approved: false });
+});
+
+test("live gets no download and no candidate list: those are for the copy of live only", () => {
+  const on = (host, ...extra) => () => parseArgs(["--profile", "live-readonly", "--base-url", host, "--result", "r.json", "--manifest", committedManifest, "--db-guard", "g.json", ...extra], env);
+  const live = "https://quote-internal.example.test";
+  const copy = "https://quote-rehearsal-copy.example.test";
+  assert.throws(on(live, "--download-files"), /copy of live only/);
+  assert.throws(on(live, "--targets-out", "t.json"), /copy of live only/);
+  assert.equal(on(copy, "--download-files")().downloadFiles, true);
+  assert.equal(on(live, "--expect-files", "a.json")().expectFiles, "a.json");
+  assert.throws(on(copy, "--download-files", "--expect-files", "a.json"), /not both/);
+  assert.throws(() => parseArgs(["--profile", "live-readonly", "--base-url", copy, "--result", "r.json", "--download-files", "--db-guard", "g.json"], env), /need --manifest/);
+  assert.throws(() => parseArgs(["--profile", "reopen", "--seed-file", "s.json", "--base-url", copy, "--result", "r.json", "--download-files"], env), /live-readonly only/);
+  // The click probe saves on every click, so it runs only in Pass A on the copy, never on live.
+  assert.equal(on(copy, "--download-files", "--click-budget")().clickBudget, true);
+  assert.throws(on(copy, "--click-budget"), /Pass A only/);
+  assert.throws(on(live, "--expect-files", "a.json", "--click-budget"), /Pass A only/);
+  assert.throws(on(live, "--download-files", "--click-budget"), /copy of live only/);
+});
+
+test("the click probe's saves are answered in the browser and never reach the copy", async () => {
+  const readback = { session_id: id(1), updated_at: "t", draft_version: "a".repeat(64), draft_state: { secret: 1 }, draft_files: [{}],
+    pricing_ledger: { revision: 4, rows: { "row-1": 2, "row-2": -1, "row-3": "x" } } };
+  const body = { session_id: id(1), expected_draft_version: "a".repeat(64), draft_state: { quoteBasisSections: [] } };
+  const ack = savedAck(readback, body);
+  // The app accepts a save only with these (webapp/static/app.js saveCurrentQuoteSession).
+  assert.equal(ack.status, "saved");
+  assert.equal(ack.quote_session.session_id, id(1));
+  assert.match(ack.quote_session.draft_version, /^[0-9a-f]{64}$/);
+  assert.notEqual(ack.quote_session.draft_version, body.expected_draft_version);
+  assert.deepEqual(ack.quote_session.pricing_ledger, { revision: 4, rows: { "row-1": 2 } });
+  assert.ok(!("draft_state" in ack.quote_session) && !("draft_files" in ack.quote_session));
+
+  const run = { baseUrl: "https://quote-rehearsal-copy.example.test" };
+  const stubbed = [];
+  const stub = saveStub(run, readback, stubbed);
+  const route = (method, url, post = null) => {
+    const calls = [];
+    return {
+      calls,
+      request: () => ({ method: () => method, url: () => url, postDataJSON: () => post }),
+      continue: async () => { calls.push(["continue"]); },
+      abort: async () => { calls.push(["abort"]); },
+      fulfill: async (response) => { calls.push(["fulfill", response.status, response.body ? JSON.parse(response.body).status : ""]); },
+    };
+  };
+  const cases = [
+    [["GET", run.baseUrl + "/api/quote-sessions"], ["continue"]],
+    [["GET", "https://fonts.example.test/a.woff2"], ["continue"]],
+    [["POST", run.baseUrl + "/api/quote-sessions", body], ["fulfill", 200, "saved"]],
+    [["POST", run.baseUrl + "/api/client-events", {}], ["fulfill", 204, ""]],
+    [["DELETE", run.baseUrl + "/api/quote-sessions/" + id(1)], ["fulfill", 204, ""]],
+    [["POST", "https://other.example.test/api/quote-sessions", body], ["abort"]],
+  ];
+  for (const [args, expected] of cases) {
+    const fake = route(...args);
+    await stub(fake);
+    assert.deepEqual(fake.calls, [expected], args.slice(0, 2).join(" "));
+  }
+  assert.deepEqual(stubbed.map((entry) => entry.method), ["POST", "POST", "DELETE"]);
+  assert.ok(stubbed.every((entry) => !entry.path.includes("1111111111")), "ids in stubbed paths are masked");
+});
+
+test("writing to a hosted database, or anything on the copy of live, needs a fresh passing production-branch guard", async () => {
+  const args = (profile, host, ...extra) => ["--profile", profile, "--base-url", host, "--result", "r.json", ...extra];
+  const seed = (host, ...extra) => args("seed", host, "--ai-ok", "--ai-ledger", "l.json", ...extra);
+  const rehearsal = "https://quote-rehearsal.example.test";
+  const copy = "https://quote-rehearsal-copy.example.test";
+  const live = "https://quote-internal.example.test";
+  // Refused before any request: the database behind the app may be live's.
+  for (const argv of [seed(rehearsal), seed(copy), args("reopen", rehearsal, "--seed-file", "s.json"), args("verify", copy, "--seed-file", "s.json", "--no-ai"), args("live-readonly", copy)]) {
+    assert.throws(() => parseArgs(argv, env), /neon_branch_guard\.py/, argv.join(" "));
+  }
+  // Live itself and the loopback CI server take no guard: live is read-only and has no rehearsal database.
+  assert.equal(needsDbGuard(parseArgs(args("live-readonly", live), env)), false);
+  assert.equal(needsDbGuard(parseArgs(args("seed", "http://127.0.0.1:8000", "--allow-loopback-http", "--ai-ok", "--ai-ledger", "l.json"), env)), false);
+  // A passing, recent guard is read and its host and branch name are kept for the result.
+  const options = await loadRunInputs(parseArgs(seed(copy, "--db-guard", await guardFile()), env));
+  assert.deepEqual(Object.keys(options.dbGuardResult), ["host", "branch_name", "neon_api", "checked_at"]);
+  assert.equal(options.dbGuardResult.branch_name, "rehearsal-copy-abc1234");
+  const now = Date.now();
+  for (const bad of [{ status: "refused", reason: "target is a recorded production endpoint" }, { schema: "other/v1" }, { checked_at: new Date(now - DB_GUARD_MAX_AGE_MS - 60000).toISOString() }, { checked_at: null }]) {
+    await assert.rejects(readDbGuard(await guardFile(bad), now), UsageError, JSON.stringify(bad));
+  }
+  await assert.rejects(readDbGuard(path.join(os.tmpdir(), "no-such-guard.json")), /unreadable/);
+});
+
+const hex = (digit) => String(digit).repeat(64);
+const available = (digit, size) => ({ exists: true, stale: false, availability: "available", sha256: hex(digit), size_bytes: size });
+
+test("an Excel-only quote (the default) is checked on its XLSX and never fails on the missing PDF", () => {
+  // The readback shape of an XLSX-only generation: the PDF is not recorded.
+  const excelOnly = { exports: { xlsx: available(1, 900), pdf: { filename: null, exists: false, missing: false, stale: false, availability: "not_recorded" } } };
+  assert.deepEqual(exportFacts(excelOnly), {
+    xlsx: { available: true, sha256: hex(1), size_bytes: 900 },
+    pdf: { available: false, availability: "not_recorded" },
+  });
+  const stale = { exports: { xlsx: { ...available(1, 900), stale: true }, pdf: available(2, 50) } };
+  assert.equal(exportFacts(stale).xlsx.available, false);
+  assert.equal(exportFacts(stale).pdf.available, true);
+  assert.deepEqual(exportFacts({}), { xlsx: { available: false, availability: "not_recorded" }, pdf: { available: false, availability: "not_recorded" } });
+});
+
+test("Pass B compares live's recorded hashes with Pass A's, unless the quote changed after the copy", () => {
+  const files = { xlsx: { available: true, sha256: hex(1), size_bytes: 900 }, pdf: { available: false, availability: "not_recorded" } };
+  const expected = new Map([[id(1), { updated_at: "2026-11-20T01:00:00Z", files }]]);
+  assert.deepEqual(compareWithPassA(id(1), { updated_at: "2026-11-20T01:00:00Z" }, files, expected), { pass_a: "same files" });
+  const changed = { ...files, xlsx: { ...files.xlsx, sha256: hex(9) } };
+  assert.throws(() => compareWithPassA(id(1), { updated_at: "2026-11-20T01:00:00Z" }, changed, expected), /xlsx file differs/);
+  const gainedPdf = { ...files, pdf: { available: true, sha256: hex(2), size_bytes: 40 } };
+  assert.throws(() => compareWithPassA(id(1), { updated_at: "2026-11-20T01:00:00Z" }, gainedPdf, expected), /pdf file differs/);
+  assert.deepEqual(compareWithPassA(id(1), { updated_at: "2026-11-20T02:00:00Z" }, changed, expected), { pass_a: "changed since" });
+  assert.deepEqual(compareWithPassA(id(2), { updated_at: "x" }, files, expected), { pass_a: "not walked" });
+});
+
+test("Pass B takes only a passing Pass A walk that downloaded the files", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sqag-pass-a-"));
+  const write = async (body) => { const file = path.join(dir, "a.json"); await fs.writeFile(file, JSON.stringify(body)); return file; };
+  const step = { name: "quote 1 reopens read-only", status: "pass", detail: { id: id(1), updated_at: "t", files: { xlsx: { available: true, sha256: hex(1), size_bytes: 9 } } } };
+  const good = { schema: "sqag-rehearsal-check/v1", profile: "live-readonly", result: "pass", downloaded_files: true, steps: [step] };
+  assert.deepEqual([...(await readPassAFiles(await write(good))).keys()], [id(1)]);
+  for (const bad of [{ ...good, result: "fail" }, { ...good, downloaded_files: false }, { ...good, profile: "seed" }, { ...good, steps: [] }]) {
+    await assert.rejects(readPassAFiles(await write(bad)), UsageError);
+  }
+  await assert.rejects(readPassAFiles(path.join(dir, "missing.json")), /unreadable/);
 });
 
 function fakeRoute(method, url) {

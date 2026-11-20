@@ -189,7 +189,8 @@ or deployment behaviour changes accompany this test.
 - `Quote Basis click budget`: runs after the retrospective fixture and security
   gates pass, on `ubuntu-24.04` with a 20-minute timeout and no secrets. It
   installs the locked Node and Python dependencies and Playwright Chromium, then
-  runs `npm run playwright:click-budget` against the local synthetic server. It
+  runs `npm run playwright:click-budget` against the local synthetic server (probes and count checks
+  in `scripts/lib/basis-click-probe.mjs`, shared with Pass A of the live-data test). It
   fails when a Quote Basis tick or X writes the browser copy more than once,
   rewrites unchanged reference files, re-renders or rebuilds the list, saves the
   quote more than once per burst, sends files the server already has, or goes
@@ -323,7 +324,10 @@ or deployment behaviour changes accompany this test.
   check changes. The live-data end-to-end test (Pass A on a copy of live before the switch, Pass B
   read-only on live after it, `scripts/copy_live_objects_to_rehearsal.py`, `scripts/live_rollback.py`) is
   part of that manual procedure, run from the laptop; CI runs only its offline and loopback tests
-  (`tests/test_live_e2e.mjs` in the same npm step, the Python tests in the unittest step).
+  (`tests/test_live_e2e.mjs` in the same npm step, the Python tests in the unittest step). In database
+  mode the loopback run fails if Pass B changes any `sqag_` table's row count, telemetry included. The
+  production-branch guard (`scripts/neon_branch_guard.py`) is tested offline with a fake production
+  host; CI never calls Neon.
 - All six maintained inference operations require `OPENROUTER_API_KEY` and
   explicit `OPENROUTER_<SUFFIX>_MODEL`,
   `OPENROUTER_<SUFFIX>_REASONING_EFFORT` and

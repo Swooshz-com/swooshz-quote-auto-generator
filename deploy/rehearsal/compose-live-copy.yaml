@@ -1,5 +1,6 @@
 # SQAG live-data check (Pass A): the candidate image on a copy of live data.
-# Created, tested and deleted in step 8 of every release run, before live switches.
+# Created and tested in step 8 of every release run, before live switches; kept up for
+# the UAT on the copy (step 8.2) and deleted in step 9.
 # Map: deploy/rehearsal/resources.json, "live_copy". Run order:
 # docs/internal-uat-coolify-deploy.md, "Internal redeployment flow", step 8.
 # Check offline with: python scripts/check_rehearsal_map.py

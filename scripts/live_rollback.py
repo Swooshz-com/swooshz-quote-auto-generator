@@ -6,13 +6,16 @@ on the laptop, from a clean checkout of the deployment/internal branch:
 
     node <toolkit>/repo/scripts/toolkit-env.cjs run --names COOLIFY_SWOOSHZ_API_URL,COOLIFY_SWOOSHZ_API_TOKEN -- \
       python scripts/live_rollback.py --pass-b-result <live-walk.json> \
+        --live-url https://<live host> --switched-at <UTC time the live deploy finished> \
         --candidate-image sha256:<id> --candidate-source <40-char commit> \
         --previous-image sha256:<id> --previous-source <40-char commit> \
         --deploy-checkout <deployment/internal checkout> --live-app-uuid <uuid> \
         --record <rollback.json> --execute
 
 Only an explicit pass of the full walk keeps the candidate; a missing,
-unreadable or partial result rolls back. Before any effect it checks that the
+unreadable or partial result rolls back, and so does a result that did not
+walk live's host (--live-url, compared by hash), started before the switch
+(--switched-at), downloaded files or did not compare them with Pass A. Before any effect it checks that the
 checkout is the clean deployment/internal branch pinned to the candidate and
 that the Coolify app is live's (named quote-internal). Then: rewrite the pin
 to the previous image, commit, push (never forced), deploy the app with
@@ -27,6 +30,7 @@ not executed (no --execute); 2 refused before any effect; 1 rollback failed
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -34,7 +38,9 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -56,8 +62,29 @@ class Refusal(Exception):
     pass
 
 
-def walk_passed(result_path: Path) -> tuple[bool, str]:
-    """True only for a complete, passing live-data walk result."""
+def origin_sha256(url: str) -> str:
+    """Hash of the URL's origin as the walk records it (JavaScript's URL.origin)."""
+    parts = urllib.parse.urlsplit(url)
+    host = (parts.hostname or "").lower()
+    if parts.scheme != "https" or not host or parts.username or parts.password or parts.path not in ("", "/") or parts.query or parts.fragment:
+        raise Refusal("--live-url must be live's https origin with no path")
+    port = parts.port
+    origin = f"https://{host}" + (f":{port}" if port and port != 443 else "")
+    return hashlib.sha256(origin.encode("utf-8")).hexdigest()
+
+
+def utc_time(text: str, label: str) -> datetime:
+    try:
+        value = datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    except ValueError:
+        raise Refusal(f"{label} is not an ISO time") from None
+    if value.tzinfo is None:
+        raise Refusal(f"{label} must say its time zone (UTC)")
+    return value.astimezone(timezone.utc)
+
+
+def walk_passed(result_path: Path, live_origin_sha256: str, switched_at: datetime) -> tuple[bool, str]:
+    """True only for a complete, passing live-data walk of live, run after the switch."""
     try:
         result = json.loads(result_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
@@ -66,6 +93,16 @@ def walk_passed(result_path: Path) -> tuple[bool, str]:
         return False, "the Pass B result is not a live-readonly result"
     if result.get("result") != "pass":
         return False, "the Pass B walk failed"
+    if result.get("walked_origin_sha256") != live_origin_sha256:
+        return False, "the Pass B result did not walk live's host"
+    try:
+        started = utc_time(result.get("started_at"), "the Pass B start time")
+    except Refusal:
+        return False, "the Pass B result has no start time"
+    if started < switched_at:
+        return False, "the Pass B walk started before live switched to the candidate"
+    if result.get("downloaded_files") is not False or result.get("compared_with_pass_a") is not True:
+        return False, "the Pass B walk downloaded files or did not compare them with Pass A"
     steps = {step.get("name"): step.get("status") for step in result.get("steps") or [] if isinstance(step, dict)}
     for needed in ("walk targets", "served app.js", "no write attempted"):
         if steps.get(needed) != "pass":
@@ -178,7 +215,8 @@ class LiveRollback:
         return self.rolled_back_text()
 
     def run(self) -> int:
-        passed, reason = walk_passed(self.args.pass_b_result)
+        passed, reason = walk_passed(self.args.pass_b_result, origin_sha256(self.args.live_url),
+                                     utc_time(self.args.switched_at, "--switched-at"))
         self.record["decision"] = "keep" if passed else "rollback"
         self.record["reason"] = reason
         if passed:
@@ -217,6 +255,8 @@ class LiveRollback:
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Roll live back to the previous image when Pass B fails.")
     parser.add_argument("--pass-b-result", type=Path, required=True)
+    parser.add_argument("--live-url", required=True, help="live's https origin, as Pass B walked it")
+    parser.add_argument("--switched-at", required=True, help="UTC time the candidate's live deploy finished")
     parser.add_argument("--candidate-image", required=True)
     parser.add_argument("--candidate-source", required=True)
     parser.add_argument("--previous-image", required=True)

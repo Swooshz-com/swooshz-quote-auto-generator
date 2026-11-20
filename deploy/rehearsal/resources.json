@@ -36,7 +36,7 @@
       "name": "quote-rehearsal-copy",
       "lifetime": "per_run",
       "created_by": "Operator on the laptop, in Coolify, in step 8: a Docker Compose service on the same server and project as live, compose pasted from deploy/rehearsal/compose-live-copy.yaml, image the candidate. Variables as the rehearsal service, except the live_copy run values. Every change is applied with POST /api/v1/deploy?uuid=<service uuid>; a restart does not re-render the compose.",
-      "delete": "Delete the quote-rehearsal-copy service in Coolify with its containers right after Pass A. Its files stay in the rehearsal bucket until step 9 empties it."
+      "delete": "Kept up after Pass A for the agent's and then the owner's UAT on the copy (doc step 8), at most 24 hours unless the owner extends it. Delete it in Coolify with its containers in step 9, after the live deploy or when the owner abandons the candidate. Its files stay in the rehearsal bucket until step 9 empties it."
     },
     {
       "id": "r2-bucket",
@@ -73,7 +73,7 @@
       "branch_type": "with data, parent is live's default branch at a recorded time",
       "lifetime": "per_run",
       "created_by": "Operator on the laptop with Neon access, in step 8 before live switches: a branch of live's default branch WITH data at a recorded time (record it). Its rows, migration ledger and owners match live, so no ledger copy or owner change is needed. Then reset the passwords of the roles on the rehearsal-copy-<run id> branch, named by its branch id, so no live password is used. Never reset a password on the default branch. Apply the candidate's pending migrations on this branch only, as step 5 does on the rehearsal branch.",
-      "delete": "Delete the rehearsal-copy-<run id> branch in the swooshz-sqag project in the same run, after Pass A. Never delete a branch whose name does not start with rehearsal-."
+      "delete": "Delete the rehearsal-copy-<run id> branch in the swooshz-sqag project in step 9, with the copy service, after the live deploy or when the owner abandons the candidate. Never delete a branch whose name does not start with rehearsal-."
     },
     {
       "id": "run-secrets",
@@ -128,6 +128,14 @@
       "lifetime": "kept",
       "created_by": "Owner, once: an R2 API token with Object Read only on live's bucket, stored in the laptop credential store (toolkit-env) under the entry names listed here. Only scripts/copy_live_objects_to_rehearsal.py reads it, through toolkit env run, and the script refuses it if its access key id equals the rehearsal token's.",
       "delete": "Not deleted per run. The owner revokes the token when it is no longer wanted."
+    },
+    {
+      "id": "uat-login-password",
+      "kind": "credential_store_entry",
+      "name": "SWOOSHZ_SQAG_REHEARSAL_UAT_LOGIN_PASSWORD",
+      "lifetime": "per_run",
+      "created_by": "Generated on the laptop for one run straight into the credential store (toolkit-env), never shown in chat. It is the copy app's sign-in password for the owner's own email (live_copy.run_values), bound to the owner's user id on the copy only, never their live password. The owner reads it there for the UAT on the copy.",
+      "delete": "Removed with toolkit env in step 9, with the copy service."
     },
     {
       "id": "neon-access",
@@ -223,6 +231,20 @@
   },
   "image_retention": "Keep the current live image, the previous live image and the candidate. Removing any other image or old container is a separate owner-approved server action.",
   "workspace_id": "sqag-rehearsal",
+  "production_guard": {
+    "purpose": "Every step that writes to the copy's database (role password reset, migrations, the live object copy, seed and verify on the copy) runs scripts/neon_branch_guard.py first. It refuses a database host whose endpoint is listed here, a branch that is Neon's default or does not start with branch_prefix, or a host it cannot place. Names and ids only.",
+    "script": "scripts/neon_branch_guard.py",
+    "neon_project": "swooshz-sqag",
+    "branch_prefix": "rehearsal-",
+    "forbidden_endpoints": [
+      {
+        "name": "live default branch compute",
+        "endpoint_id": "ep-weathered-king-az5onvhs",
+        "branch_id": "br-blue-breeze-azlylkzw"
+      }
+    ],
+    "source": "Evidence store record alpha1-retirement-record-20261106 (live's default branch and its compute). The first run confirms both ids are still live's before relying on them."
+  },
   "live_copy": {
     "purpose": "Pass A of the live-data end-to-end test: the candidate image on a copy of live data, before live switches. Nothing is written to live.",
     "compose": "deploy/rehearsal/compose-live-copy.yaml",
@@ -237,11 +259,11 @@
     ],
     "run_values": {
       "SQAG_INTERNAL_WORKSPACE_ID": "Read on the data branch: the one workspace_id in public.sqag_quote_sessions, an opaque id. The copied rows and files are filed under it.",
-      "SQAG_INTERNAL_ALLOWED_EMAILS": "The operator's own sign-in email (SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_EMAIL), set from the credential store, so the copy shows the operator's quotes as live does.",
+      "SQAG_INTERNAL_ALLOWED_EMAILS": "The owner's own sign-in email (SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_EMAIL), set from the credential store, so the copy shows the owner's quotes and company profiles as live does.",
       "SQAG_INTERNAL_ALLOWED_EMAILS_ADMIN": "The same email.",
       "SQAG_INTERNAL_IDENTITY_BINDINGS_JSON": "[] when live has no identity binding for that email. If it has one, the owner supplies that one row; without it the walk fails with a not-owned quote, never a false pass.",
       "SQAG_DATABASE_URL": "The data branch's runtime URL after its password reset.",
-      "SQAG_INTERNAL_ADMIN_LOGIN_PASSWORD": "Generated for this run (the generated rule), never live's password. Pass A signs in with it as SQAG_REHEARSAL_LOGIN_PASSWORD."
+      "SQAG_INTERNAL_ADMIN_LOGIN_PASSWORD": "SWOOSHZ_SQAG_REHEARSAL_UAT_LOGIN_PASSWORD, generated for this run (the generated rule), never live's password. Pass A and the agent UAT sign in with it as SQAG_REHEARSAL_LOGIN_PASSWORD; the owner reads it from the credential store for the owner UAT."
     },
     "ai_cap_usd": 1
   }

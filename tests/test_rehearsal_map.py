@@ -21,13 +21,14 @@ SETTINGS = ROOT / "deploy" / "internal" / "release-settings.json"
 COPY_COMPOSE = ROOT / "deploy" / "rehearsal" / "compose-live-copy.yaml"
 MANIFEST = ROOT / "deploy" / "rehearsal" / "live-cases.json"
 COPY_SCRIPT = ROOT / "scripts" / "copy_live_objects_to_rehearsal.py"
+GUARD_SCRIPT = ROOT / "scripts" / "neon_branch_guard.py"
 
 
 class RehearsalMapTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.base = Path(self.tmp.name)
-        for source in (MAP, COMPOSE, SETTINGS, COPY_COMPOSE, MANIFEST, COPY_SCRIPT):
+        for source in (MAP, COMPOSE, SETTINGS, COPY_COMPOSE, MANIFEST, COPY_SCRIPT, GUARD_SCRIPT):
             target = self.base / source.relative_to(ROOT)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
@@ -214,6 +215,36 @@ class RehearsalMapTests(unittest.TestCase):
             change(data)
             errors = self.check_with(data)
             self.assertTrue(any(expected in e for e in errors), (expected, errors))
+
+    def test_production_guard_lists_live_endpoint_and_matches_the_branches(self) -> None:
+        guard = self.data["production_guard"]
+        self.assertTrue(guard["forbidden_endpoints"])
+        for entry in guard["forbidden_endpoints"]:
+            self.assertRegex(entry["endpoint_id"], r"^ep-")
+            self.assertRegex(entry["branch_id"], r"^br-")
+        cases = [
+            (lambda d: d.pop("production_guard"), "production_guard must list"),
+            (lambda d: d["production_guard"].update(forbidden_endpoints=[]), "forbidden_endpoints must list"),
+            (lambda d: d["production_guard"]["forbidden_endpoints"][0].update(endpoint_id="weathered"), "needs an endpoint_id"),
+            (lambda d: d["production_guard"]["forbidden_endpoints"][0].pop("branch_id"), "needs a branch_id"),
+            (lambda d: d["production_guard"].update(neon_project="other"), "neon_project must be the project"),
+            (lambda d: d["production_guard"].update(branch_prefix="copy-"), "branch_prefix must say rehearsal"),
+            (lambda d: d["production_guard"].update(script="scripts/missing.py"), "script must name a file"),
+            (lambda d: d["production_guard"].update(source=""), "source must say where"),
+        ]
+        for change, expected in cases:
+            data = copy.deepcopy(self.data)
+            change(data)
+            errors = self.check_with(data)
+            self.assertTrue(any(expected in e for e in errors), (expected, errors))
+
+    def test_copy_stays_up_for_uat_and_is_deleted_after_the_live_deploy(self) -> None:
+        resources = {r["id"]: r for r in self.data["resources"]}
+        for rid in ("coolify-copy-service", "neon-data-branch"):
+            self.assertIn("step 9", resources[rid]["delete"])
+            self.assertIn("after the live deploy", resources[rid]["delete"])
+        uat = resources["uat-login-password"]
+        self.assertEqual((uat["kind"], uat["lifetime"], uat["name"]), ("credential_store_entry", "per_run", "SWOOSHZ_SQAG_REHEARSAL_UAT_LOGIN_PASSWORD"))
 
     def test_data_branch_resets_its_own_passwords_and_stays_a_rehearsal_branch(self) -> None:
         for needle, _step in checker.DATA_BRANCH_CREATE_STEPS:

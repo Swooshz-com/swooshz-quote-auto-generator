@@ -6,8 +6,17 @@
 //        --base-url https://<host> --result <file.json>
 //        [--seed-file <seed result.json>] [--asset-out <app.js file>] [--no-ai]
 //        [--ai-ok --ai-ledger <run ledger.json> [--ai-cap-usd 1]]
-//        [--manifest deploy/rehearsal/live-cases.json [--targets-out <file.json> [--targets-only]]]
+//        [--manifest deploy/rehearsal/live-cases.json [--targets-out <file.json> [--targets-only]]
+//         [--download-files [--click-budget] | --expect-files <Pass A result.json>]]
+//        [--db-guard <neon_branch_guard result.json>]
 //        [--allow-loopback-http [--file-storage]]
+//
+// Database guard: a writing profile (seed, verify, reopen) on any non-loopback
+// host, and every run on the copy of live (a host that says rehearsal-copy),
+// needs --db-guard: the result of scripts/neon_branch_guard.py on the database
+// URL that app was given, passed and at most 12 hours old. The guard refuses
+// live's default (production) branch, so a mistyped database URL stops the run
+// before it writes to live. Its host and branch name go into the result.
 //
 // Paid AI (seed's pricing-reference enrichment, verify's image analysis) needs
 // --ai-ok and a ledger file shared by every check in the run; the run stops
@@ -18,6 +27,17 @@
 // the login owns, checks their files, blocks, booth box and quantity boxes,
 // and fails if anything tried to write. --targets-only stops after writing the
 // target ids (for the bucket copy) and the manifest candidates.
+// Downloads write a telemetry row on the server, so only Pass A (a rehearsal
+// host) may pass --download-files: it fetches each available export and checks
+// its bytes against the recorded hash. Pass B on live downloads nothing: it
+// compares each quote's recorded export hashes with Pass A's (--expect-files),
+// unless the quote changed after the copy was taken. --targets-out and
+// --download-files are refused on any host that does not say rehearsal.
+// --click-budget (Pass A only) runs the Quote Basis click probe
+// (scripts/lib/basis-click-probe.mjs, the CI click-budget job's) on the largest
+// manifest quotes, in a separate browser where every save is answered locally
+// and counted, so the copy stays unchanged. Exact counts fail the walk;
+// timings are recorded only. Never on live: a click there would save.
 //
 // Credentials come from the environment only, never arguments:
 //   SQAG_REHEARSAL_LOGIN_EMAIL, SQAG_REHEARSAL_LOGIN_PASSWORD: the rehearsal app's
@@ -42,6 +62,7 @@ import { signIn } from "./internal-password-browser-test.mjs";
 import { pdfFontNames, unexpectedPdfFonts, validatePdf, validateXlsx } from "./lib/artifact-checks.mjs";
 import { AI_CAP_MAX_USD, AI_PRICING_ENRICHMENT_USD, AiCapError, loadBudget, reportedUsd, saveBudget } from "./lib/ai-budget.mjs";
 import { derivedReasons, ManifestError, targetsDocument, validateManifest, walkTargets } from "./lib/live-cases.mjs";
+import { byteBudget, CLICK_COUNT_BUDGET, groupActions, installClickProbe, judgeClickCounts, lineButton, linesIn, measureClicks } from "./lib/basis-click-probe.mjs";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -53,10 +74,10 @@ const fixtureDir = path.join(root, "tests", "fixtures", "quote-generator", "pric
 const layoutFixture = path.join(root, "tests", "fixtures", "quote-generator", "profiles", "synthetic-exhibition-fixture-template", "quotation-layout.xlsx");
 const RESULT_SCHEMA = "sqag-rehearsal-check/v1";
 const PROFILES = ["seed", "verify", "reopen", "live-readonly"];
-const VALUE_FLAGS = new Set(["--profile", "--base-url", "--result", "--seed-file", "--asset-out", "--manifest", "--targets-out", "--ai-ledger", "--ai-cap-usd"]);
+const VALUE_FLAGS = new Set(["--profile", "--base-url", "--result", "--seed-file", "--asset-out", "--manifest", "--targets-out", "--ai-ledger", "--ai-cap-usd", "--expect-files", "--db-guard"]);
 const BOOLEAN_FLAGS = new Map([
   ["--no-ai", "noAi"], ["--allow-loopback-http", "allowLoopbackHttp"], ["--file-storage", "fileStorage"],
-  ["--ai-ok", "aiOk"], ["--targets-only", "targetsOnly"],
+  ["--ai-ok", "aiOk"], ["--targets-only", "targetsOnly"], ["--download-files", "downloadFiles"], ["--click-budget", "clickBudget"],
 ]);
 const REHEARSAL_LOGIN_ENV = { email: "SQAG_REHEARSAL_LOGIN_EMAIL", password: "SQAG_REHEARSAL_LOGIN_PASSWORD" };
 const LIVE_LOGIN_ENV = { email: "SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_EMAIL", password: "SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_PASSWORD" };
@@ -135,6 +156,10 @@ export function parseArgs(argv, env = process.env) {
   checkWalkFlags(options);
   checkAiFlags(options);
   options.baseUrl = checkBaseUrl(options.baseUrl, options.profile, options.allowLoopbackHttp, env);
+  checkWalkHost(options);
+  if (needsDbGuard(options) && !options.dbGuard) {
+    throw new UsageError("this run writes to a rehearsal database: run scripts/neon_branch_guard.py on its database URL first and pass --db-guard <result.json>");
+  }
   options.credentials = readCredentials(env, loginNames(options.profile, options.baseUrl));
   return options;
 }
@@ -152,8 +177,53 @@ function checkWalkFlags(options) {
   if (!walk && (options.manifest || options.targetsOut || options.targetsOnly)) {
     throw new UsageError("--manifest, --targets-out and --targets-only are for live-readonly only");
   }
+  if (!walk && (options.downloadFiles || options.expectFiles)) {
+    throw new UsageError("--download-files and --expect-files are for live-readonly only");
+  }
   if (options.targetsOut && !options.manifest) throw new UsageError("--targets-out needs --manifest");
   if (options.targetsOnly && !options.targetsOut) throw new UsageError("--targets-only needs --targets-out");
+  if ((options.downloadFiles || options.expectFiles) && !options.manifest) throw new UsageError("--download-files and --expect-files need --manifest");
+  if (options.downloadFiles && options.expectFiles) throw new UsageError("use --download-files (Pass A) or --expect-files (Pass B), not both");
+  if (options.clickBudget && !(walk && options.downloadFiles)) {
+    throw new UsageError("--click-budget is for Pass A only (live-readonly with --download-files on the copy of live)");
+  }
+}
+
+// Writes on the server (telemetry rows for downloads, full quote reads for the
+// candidate list) are only for the copy of live or a loopback test server.
+function checkWalkHost(options) {
+  if (!(options.downloadFiles || options.targetsOut)) return;
+  const host = new URL(options.baseUrl).hostname.toLowerCase();
+  if (!(LOOPBACK_HOSTS.has(host) || host.includes("rehearsal"))) {
+    throw new UsageError("--download-files and --targets-out are for the copy of live only (a host that says rehearsal)");
+  }
+}
+
+// Writing to a hosted database, or anything on the copy of live, needs the
+// production-branch guard's pass first.
+export function needsDbGuard(options) {
+  const host = new URL(options.baseUrl).hostname.toLowerCase();
+  if (LOOPBACK_HOSTS.has(host)) return false;
+  return options.profile !== "live-readonly" || host.includes("rehearsal-copy");
+}
+
+export const DB_GUARD_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+
+export async function readDbGuard(file, now = Date.now()) {
+  let guard;
+  try {
+    guard = JSON.parse(await fs.readFile(file, "utf8"));
+  } catch {
+    throw new UsageError("--db-guard is unreadable");
+  }
+  if (guard?.schema !== "sqag-db-guard/v1" || guard.status !== "pass") {
+    throw new UsageError("--db-guard is not a passing production-branch guard result: the database may be live's, so nothing was sent");
+  }
+  const checked = Date.parse(String(guard.checked_at || ""));
+  if (!Number.isFinite(checked) || checked > now + 60000 || now - checked > DB_GUARD_MAX_AGE_MS) {
+    throw new UsageError("--db-guard is older than 12 hours or undated: run the guard again");
+  }
+  return { host: String(guard.host || ""), branch_name: guard.branch_name ?? null, neon_api: String(guard.neon_api || ""), checked_at: guard.checked_at };
 }
 
 // Paid AI runs only with the owner's OK and a run ledger, refused before any request.
@@ -303,6 +373,8 @@ class Run {
     this.result = {
       schema: RESULT_SCHEMA, profile: options.profile, result: "running",
       no_ai: options.noAi, started_at: new Date().toISOString(), steps: [],
+      // The production-branch guard's verdict on this app's database (host and branch name only).
+      db_guard: options.dbGuardResult ?? null,
     };
     this.trace = { jobs: [], saves: [], normalizations: [], pending: [], sequence: 0 };
     // Paid AI goes through the run's capped ledger; a check without one refuses any paid call.
@@ -313,6 +385,11 @@ class Run {
       this.readOnly = { writes: [], blocked: [] };
       this.result.write_requests = this.readOnly.writes;
       this.result.blocked_requests = this.readOnly.blocked;
+      // Which app was walked (a hash, never the URL) and how, so the rollback
+      // can refuse a result from the copy or from another run.
+      this.result.walked_origin_sha256 = sha256(options.baseUrl);
+      this.result.downloaded_files = options.downloadFiles === true;
+      this.result.compared_with_pass_a = Boolean(options.expectFiles);
     }
   }
 
@@ -613,7 +690,7 @@ async function waitForJob(run, type, fromIndex, timeoutMs) {
   });
 }
 
-async function confirmAndGenerate(run, sessionId, fixture) {
+async function confirmAndGenerate(run, sessionId, fixture, { pdf: makePdf = true } = {}) {
   await reopenQuote(run, sessionId);
   const page = run.page;
   await page.locator("#sideNextButton").waitFor({ state: "visible", timeout: 15000 });
@@ -637,6 +714,13 @@ async function confirmAndGenerate(run, sessionId, fixture) {
   const xlsxTerminal = await waitForJob(run, "generate", xlsxJobs, GENERATION_TIMEOUT_MS);
   assert(xlsxTerminal.status === "completed" && xlsxTerminal.result?.status === "completed", `XLSX generation ended ${xlsxTerminal.status}.`);
   await downloadPromise;
+  if (!makePdf) {
+    // Excel-only, the app's default output: the PDF is never made.
+    const readback = await quoteSession(run, sessionId);
+    assert(readback.status?.quote_generated === true, "The generated quote is not marked current.");
+    assert(readback.exports?.pdf?.exists !== true, "An Excel-only quote has a PDF.");
+    return { readback, xlsx: await download(run, readback.exports?.xlsx, "xlsx"), pdf: null };
+  }
 
   const pdfJobs = run.trace.jobs.length;
   await page.locator("#sideViewPdfButton").click();
@@ -656,6 +740,7 @@ async function confirmAndGenerate(run, sessionId, fixture) {
 async function checkArtifacts(run, artifacts, projectNumber, fixture) {
   const lineAmounts = fixture.items.map((item) => Math.round(item.price * 100) / 100);
   const xlsx = await validateXlsx(artifacts.xlsx.file, [CUSTOMER, PROJECT, projectNumber, ...fixture.items.map((item) => item.description)], lineAmounts, null);
+  if (!artifacts.pdf) return { xlsx_sheets: xlsx.sheets };
   const pdf = await validatePdf(artifacts.pdf.file);
   const fonts = await pdfFontNames(artifacts.pdf.file);
   const unexpected = unexpectedPdfFonts(fonts);
@@ -685,7 +770,7 @@ async function readSeed(file) {
     throw new UsageError("--seed-file is unreadable");
   }
   const ids = seed?.seed;
-  if (seed?.schema !== RESULT_SCHEMA || seed.profile !== "seed" || seed.result !== "pass" || !ids?.published_session_id || !ids?.draft_session_id || !ids?.pricing_reference_id || !("company_profile_id" in ids)) {
+  if (seed?.schema !== RESULT_SCHEMA || seed.profile !== "seed" || seed.result !== "pass" || !ids?.published_session_id || !ids?.draft_session_id || !ids?.excel_only_session_id || !ids?.pricing_reference_id || !("company_profile_id" in ids)) {
     throw new UsageError("--seed-file is not a passed seed result");
   }
   return ids;
@@ -716,6 +801,15 @@ async function reopenSeed(run, seed) {
     await run.page.locator("#pricingMatchesBody tr").first().waitFor({ state: "visible", timeout: 20000 });
     return { xlsx_sha256: xlsx.sha256, pdf_sha256: pdf.sha256 };
   });
+  await run.step("Excel-only quote reopens", async () => {
+    const readback = await quoteSession(run, seed.excel_only_session_id);
+    const files = exportFacts(readback);
+    assert(files.xlsx.available && !files.pdf.available, "The Excel-only quote's files changed: it should have an XLSX and no PDF.");
+    const xlsx = await download(run, readback.exports.xlsx, "xlsx");
+    assert(xlsx.sha256 === seed.excel_only_xlsx_sha256, "The Excel-only quote's XLSX changed since the seed.");
+    await reopenQuote(run, seed.excel_only_session_id);
+    return { xlsx_sha256: xlsx.sha256 };
+  });
   await run.step("draft quote reopens", async () => {
     const readback = await quoteSession(run, seed.draft_session_id);
     assert(readback.customer_summary?.customer_name === CUSTOMER, "The draft quote lost its customer details.");
@@ -724,16 +818,17 @@ async function reopenSeed(run, seed) {
   });
 }
 
-async function newGeneratedQuote(run, images, fixture, label) {
+async function newGeneratedQuote(run, images, fixture, label, { pdf = true } = {}) {
   const projectNumber = `REH-${Date.now().toString(36).toUpperCase()}`;
   const sessionId = await run.step(`${label}: create quote`, () => createQuoteDraft(run, images, projectNumber));
   await run.step(`${label}: deterministic basis`, () => seedBasis(run, sessionId, fixture));
-  const artifacts = await run.step(`${label}: confirm and generate XLSX and PDF`, async () => {
-    const value = await confirmAndGenerate(run, sessionId, fixture);
+  const files = pdf ? "XLSX and PDF" : "XLSX only";
+  const artifacts = await run.step(`${label}: confirm and generate ${files}`, async () => {
+    const value = await confirmAndGenerate(run, sessionId, fixture, { pdf });
     run.lastArtifacts = value;
-    return { xlsx_sha256: value.xlsx.sha256, pdf_sha256: value.pdf.sha256 };
+    return { xlsx_sha256: value.xlsx.sha256, pdf_sha256: value.pdf?.sha256 ?? null };
   });
-  await run.step(`${label}: check XLSX, PDF and fonts`, () => checkArtifacts(run, run.lastArtifacts, projectNumber, fixture));
+  await run.step(pdf ? `${label}: check XLSX, PDF and fonts` : `${label}: check XLSX`, () => checkArtifacts(run, run.lastArtifacts, projectNumber, fixture));
   return { sessionId, artifacts };
 }
 
@@ -823,15 +918,48 @@ export async function basisPageChecks(page) {
   });
 }
 
+// An export is checked only when the quote has it now: Excel-only quotes (the
+// default) have no PDF, and that is recorded, never a failure.
+export function exportFacts(readback) {
+  const facts = {};
+  for (const kind of ["xlsx", "pdf"]) {
+    const record = readback?.exports?.[kind];
+    const available = record?.exists === true && record?.stale === false && /^[0-9a-f]{64}$/i.test(String(record?.sha256 || ""));
+    facts[kind] = available
+      ? { available: true, sha256: String(record.sha256).toLowerCase(), size_bytes: Number(record.size_bytes) }
+      : { available: false, availability: String(record?.availability || "not_recorded") };
+  }
+  return facts;
+}
+
+// Pass B: the recorded hashes on live must equal what Pass A downloaded from the
+// copy, unless the quote was saved again after the copy was taken.
+export function compareWithPassA(id, readback, files, expected) {
+  const before = expected.get(id);
+  if (!before) return { pass_a: "not walked" };
+  if (String(before.updated_at ?? "") !== String(readback?.updated_at ?? "")) return { pass_a: "changed since" };
+  for (const kind of ["xlsx", "pdf"]) {
+    const was = before.files?.[kind];
+    const now = files[kind];
+    if (!was?.available && !now.available) continue;
+    assert(was?.available === now.available && was?.sha256 === now.sha256 && was?.size_bytes === now.size_bytes,
+      `The ${kind} file differs from the one Pass A checked on the copy.`);
+  }
+  return { pass_a: "same files" };
+}
+
 async function walkQuote(run, sessionId) {
   const readback = await quoteSession(run, sessionId);
-  const detail = { generated: readback.status?.quote_generated === true };
-  if (detail.generated) {
-    // Existing files only: a GET of what is already stored, hashed against its record.
-    const xlsx = await download(run, readback.exports?.xlsx, "xlsx");
-    const pdf = await download(run, readback.exports?.pdf, "pdf");
-    Object.assign(detail, { xlsx_sha256: xlsx.sha256, pdf_sha256: pdf.sha256 });
+  const files = exportFacts(readback);
+  const { sections, lines } = derivedReasons(readback);
+  const detail = { generated: readback.status?.quote_generated === true, updated_at: readback.updated_at ?? null, sections, lines, files };
+  if (run.options.downloadFiles) {
+    // Pass A only: a GET of what is already stored, checked against its record.
+    for (const kind of ["xlsx", "pdf"]) {
+      if (files[kind].available) files[kind].downloaded = (await download(run, readback.exports[kind], kind)).sha256 === files[kind].sha256;
+    }
   }
+  if (run.options.expectedFiles) Object.assign(detail, compareWithPassA(sessionId, readback, files, run.options.expectedFiles));
   await freshPage(run);
   await openDashboard(run);
   await run.page.locator(`#dashboardSessionsList [data-quote-session-id="${sessionId}"]`).waitFor({ state: "attached", timeout: 20000 });
@@ -849,14 +977,22 @@ async function liveWalk(run, manifest) {
   const { ids, newest } = manifest;
   let list = [];
   await run.step("quote list matches the dashboard", async () => {
-    list = await quoteList(run);
-    await openDashboard(run);
-    // The dashboard fetches its list after the page shows; a timeout falls through to the count check.
-    await run.page.waitForFunction((count) => state.quoteSessions.length >= count, list.length, { timeout: 20000 }).catch(() => {});
-    const shown = await run.page.evaluate(() => state.quoteSessions.map((session) => session.session_id));
-    const listed = list.map((session) => session.session_id);
-    assert(shown.length === listed.length && listed.every((id) => shown.includes(id)), `The dashboard holds ${shown.length} quotes, the API lists ${listed.length}.`);
-    return { quotes: listed.length, own: list.filter((session) => !session.dashboard_summary_only).length };
+    // A teammate may add or delete a quote between the two reads on live, so
+    // a mismatch is read again once before it fails the walk.
+    let mismatch = "";
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      list = await quoteList(run);
+      await openDashboard(run);
+      // The dashboard fetches its list after the page shows; a timeout falls through to the count check.
+      await run.page.waitForFunction((count) => state.quoteSessions.length >= count, list.length, { timeout: 20000 }).catch(() => {});
+      const shown = await run.page.evaluate(() => state.quoteSessions.map((session) => session.session_id));
+      const listed = list.map((session) => session.session_id);
+      if (shown.length === listed.length && listed.every((id) => shown.includes(id))) {
+        return { quotes: listed.length, own: list.filter((session) => !session.dashboard_summary_only).length, attempts: attempt + 1 };
+      }
+      mismatch = `The dashboard holds ${shown.length} quotes, the API lists ${listed.length}.`;
+    }
+    throw new Error(mismatch);
   });
   const own = list.filter((session) => !session.dashboard_summary_only);
   await run.step("walk targets", () => {
@@ -881,8 +1017,119 @@ async function liveWalk(run, manifest) {
     });
   }
   if (run.options.targetsOnly) return;
+  const walked = [];
   for (const [index, id] of run.result.targets.entries()) {
-    await run.step(`quote ${index + 1} reopens read-only`, async () => ({ id, ...(await walkQuote(run, id)) }));
+    const detail = await run.step(`quote ${index + 1} reopens read-only`, async () => ({ id, ...(await walkQuote(run, id)) }));
+    if (ids.includes(id)) walked.push(detail);
+  }
+  if (run.options.clickBudget) {
+    const largest = walked.filter((detail) => detail.lines > 0).sort((a, b) => b.lines - a.lines).slice(0, CLICK_BUDGET_QUOTES);
+    if (!largest.length) await run.step("click budget", () => { throw new Error("No manifest quote has basis lines to click."); });
+    for (const [index, detail] of largest.entries()) {
+      await run.step(`click budget on quote ${index + 1}`, () => clickBudgetOnQuote(run, detail.id));
+    }
+  }
+}
+
+// Pass A's click probe runs on this many of the largest manifest quotes.
+const CLICK_BUDGET_QUOTES = 2;
+
+// The answer the server gives a quote save, built locally from the quote's
+// readback and the save body, so the app carries on as after a real save.
+// A new draft version each time; the ledger rows are the readback's.
+export function savedAck(readback, body) {
+  const { draft_state: _state, draft_files: _files, ...summary } = readback || {};
+  const rows = Object.fromEntries(Object.entries(readback?.pricing_ledger?.rows || {}).filter(([, revision]) => Number.isSafeInteger(revision) && revision >= 0));
+  const revision = Number.isSafeInteger(readback?.pricing_ledger?.revision) ? readback.pricing_ledger.revision : 0;
+  const draftVersion = sha256(JSON.stringify([body?.expected_draft_version ?? "", body?.draft_state ?? null, Date.now()]));
+  return { status: "saved", quote_session: { ...summary, session_id: body?.session_id, draft_version: draftVersion, pricing_ledger: { revision, rows } } };
+}
+
+// The probe browser's only route: reads go out; every write is answered here
+// and counted, never sent (quote saves get savedAck, anything else 204).
+export function saveStub(run, readback, stubbed) {
+  return async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const method = request.method();
+    if (READ_METHODS.has(method)) return route.continue();
+    if (url.origin !== run.baseUrl) return route.abort();
+    stubbed.push({ method, path: blockedPath(url.toString(), run.baseUrl) });
+    if (method === "POST" && url.pathname === "/api/quote-sessions") {
+      let body = null;
+      try { body = request.postDataJSON(); } catch { body = null; }
+      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(savedAck(readback, body)) });
+    }
+    return route.fulfill({ status: 204, body: "" });
+  };
+}
+
+async function clickBudgetOnQuote(run, sessionId) {
+  const readback = await quoteSession(run, sessionId);
+  const { cookies } = await run.context.storageState();
+  const context = await run.browser.newContext({ storageState: { cookies, origins: [] } });
+  const stubbed = [];
+  await context.route("**/*", saveStub(run, readback, stubbed));
+  try {
+    const page = await context.newPage();
+    const pageErrors = [];
+    page.on("pageerror", (error) => pageErrors.push(error.name));
+    const quotePosts = [];
+    page.on("request", (request) => {
+      if (request.method() !== "POST" || new URL(request.url()).pathname !== "/api/quote-sessions") return;
+      let files = -1;
+      try { const body = request.postDataJSON(); files = Array.isArray(body?.draft_files) ? body.draft_files.length : 0; } catch { files = -1; }
+      quotePosts.push({ files });
+    });
+    await page.goto(`${run.baseUrl}/`, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.locator(`#dashboardSessionsList [data-quote-session-id="${sessionId}"]`).waitFor({ state: "attached", timeout: 30000 });
+    assert(await page.evaluate((id) => modifyDashboardQuote(id), sessionId) === true, "The quote did not reopen for the click probe.");
+    await page.locator("#basisReviewSurface li[data-basis-key]").first().waitFor({ state: "visible", timeout: 30000 });
+    // The quote's own size sets the byte budgets (a click copies it once, a save about three times).
+    const quoteBytes = await page.evaluate(() => JSON.stringify(currentQuoteSessionDraftState()).length);
+    const budget = byteBudget(CLICK_COUNT_BUDGET, quoteBytes);
+    await installClickProbe(page);
+    const failures = [];
+    const check = (ok, message, detail) => { if (!ok) failures.push(message + (detail === undefined ? "" : ": " + JSON.stringify(detail))); };
+    const judge = (sample, posts) => judgeClickCounts(sample, posts, budget, check);
+    const samples = [];
+    const groups = {};
+    for (const group of ["Matched", "Review", "Unmatched"]) {
+      const lines = await linesIn(page, group);
+      groups[group] = lines.length;
+      if (!lines.length) continue;
+      for (const [action, click] of groupActions(page, lines[0])) samples.push(await measureClicks(page, { group, action, clicks: [click], quotePosts, judge }));
+    }
+    assert(samples.length > 0, "The quote shows no basis line to click.");
+    // Five fast clicks on three lines of the largest group arm one save, not five.
+    const burstGroup = Object.entries(groups).sort((a, b) => b[1] - a[1]).find(([, count]) => count >= 3)?.[0];
+    let burst = null;
+    if (burstGroup) {
+      const three = (await linesIn(page, burstGroup)).slice(0, 3);
+      burst = await measureClicks(page, {
+        group: burstGroup, action: "burst", expectedClicks: 5, touched: three, quotePosts, judge,
+        clicks: [() => lineButton(page, three[0], true), () => lineButton(page, three[1], true), () => lineButton(page, three[2], true),
+          () => lineButton(page, three[0], false), () => lineButton(page, three[1], false)],
+      });
+    }
+    check(pageErrors.length === 0, "the page threw errors", pageErrors);
+    const counts = (sample) => ({
+      group: sample.group, action: sample.action, clicks: sample.clicks, quote_local_storage_writes: sample.quoteLocalStorageWrites,
+      indexed_db_puts: sample.indexedDbPuts, basis_renders: sample.basisRenders, rebuilt_rows: sample.rebuiltRows, kept_rows: sample.keptRows,
+      serialised_bytes: sample.serialisedBytes, encoded_bytes: sample.encodedBytes, quote_saves: sample.quoteSaves,
+      // Timings vary with the laptop: recorded, never judged here.
+      input_to_paint_ms: Math.round(sample.inputToPaintMs), longest_frame_ms: Math.max(0, ...sample.clickFrames, ...sample.laterFrames),
+    });
+    const detail = {
+      id: sessionId, lines: derivedReasons(readback).lines, quote_bytes: quoteBytes, groups,
+      samples: samples.map(counts), burst: burst && counts(burst),
+      stubbed_saves: stubbed.filter((entry) => entry.method === "POST" && entry.path === "/api/quote-sessions").length,
+      stubbed_other: stubbed.length - stubbed.filter((entry) => entry.method === "POST" && entry.path === "/api/quote-sessions").length,
+    };
+    assert(failures.length === 0, `Click budget: ${failures.join("; ")}`);
+    return detail;
+  } finally {
+    await context.close().catch(() => {});
   }
 }
 
@@ -928,6 +1175,7 @@ export async function runChecks(options, playwright) {
         if (options.fileStorage) run.skip("company profile", "--file-storage: the server has no database company profiles.");
         else company = await run.step("company profile", () => seedCompanyProfile(run));
         const published = await newGeneratedQuote(run, images, fixture, "published quote");
+        const excelOnly = await newGeneratedQuote(run, images, fixture, "Excel-only quote", { pdf: false });
         const draftId = await run.step("draft quote", () => createQuoteDraft(run, images, `REH-DRAFT-${Date.now().toString(36).toUpperCase()}`));
         run.skip("damaged pricing reference", "No app route creates a damaged pack; the fail-closed message stays covered by the unit tests.");
         run.result.seed = {
@@ -936,6 +1184,8 @@ export async function runChecks(options, playwright) {
           published_session_id: published.sessionId,
           draft_session_id: draftId,
           published_exports: { xlsx_sha256: published.artifacts.xlsx_sha256, pdf_sha256: published.artifacts.pdf_sha256 },
+          excel_only_session_id: excelOnly.sessionId,
+          excel_only_xlsx_sha256: excelOnly.artifacts.xlsx_sha256,
         };
       } else {
         const seed = await readSeed(options.seedFile);
@@ -964,6 +1214,28 @@ export async function runChecks(options, playwright) {
   return run.result;
 }
 
+// Pass A's walk result: each reopened quote's id, saved time and the export
+// hashes it downloaded and checked on the copy.
+export async function readPassAFiles(file) {
+  let result;
+  try {
+    result = JSON.parse(await fs.readFile(file, "utf8"));
+  } catch {
+    throw new UsageError("--expect-files is unreadable");
+  }
+  if (result?.schema !== RESULT_SCHEMA || result.profile !== "live-readonly" || result.result !== "pass" || result.downloaded_files !== true) {
+    throw new UsageError("--expect-files must be a passing Pass A walk result (live-readonly with --download-files)");
+  }
+  const expected = new Map();
+  for (const step of result.steps || []) {
+    if (/^quote [0-9]+ reopens read-only$/.test(step?.name) && step.status === "pass" && step.detail?.id) {
+      expected.set(step.detail.id, { updated_at: step.detail.updated_at ?? null, files: step.detail.files || {} });
+    }
+  }
+  if (!expected.size) throw new UsageError("--expect-files holds no reopened quote");
+  return expected;
+}
+
 // File inputs, read before any request so a bad manifest or ledger stops the run.
 export async function loadRunInputs(options) {
   if (options.manifest) {
@@ -976,6 +1248,8 @@ export async function loadRunInputs(options) {
     // Listing candidates for the owner to approve is the one use of an unapproved manifest.
     options.manifestIds = validateManifest(manifest, { requireApproval: !options.targetsOnly });
   }
+  if (options.dbGuard) options.dbGuardResult = await readDbGuard(options.dbGuard);
+  if (options.expectFiles) options.expectedFiles = await readPassAFiles(options.expectFiles);
   if (aiNeeded(options)) options.budget = await loadBudget(options.aiLedger, { ok: options.aiOk, capUsd: options.aiCapUsd });
   return options;
 }

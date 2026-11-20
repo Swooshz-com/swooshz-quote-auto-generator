@@ -13,7 +13,10 @@ Fails when:
   other third-party container), publishes a host port, mounts a volume or
   host path, or loads an env file;
 - storage is not the map's rehearsal-only bucket, or the bucket has no
-  clear step.
+  clear step;
+- the production guard does not list live's default-branch endpoint, its
+  project or branch prefix differ from the Neon branch resources, or its
+  script is missing.
 
 It reads only repository files. It never reads env values.
 """
@@ -505,6 +508,43 @@ def check_live_copy(data: dict[str, Any], base: Path, compose: dict[str, Any]) -
     return errors
 
 
+ENDPOINT_ID_RE = re.compile(r"^ep-[a-z0-9]+(?:-[a-z0-9]+)*$")
+BRANCH_ID_RE = re.compile(r"^br-[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def check_production_guard(data: dict[str, Any], base: Path) -> list[str]:
+    """The guard that keeps every copy write off live's database reads this
+    section, so a missing or malformed record would let it pass nothing or
+    the wrong thing."""
+    guard = data.get("production_guard")
+    if not isinstance(guard, dict):
+        return ["production_guard must list live's Neon endpoints (neon_project, branch_prefix, forbidden_endpoints)"]
+    errors: list[str] = []
+    if not (base / str(guard.get("script") or "")).is_file():
+        errors.append("production_guard.script must name a file in the repository")
+    branches = [r for r in data.get("resources") or [] if isinstance(r, dict) and r.get("kind") == "neon_branch"]
+    projects = {str(r.get("project") or "") for r in branches}
+    if not guard.get("neon_project") or projects != {guard.get("neon_project")}:
+        errors.append("production_guard.neon_project must be the project of every neon_branch resource")
+    prefix = str(guard.get("branch_prefix") or "")
+    if "rehearsal" not in prefix or not branches or not all(str(r.get("name") or "").startswith(prefix) for r in branches):
+        errors.append("production_guard.branch_prefix must say rehearsal and start every neon_branch name")
+    endpoints = guard.get("forbidden_endpoints")
+    if not isinstance(endpoints, list) or not endpoints:
+        return errors + ["production_guard.forbidden_endpoints must list live's default-branch endpoint"]
+    for entry in endpoints:
+        if not isinstance(entry, dict) or not str(entry.get("name") or "").strip():
+            errors.append("each production_guard.forbidden_endpoints entry needs a name")
+            continue
+        if not ENDPOINT_ID_RE.fullmatch(str(entry.get("endpoint_id") or "")):
+            errors.append(f"production_guard endpoint {entry.get('name')!r} needs an endpoint_id like ep-...")
+        if not BRANCH_ID_RE.fullmatch(str(entry.get("branch_id") or "")):
+            errors.append(f"production_guard endpoint {entry.get('name')!r} needs a branch_id like br-...")
+    if not str(guard.get("source") or "").strip():
+        errors.append("production_guard.source must say where the ids were read")
+    return errors
+
+
 def run_checks(map_path: Path) -> list[str]:
     try:
         data = json.loads(map_path.read_text(encoding="utf-8"))
@@ -533,6 +573,7 @@ def run_checks(map_path: Path) -> list[str]:
     errors += compose_errors
     errors += check_env_sources(data, settings, app_env)
     errors += check_live_copy(data, base, compose)
+    errors += check_production_guard(data, base)
     return errors
 
 
