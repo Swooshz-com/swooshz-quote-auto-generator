@@ -291,6 +291,11 @@ async function waitUntil(predicate, label, timeoutMs = 20000) {
   throw new Error(`Timed out waiting for ${label}.`);
 }
 
+const NO_PAID_AI = Object.freeze({
+  admit(label) { throw new AiCapError(`${label}: this check has no AI ledger, so it makes no paid AI call`); },
+  record(label) { throw new AiCapError(`${label}: this check has no AI ledger, so it makes no paid AI call`); },
+});
+
 class Run {
   constructor(options) {
     this.options = options;
@@ -300,6 +305,8 @@ class Run {
       no_ai: options.noAi, started_at: new Date().toISOString(), steps: [],
     };
     this.trace = { jobs: [], saves: [], normalizations: [], pending: [], sequence: 0 };
+    // Paid AI goes through the run's capped ledger; a check without one refuses any paid call.
+    this.budget = options.budget ?? NO_PAID_AI;
     this.readOnly = null;
     if (options.profile === "live-readonly") {
       // Attached before the first step so a failed run still shows what was tried.
@@ -948,6 +955,7 @@ export async function runChecks(options, playwright) {
     if (run.api) await run.api.dispose().catch(() => {});
     if (browser) await browser.close().catch(() => {});
     await fs.rm(run.workDir, { recursive: true, force: true }).catch(() => {});
+    if (options.budget) run.result.ai_budget = options.budget.summary();
     run.result.finished_at = new Date().toISOString();
   }
   return run.result;

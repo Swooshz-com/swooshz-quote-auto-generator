@@ -75,7 +75,7 @@ test("credentials are refused as arguments and never echoed", () => {
   }
   assert.throws(() => parseArgs([...base, "positional-value"], env()), /not shown/);
   assert.throws(() => parseArgs(base, env({ SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_EMAIL: "" })), /SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_EMAIL/);
-  const seedArgs = ["--profile", "seed", "--base-url", "https://quote-rehearsal.example.test", "--result", "r.json"];
+  const seedArgs = ["--profile", "seed", "--base-url", "https://quote-rehearsal.example.test", "--result", "r.json", "--ai-ok", "--ai-ledger", "l.json"];
   assert.throws(() => parseArgs(seedArgs, env({ SQAG_REHEARSAL_LOGIN_EMAIL: "" })), /SQAG_REHEARSAL_LOGIN_EMAIL/);
   // Rehearsal logins never reach live: live-readonly reads only the live sign-in names.
   const rehearsalOnly = { ...process.env, SQAG_REHEARSAL_LOGIN_EMAIL: syntheticEmail, SQAG_REHEARSAL_LOGIN_PASSWORD: syntheticPassword };
