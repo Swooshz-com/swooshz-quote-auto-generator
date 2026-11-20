@@ -1,5 +1,5 @@
-# AI-AGENT-TOOLKIT:cloud-workflows:RENDERED programme-sweep toolkit=d667ad5d05304776e67d8789bf83924e71086485 sha256=57249df4b241
-# A copy of the Toolkit's own workflow, pinned to the Toolkit commit above. Do not edit it here: refresh the repository rules to update it.
+# AI-AGENT-TOOLKIT:cloud-workflows:RENDERED programme-sweep toolkit=82306852ca9e5207af491b4169a6c52cd1c1555d sha256=b92c25bf0259 layout=1
+# A copy of the Toolkit's own workflow, rendered at the Toolkit commit above. It runs Toolkit main, or the commit this repository's TOOLKIT_REF variable pins. Do not edit it here: refresh the repository rules to update it.
 # Toolkit Programme Sweep: the programme refresh, run on GitHub instead of a computer.
 #
 # After every push to main (a merged pull request), when started by hand, and when the gate
@@ -9,7 +9,8 @@
 # built-in token, and starts this workflow on main only when there is work, so a quiet hour costs
 # seconds.
 # It runs the Toolkit's `programme.cjs refresh` (from this run's commit in the Toolkit; a governed
-# repository's copy checks the Toolkit out at a pinned commit) under the governance GitHub App:
+# repository's copy checks out Toolkit main, or the commit its TOOLKIT_REF variable pins) under the
+# governance GitHub App:
 # two installation tokens, one for this repository (issues, pull requests, checks) and one for the
 # evidence store (contents), each minted with only its own permissions. The built-in token is
 # contents read only, the checkout keeps no credentials, and no token or key is printed.
@@ -82,7 +83,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: weijunswj/ai-agent-toolkit
-          ref: d667ad5d05304776e67d8789bf83924e71086485
+          ref: ${{ vars.TOOLKIT_REF || 'main' }}
           path: .toolkit
           persist-credentials: false
 
@@ -161,7 +162,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: weijunswj/ai-agent-toolkit
-          ref: d667ad5d05304776e67d8789bf83924e71086485
+          ref: ${{ vars.TOOLKIT_REF || 'main' }}
           path: .toolkit
           persist-credentials: false
           sparse-checkout: repo/scripts/toolkit-programme-sweep-gate.cjs
