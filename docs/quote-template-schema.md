@@ -15,6 +15,11 @@ Profiles without a template keep using their own layout workbook exactly as
 today. Storage, permissions, the editor and choosing a template for a profile
 come in later slices.
 
+`scripts/generate_quote.py` renders a quote with a template through
+`write_template_quote_xlsx`, or from the command line with
+`--quote-template PATH`. It builds a new workbook with the standard library
+only and writes all text as inline strings.
+
 ## Reading rules
 
 - **Default-deny.** Every object lists its keys below. An unknown key, a missing
@@ -25,7 +30,8 @@ come in later slices.
   keys, no `NaN` or `Infinity`, no nesting deep enough to exhaust the parser.
   An already-parsed object must hold only JSON values and obeys the same size cap.
 - **Numbers:** whole numbers must be JSON integers (`true` and `61.0` are refused);
-  every number must be finite and inside its range.
+  every number must be finite and inside its range. Number text longer than 32
+  characters is refused, so huge numbers fail with a path, not a crash.
 - **Text:** trimmed and NFC-normalised. Any control, format (including bidi
   overrides and zero-width characters), surrogate, private-use, unassigned,
   line-separator or paragraph-separator character is refused. Text that starts
@@ -58,7 +64,11 @@ come in later slices.
 larger than the top or bottom margin). `row_height_pt` is 12 to 40.
 `first_page_rows` and `page_rows` (20 to 150) are the printable rows on page 1
 and on each later page; `continuation_top_rows` (0 to 10, default 2) is the gap
-above the repeated item-table header on later pages.
+above the repeated item-table header on later pages. The rows must fit the
+paper: the sheet prints scaled to the width of the visible columns, so page
+height divided by that scaled row height limits the rows per page. Too many
+rows spill onto extra printed pages. The reader cannot check this exactly
+(the print scale depends on the PDF renderer), so the editor must preview it.
 
 ## Blocks
 
@@ -71,11 +81,14 @@ columns, inside the grid) and an optional `style` (`font`, `size_pt`, `bold`,
 - **Body blocks** flow down the page in list order. Optional `gap_before`
   (0 to 10 blank rows, default 1) and `beside` (default false): a block with
   `beside: true` shares the previous block's rows and must not overlap its
-  columns. The item table and totals always stand on their own rows.
+  columns. The item table and totals always stand on their own rows. A block
+  with nothing to show (a quote without notes) takes no rows and its gap is
+  skipped. Blocks that do not fit on a page move to the next one, below the
+  repeated item-table header.
 
 | Type | Area | Extra keys | Count |
 | --- | --- | --- | --- |
-| `logo` | header | `logo`: `width_mm` 5 to 120, `height_mm` 5 to 80, `align`, `valign` (`top`, `middle`, `bottom`), `keep_aspect`, `repeat` (also show it at the same place on every later page) | at most 1 |
+| `logo` | header | `logo`: `width_mm` 5 to 120, `height_mm` 5 to 80 (the picture's box, which may extend past the block's cells), `align`, `valign` (`top`, `middle`, `bottom`: place the box inside the block's cells), `keep_aspect`, `repeat` (also show it at the same place on every later page) | at most 1 |
 | `company_details` | header | `fields` from `header_lines`, `project_number`, `blank` | at most 1 |
 | `client_details` | header | `fields` from `client_name`, `client_address`, `attention`, `client_title`, `blank`; `address_rows` 1 to 6; `indent_cols` 0 to span-1 | at most 1 |
 | `quote_details` | header | `fields` from `quote_date`, `project_title`, `project_number`, `blank` | at most 1 |
@@ -95,10 +108,13 @@ Item-table column keys: `position`, `quantity`, `unit`, `description`,
 required. Columns sit inside the table block, must not overlap, and must not
 start on a hidden grid column.
 
+Every block must cover at least one visible grid column.
+
 Totals rules: the totals block comes after the item table, covers the item
 table's `amount` column (totals amounts are written there), and keeps its label
-and currency on their own visible columns. Prices, quantities, tax and totals are
-calculated exactly as for every other quote; a template only places them.
+(and currency, if any) on separate visible columns, neither of them a cell of
+the amount column (including the second cell of a two-column amount). Prices,
+quantities, tax and totals are calculated exactly as for every other quote; a template only places them.
 
 ## Standard template
 

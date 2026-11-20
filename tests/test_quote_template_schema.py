@@ -2,6 +2,7 @@ import copy
 import json
 import sys
 import unittest
+from unittest import mock
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -168,7 +169,7 @@ class HostileDefinitionTest(unittest.TestCase):
                 self.assert_refused(mutated(lambda d: block(d, "terms")["style"].update({"font": font})), "blocks[7].style.font")
 
     def test_hidden_and_control_characters_in_text_are_refused(self):
-        for character in ("‮", "⁦", "​", "﻿", "\u0000", "\n", "\r", "\t", " ", " ", "", "\u0085"):
+        for character in ("\u202e", "\u2066", "\u200b", "\ufeff", "\u0000", "\n", "\r", "\t", "\u2028", "\u2029", "\ue000", "\u0085"):
             with self.subTest(code_point=f"U+{ord(character):04X}"):
                 label = f"Pos{character}."
                 self.assert_refused(
@@ -214,6 +215,15 @@ class HostileDefinitionTest(unittest.TestCase):
             ),
             "totals miss amount column": (lambda d: block(d, "totals").update({"col": 6, "span": 1, "label_col": 6, "currency_col": 0}), "blocks"),
             "totals label on amount column": (lambda d: block(d, "totals").update({"label_col": 5}), "blocks"),
+            "totals label and currency share a column": (lambda d: block(d, "totals").update({"currency_col": 4}), "blocks"),
+            "totals currency on second amount cell": (
+                lambda d: (block(d, "item_table").update({"span": 6}), block(d, "item_table")["columns"][3].update({"span": 2})),
+                "blocks",
+            ),
+            "body block wholly on hidden columns": (lambda d: d["blocks"].append({
+                "type": "free_text", "area": "body", "col": 7, "span": 2, "heading": "Hidden", "lines": [],
+            }), "blocks[11]"),
+            "header block wholly on hidden columns": (lambda d: block(d, "logo").update({"col": 8}), "blocks[0]"),
             "header blocks overlap": (lambda d: block(d, "quote_details").update({"row": 12}), "blocks[3]"),
             "header type in body": (lambda d: block(d, "logo").update({"area": "body"}), "blocks[0].area"),
             "body type in header": (lambda d: block(d, "terms").update({"area": "header", "row": 1, "rows": 1}), "blocks[7].area"),
@@ -224,6 +234,10 @@ class HostileDefinitionTest(unittest.TestCase):
             "too many free text": (lambda d: d["blocks"].extend(copy.deepcopy(block(d, "free_text")) for _ in range(10)), "blocks"),
             "too many blocks": (lambda d: d["blocks"].extend([copy.deepcopy(block(d, "free_text"))] * 20), "blocks"),
             "empty free text": (lambda d: block(d, "free_text").update({"heading": "", "lines": [" "]}), "blocks[6]"),
+            "header free text overflows rows": (lambda d: d["blocks"].append({
+                "type": "free_text", "area": "header", "row": 1, "rows": 1, "col": 1, "span": 3,
+                "heading": "Quotation", "lines": ["Valid for 30 days"],
+            }), "blocks[11].rows"),
             "terms with one column": (lambda d: block(d, "terms").update({"span": 1}), "blocks[7].span"),
             "client fields overflow rows": (lambda d: block(d, "client_details").update({"address_rows": 5}), "blocks[2].rows"),
             "quote fields overflow rows": (lambda d: block(d, "quote_details")["fields"].append("project_number"), "blocks[3].rows"),
@@ -243,11 +257,10 @@ class HostileDefinitionTest(unittest.TestCase):
             "duplicate key": standard_text.replace('"name": "Standard"', '"name": "Standard", "name": "Other"'),
             "NaN": standard_text.replace('"row_height_pt": 18.7', '"row_height_pt": NaN'),
             "Infinity": standard_text.replace('"row_height_pt": 18.7', '"row_height_pt": Infinity'),
-            "byte order mark": "﻿" + standard_text,
+            "byte order mark": "\ufeff" + standard_text,
             "trailing garbage": standard_text + "]",
             "not an object": "[]",
             "deep nesting": '{"schema": ' + "[" * 30000 + "]" * 30000 + "}",
-            "oversized": standard_text[:-1] + ', "pad": "' + "x" * qt.MAX_DEFINITION_BYTES + '"}',
         }
         for name, text in cases.items():
             with self.subTest(case=name):
@@ -264,11 +277,42 @@ class HostileDefinitionTest(unittest.TestCase):
         }.items():
             with self.subTest(case=name):
                 self.assert_refused(mutated(change), "definition")
-        oversized = mutated(lambda d: block(d, "free_text")["lines"].__setitem__(0, "x" * qt.MAX_DEFINITION_BYTES))
-        self.assert_refused(oversized, "definition")
         source = mutated(lambda d: None)
         qt.read_quote_template(source)
         self.assertEqual(source, STANDARD_RAW)
+
+    def test_definitions_over_64_kib_are_refused_only_for_their_size(self):
+        def fill(definition):
+            for _ in range(9):
+                definition["blocks"].append({
+                    "type": "free_text", "area": "body", "col": 1, "span": 9,
+                    "heading": "Notes", "lines": ["\u20ac" * 200] * 20,
+                })
+
+        oversized = mutated(fill)
+        text = json.dumps(oversized, ensure_ascii=False)
+        self.assertGreater(len(text.encode("utf-8")), qt.MAX_DEFINITION_BYTES)
+        self.assert_refused(oversized, "definition")
+        self.assert_refused(text, "definition")
+        self.assert_refused(text.encode("utf-8"), "definition")
+        # Without the cap the same definition is valid, so the cap is what refuses it.
+        with mock.patch.object(qt, "MAX_DEFINITION_BYTES", 10 * qt.MAX_DEFINITION_BYTES):
+            self.assertEqual(len(qt.read_quote_template(oversized)["blocks"]), 20)
+            self.assertEqual(len(qt.read_quote_template(text)["blocks"]), 20)
+
+    def test_huge_numbers_and_lone_surrogates_are_refused_with_a_path(self):
+        standard_text = json.dumps(STANDARD_RAW)
+        for digits in (400, 5000):
+            with self.subTest(digits=digits):
+                huge = "1" + "0" * digits
+                self.assert_refused(standard_text.replace('"row_height_pt": 18.7', f'"row_height_pt": {huge}'), "definition")
+                self.assert_refused(standard_text.replace('"page_rows": 61', f'"page_rows": {huge}'), "definition")
+                self.assert_refused(standard_text.replace('"row_height_pt": 18.7', f'"row_height_pt": {huge}.5'), "definition")
+        self.assert_refused(standard_text.replace('"row_height_pt": 18.7', '"row_height_pt": 1e400'), "definition")
+        self.assert_refused(mutated(lambda d: d["page"].update({"row_height_pt": 10 ** 400})), "page.row_height_pt")
+        self.assert_refused(mutated(lambda d: d["page"].update({"row_height_pt": -(10 ** 400)})), "page.row_height_pt")
+        self.assert_refused(mutated(lambda d: d.update({"name": "Std\ud800"})), "definition")
+        self.assert_refused(mutated(lambda d: d["theme"].update({"\udc00": 1})), "definition")
 
     def test_reader_names_a_path_for_every_refusal(self):
         error = None
