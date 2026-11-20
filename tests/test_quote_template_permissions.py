@@ -116,6 +116,41 @@ class QuoteTemplatePermissionsTest(unittest.TestCase):
                 self.assertEqual(self.call(admin, method, route, payload)[0], status_expected)
         self.assertEqual(len(self.saved_rows()), 1)
 
+    def test_refused_saves_say_why_without_internals(self):
+        admin = self.login(auth_http.email())
+        base = "/api/settings/quote-templates"
+        for name in ("First", "Second"):
+            status, body = self.call(admin, "POST", base, {"definition": definition(name)})
+            self.assertEqual(status, 200, body)
+        saved = body["template"]
+        missing = "tpl-" + "0" * 32
+        cases = (
+            # (refusal, method, route, body, status, reason, message)
+            ("at the limit", "POST", base, {"definition": definition("One too many")}, 409, "template_limit_reached",
+             "This workspace already has 2 quote templates, the most it can keep. Delete one before adding another."),
+            ("old save number", "POST", f"{base}/{saved['id']}", {"definition": definition("Stale"), "save_number": 7},
+             409, "template_save_conflict", "This template changed since it was opened. Reload it before trying again."),
+            ("old save number on delete", "DELETE", f"{base}/{saved['id']}?save_number=7", None,
+             409, "template_save_conflict", "This template changed since it was opened. Reload it before trying again."),
+            ("missing template", "DELETE", f"{base}/{missing}?save_number=1", None, 404, "template_not_found",
+             "Quote template not found."),
+            ("Standard is built in", "DELETE", f"{base}/standard?save_number=0", None, 403, "template_builtin",
+             "The Standard template is built in and cannot be changed or deleted."),
+            ("profile names a missing template", "POST", "/api/settings/profiles",
+             {"operation": "create", "id": "synthetic-refusal", "label": "Synthetic refusal", "defaults": {},
+              "quote_template_id": missing}, 400, "template_not_found",
+             "The chosen quote template does not exist. Pick another template."),
+        )
+        with mock.patch.dict(os.environ, {s.QUOTE_TEMPLATE_LIMIT_ENV_NAME: "2"}):
+            for refusal, method, route, payload, status_expected, reason, message in cases:
+                with self.subTest(refusal=refusal):
+                    status, body = self.call(admin, method, route, payload)
+                    self.assertEqual((status, body.get("reason"), body.get("errors")), (status_expected, reason, [message]))
+                    self.assertRegex(body.get("error_reference", ""), r"^ERR-[0-9A-F]{8}$")
+                    for internal in ("sqag_quote_templates", "Traceback", "workspace_id", self.workspace):
+                        self.assertNotIn(internal, json.dumps(body))
+        self.assertEqual(sorted(row["name"] for row in self.saved_rows()), ["First", "Second"])
+
     def test_profile_links_follow_profile_privacy(self):
         admin, operator = self.login(auth_http.email()), self.login(auth_http.email("operator"))
         status, body = self.call(admin, "POST", "/api/settings/quote-templates", {"definition": definition("Linked")})

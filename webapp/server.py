@@ -12191,6 +12191,11 @@ def safe_auth_session_for_async(session: dict[str, Any] | None) -> dict[str, Any
     }
 
 
+QUOTE_TEMPLATE_REFUSAL_REASONS = frozenset({
+    "template_limit_reached", "template_save_conflict", "template_not_found", "template_builtin",
+})
+
+
 def storage_access_error_payload(exc: SqagStorageAccessError) -> dict[str, Any]:
     error_reference = new_error_reference()
     write_local_log("server_error", {"error_reference": error_reference, "reason": exc.reason, "status": exc.status, "errors": safe_error_messages([str(exc)])})
@@ -12201,6 +12206,9 @@ def storage_access_error_payload(exc: SqagStorageAccessError) -> dict[str, Any]:
             "reason": exc.reason,
             "error_reference": error_reference,
         }
+    if exc.reason in QUOTE_TEMPLATE_REFUSAL_REASONS:
+        # Refusals the user can act on: the message is fixed text written for them, never an internal error.
+        return {"status": "blocked", "errors": [str(exc)], "reason": exc.reason, "error_reference": error_reference}
     message = (
         QUOTE_SESSION_RETIRED_MESSAGE
         if exc.reason == "quote_session_retired"

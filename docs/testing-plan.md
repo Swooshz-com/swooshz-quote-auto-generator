@@ -755,7 +755,10 @@ the owner-approved CI lane.
   templates, only admins read, check, save, delete or set the default,
   platform viewers are refused on every route, signed-out and CSRF-less calls
   change nothing, template links never open another member's personal profile,
-  and staff linking a shared profile get 404 with nothing changed. Generation
+  staff linking a shared profile get 404 with nothing changed, and refused
+  saves (limit, old save number, missing or built-in template, a profile naming
+  a missing template) return their own reason and message, not the generic
+  storage error. Generation
   runs the real generator through the job path: which template a profile gets
   (including the note when its template was deleted), the run record, old
   quotes downloaded byte-identical over HTTP after the template is edited or
