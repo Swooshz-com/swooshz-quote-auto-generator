@@ -11,15 +11,21 @@ Every rule fails closed:
 - the URL must name exactly one Neon endpoint host (ep-<id>, optionally ep-<id>-pooler,
   under .neon.tech), with no second host and no host override in its query (host,
   hostaddr, service, or options and sslsni, which can name another endpoint);
-- that endpoint id must not be a recorded production endpoint;
-- when NEON_API_KEY is set (even blank, which then fails), the Neon API must answer: the
-  endpoint's branch must not be the default, must not be a recorded production branch,
-  and must start with the rehearsal prefix; the result then records the branch id for
-  the role password reset. Without the key only the endpoint rule applies and the result
-  says neon_api not_checked.
+- that endpoint id must not be a recorded production endpoint, nor start with one followed
+  by "-" (Neon's per-compute hosts of the same endpoint, such as ep-<id>-gvz-pooler);
+- when NEONDB_SWOOSHZ_SQAG_API_KEY (the key's credential-store name) is set, even blank,
+  which then fails, the Neon API must answer: the map's project is found by its name, or,
+  when Neon refuses to list projects (HTTP 404 for a key scoped to one project), by the
+  map's neon_project_id, which must name that project. The endpoint's branch must not be
+  the default, must not be a recorded production branch, and must start with the rehearsal
+  prefix; the result then records the branch id for the role password reset. Without the
+  key only the endpoint rules apply and the result says neon_api not_checked.
 
 scripts/rehearsal_database_url.py re-runs this check on every URL it writes to a rehearsal
 service or hands to a migration step, and refuses one that is not on the guarded endpoint.
+Every step that writes to a rehearsal branch or bucket (those steps and
+scripts/copy_live_objects_to_rehearsal.py) refuses a result that says neon_api
+not_checked (require_neon_checked).
 
 Before the verdict one line goes to stderr: "target host <host> branch <name or not checked>".
 Exit codes (CLI): 0 pass, 2 refused, 1 unexpected error. The result file is written in every case.
@@ -35,6 +41,7 @@ import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -47,8 +54,15 @@ DEFAULT_MAP = ROOT / "deploy" / "rehearsal" / "resources.json"
 RESULT_SCHEMA = "sqag-db-guard/v1"
 NEON_API = "https://console.neon.tech/api/v2"
 NEON_TIMEOUT_S = 20
-NEON_KEY_ENV = "NEON_API_KEY"
+# The key's credential-store name, so toolkit env run passes it without a name mapping.
+NEON_KEY_ENV = "NEONDB_SWOOSHZ_SQAG_API_KEY"
 NEON_UNREACHABLE = "Neon API unreachable while a key is set"
+# Neon's answer to a project listing with a key scoped to one project.
+LIST_REFUSED_STATUS = 404
+NOT_CHECKED_REFUSAL = (
+    "the guard did not check the branch with Neon's API: run it with "
+    f"{NEON_KEY_ENV} set (toolkit env run --names {NEON_KEY_ENV})"
+)
 UNKNOWN_HOST = "unknown host"
 NEON_SUFFIX = ".neon.tech"
 ENDPOINT_PREFIX = "ep-"
@@ -71,7 +85,12 @@ class GuardRefusal(Exception):
 
 
 class NeonApiError(Exception):
-    """A Neon API call failed or answered in an unexpected shape. The message names no values."""
+    """A Neon API call failed or answered in an unexpected shape. The message names no values;
+    status is the HTTP status of an error answer, else None."""
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -119,6 +138,9 @@ class NeonClient:
             opener = urllib.request.build_opener(_NoRedirect)
             with opener.open(request, timeout=self._timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            raise NeonApiError("Neon API call failed", exc.code) from None
         except (OSError, http.client.HTTPException, ValueError):
             raise NeonApiError("Neon API call failed") from None
 
@@ -132,6 +154,10 @@ class NeonClient:
             for item in projects
             if isinstance(item, dict) and item.get("name") == name and isinstance(item.get("id"), str)
         ]
+
+    def project_name(self, project_id: str) -> str:
+        """Name of one project, read by its id (allowed for a key scoped to that project)."""
+        return _text_field(self._get(f"/projects/{_seg(project_id)}"), "project", "name")
 
     def endpoint_branch_id(self, project_id: str, endpoint_id: str) -> str:
         path = f"/projects/{_seg(project_id)}/endpoints/{_seg(endpoint_id)}"
@@ -148,7 +174,7 @@ class NeonClient:
 
 
 def neon_client_from_env(env: Mapping[str, str]) -> NeonClient | None:
-    """A client when NEON_API_KEY is set. A blank key still counts as set, so the API check fails closed."""
+    """A client when NEONDB_SWOOSHZ_SQAG_API_KEY is set. A blank key still counts as set, so the API check fails closed."""
     return NeonClient(env[NEON_KEY_ENV]) if NEON_KEY_ENV in env else None
 
 
@@ -166,8 +192,9 @@ def _text(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
-def _production_record(rehearsal_map: Mapping[str, Any]) -> tuple[str, str, list[dict[str, str]]]:
-    """(Neon project name, rehearsal branch prefix, recorded production endpoints and branches)."""
+def _production_record(rehearsal_map: Mapping[str, Any]) -> tuple[str, str, str, list[dict[str, str]]]:
+    """(Neon project name, its recorded id or "", rehearsal branch prefix, recorded production
+    endpoints and branches). The id is needed only when Neon refuses to list projects."""
     section = rehearsal_map.get("production_guard")
     endpoints = section.get("forbidden_endpoints") if isinstance(section, Mapping) else None
     if not isinstance(endpoints, list) or not endpoints:
@@ -183,7 +210,7 @@ def _production_record(rehearsal_map: Mapping[str, Any]) -> tuple[str, str, list
     prefix = _text(section.get("branch_prefix"))
     if not project or not prefix:
         raise GuardRefusal("production_guard needs neon_project and branch_prefix")
-    return project, prefix, records
+    return project, _text(section.get("neon_project_id")), prefix, records
 
 
 def parse_target(database_url: str) -> tuple[str, str]:
@@ -214,26 +241,51 @@ def parse_target(database_url: str) -> tuple[str, str]:
     return host, endpoint_id
 
 
-def _endpoint_branch(neon: Any, project_name: str, endpoint_id: str) -> tuple[str, str, bool] | None:
+def _project_id(neon: Any, project_name: str, recorded_id: str) -> str | None:
+    """The project's id: the one project with exactly this name, or, when Neon refuses to list
+    projects (a key scoped to one project), the map's recorded id once Neon says it names this
+    project. None when the name matches no project or several."""
+    try:
+        project_ids = neon.project_ids_named(project_name)
+    except NeonApiError as exc:
+        if exc.status != LIST_REFUSED_STATUS:
+            raise
+        if not recorded_id:
+            raise GuardRefusal("Neon refused to list projects and the map records no neon_project_id") from None
+        if neon.project_name(recorded_id) != project_name:
+            raise GuardRefusal("the map's neon_project_id does not name the map's Neon project") from None
+        return recorded_id
+    return project_ids[0] if len(project_ids) == 1 else None
+
+
+def _endpoint_branch(neon: Any, project_name: str, recorded_id: str, endpoint_id: str) -> tuple[str, str, bool] | None:
     """(branch id, branch name, default flag) read from the Neon API; None when the name is not unique.
 
     Any call failure raises the fixed unreachable refusal, so no provider text reaches the result.
     """
     try:
-        project_ids = neon.project_ids_named(project_name)
-        if len(project_ids) != 1:
+        project_id = _project_id(neon, project_name, recorded_id)
+        if project_id is None:
             return None
-        branch_id = neon.endpoint_branch_id(project_ids[0], endpoint_id)
-        branch_name, branch_default = neon.branch(project_ids[0], branch_id)
+        branch_id = neon.endpoint_branch_id(project_id, endpoint_id)
+        branch_name, branch_default = neon.branch(project_id, branch_id)
+    except GuardRefusal:
+        raise
     except Exception:
         raise GuardRefusal(NEON_UNREACHABLE) from None
     return branch_id, branch_name, branch_default
 
 
 def _check_neon(
-    neon: Any, project_name: str, prefix: str, production: list[dict[str, str]], endpoint_id: str, result: dict
+    neon: Any,
+    project_name: str,
+    recorded_id: str,
+    prefix: str,
+    production: list[dict[str, str]],
+    endpoint_id: str,
+    result: dict,
 ) -> None:
-    facts = _endpoint_branch(neon, project_name, endpoint_id)
+    facts = _endpoint_branch(neon, project_name, recorded_id, endpoint_id)
     if facts is None:
         raise GuardRefusal("the map's Neon project name does not match exactly one project")
     branch_id, branch_name, branch_default = facts
@@ -246,14 +298,29 @@ def _check_neon(
         raise GuardRefusal("target branch name does not start with the rehearsal prefix")
 
 
+def _is_production_endpoint(endpoint_id: str, production: list[dict[str, str]]) -> bool:
+    """A recorded production endpoint, or one of its per-compute hosts (the id, "-", a suffix)."""
+    return any(
+        endpoint_id == record["endpoint_id"] or endpoint_id.startswith(record["endpoint_id"] + "-")
+        for record in production
+    )
+
+
 def _decide(database_url: str, rehearsal_map: Mapping[str, Any], neon: Any, result: dict) -> None:
-    project_name, prefix, production = _production_record(rehearsal_map)
+    project_name, recorded_id, prefix, production = _production_record(rehearsal_map)
     host, endpoint_id = parse_target(database_url)
     result.update(host=host, endpoint_id=endpoint_id)
-    if endpoint_id in {record["endpoint_id"] for record in production}:
+    if _is_production_endpoint(endpoint_id, production):
         raise GuardRefusal("target is a recorded production endpoint")
     if neon is not None:
-        _check_neon(neon, project_name, prefix, production, endpoint_id, result)
+        _check_neon(neon, project_name, recorded_id, prefix, production, endpoint_id, result)
+
+
+def require_neon_checked(result: Any) -> None:
+    """Refuse a guard result that Neon's API did not confirm. Every step that writes to a
+    rehearsal branch or bucket calls this: the endpoint rules alone cannot tie a host to a branch."""
+    if not isinstance(result, Mapping) or result.get("neon_api") != "checked":
+        raise GuardRefusal(NOT_CHECKED_REFUSAL)
 
 
 def _now() -> str:

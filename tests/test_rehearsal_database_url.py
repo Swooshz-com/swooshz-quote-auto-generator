@@ -27,6 +27,7 @@ if str(ROOT) not in sys.path:
 from scripts import live_rollback  # noqa: E402
 from scripts import neon_branch_guard as guard  # noqa: E402
 from scripts import rehearsal_database_url as dburl  # noqa: E402
+from tests.neon_guard_fakes import COPY_BRANCH, KEY, REHEARSAL_BRANCH, FakeNeon, fake_client_from_env  # noqa: E402
 
 REGION = "c-0.fake-region-1.aws.neon.tech"
 PRODUCTION_ENDPOINT = "ep-fake-production-000001"
@@ -38,7 +39,8 @@ TOKEN = "fake-coolify-token-planted"
 USER = "fake-user-planted"
 PASSWORD = "fake-password-planted"
 NEW_PASSWORD = "fake-new-password-planted"
-PLANTED = (USER, PASSWORD, NEW_PASSWORD, TOKEN, "neondb")
+PLANTED = (USER, PASSWORD, NEW_PASSWORD, TOKEN, "neondb", KEY)
+NOT_CHECKED = "did not check the branch with Neon's API"
 
 
 def url(endpoint: str, *, password: str = PASSWORD, pooler: bool = False, role: str = USER) -> str:
@@ -71,17 +73,19 @@ def write_map(folder: Path) -> Path:
     return path
 
 
-def guard_result(endpoint: str = COPY_ENDPOINT, *, status: str = "pass", age: timedelta = timedelta(minutes=5)) -> dict:
+def guard_result(
+    endpoint: str = COPY_ENDPOINT, *, status: str = "pass", age: timedelta = timedelta(minutes=5), neon_api: str = "checked"
+) -> dict:
     checked = (datetime.now(timezone.utc) - age).strftime("%Y-%m-%dT%H:%M:%SZ")
     return {
         "schema": guard.RESULT_SCHEMA,
         "status": status,
         "host": f"{endpoint}.{REGION}",
         "endpoint_id": endpoint,
-        "branch_id": None,
-        "branch_name": None,
-        "branch_default": None,
-        "neon_api": "not_checked",
+        "branch_id": REHEARSAL_BRANCH if neon_api == "checked" else None,
+        "branch_name": COPY_BRANCH if neon_api == "checked" else None,
+        "branch_default": False if neon_api == "checked" else None,
+        "neon_api": neon_api,
         "checked_at": checked,
         "reason": None if status == "pass" else "planted refusal",
     }
@@ -112,6 +116,11 @@ class Base(unittest.TestCase):
         self.map = write_map(self.dir)
         self.guard_file = self.dir / "db-guard.json"
         self.record = self.dir / "record.json"
+        # Neon's API is faked: it confirms a rehearsal branch whenever the key's name is set.
+        self.neon = FakeNeon()
+        patcher = mock.patch.object(guard, "neon_client_from_env", fake_client_from_env(self.neon))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def write_guard(self, result: dict) -> None:
         self.guard_file.write_text(json.dumps(result), encoding="utf-8")
@@ -127,7 +136,10 @@ class Base(unittest.TestCase):
 
 
 class SetServiceTests(Base):
-    def set_service(self, env: dict[str, str], coolify: FakeCoolify, uuid: str = SERVICE_UUID) -> tuple[int, str, str]:
+    def set_service(
+        self, env: dict[str, str], coolify: FakeCoolify, uuid: str = SERVICE_UUID, *, neon_key: bool = True
+    ) -> tuple[int, str, str]:
+        env = {guard.NEON_KEY_ENV: KEY, **env} if neon_key else env
         argv = [
             "set-service", "--guard-result", str(self.guard_file), "--database-url-env", "COPY_URL",
             "--service-uuid", uuid, "--result", str(self.record), "--map", str(self.map),
@@ -191,6 +203,24 @@ class SetServiceTests(Base):
                 self.assertEqual(coolify.calls, calls)
                 self.assert_no_planted(text, out, err)
 
+    def test_a_guard_that_neon_did_not_confirm_writes_nothing_to_coolify(self) -> None:
+        cases = [
+            # The endpoint-only guard: it passes a host it cannot tie to a branch.
+            ("a guard result with neon_api not_checked", guard_result(neon_api="not_checked"), True),
+            ("a checked guard result, but no key for the rerun", guard_result(), False),
+        ]
+        for label, result, neon_key in cases:
+            with self.subTest(label):
+                self.write_guard(result)
+                coolify = FakeCoolify()
+                code, out, err = self.set_service({"COPY_URL": url(COPY_ENDPOINT)}, coolify, neon_key=neon_key)
+                record, text = self.read_record()
+                self.assertEqual((code, record["status"]), (2, "refused"), err)
+                self.assertIn(NOT_CHECKED, record["reason"])
+                self.assertIn(guard.NEON_KEY_ENV, record["reason"])
+                self.assertEqual(coolify.calls, [])
+                self.assert_no_planted(text, out, err)
+
     def test_a_service_that_is_not_a_rehearsal_service_is_refused_before_the_write(self) -> None:
         self.write_guard(guard_result())
         coolify = FakeCoolify(name="quote-internal")
@@ -226,7 +256,8 @@ class SetServiceTests(Base):
 
 
 class MigratorTests(Base):
-    def run_step(self, step: str, env: dict[str, str]) -> tuple[int, list[list[str]], str, str]:
+    def run_step(self, step: str, env: dict[str, str], *, neon_key: bool = True) -> tuple[int, list[list[str]], str, str]:
+        env = {guard.NEON_KEY_ENV: KEY, **env} if neon_key else env
         ran: list[list[str]] = []
 
         def runner(command: list[str], step_env: dict[str, str]) -> int:
@@ -257,6 +288,7 @@ class MigratorTests(Base):
                 self.assertEqual(ran, commands)
                 self.assertEqual((record["schema"], record["status"], record["step"], record["endpoint_id"]), (dburl.MIGRATOR_SCHEMA, "pass", step, COPY_ENDPOINT))
                 self.assertEqual(record["checked_variables"], sorted(env))
+                self.assertEqual(record["neon_api"], "checked")
                 self.assert_no_planted(text, out, err, "fake-migrator-planted")
 
     def test_an_unguarded_migrator_url_runs_nothing(self) -> None:
@@ -281,6 +313,24 @@ class MigratorTests(Base):
                     self.assertIn(reason, record["reason"])
                     self.assert_no_planted(text, out, err)
 
+    def test_a_guard_that_neon_did_not_confirm_runs_no_step(self) -> None:
+        env = {"SQAG_MIGRATOR_DATABASE_URL": url(COPY_ENDPOINT), "SQAG_DATABASE_URL": url(COPY_ENDPOINT, pooler=True),
+               "SQAG_MAINTENANCE_DATABASE_URL": url(COPY_ENDPOINT)}
+        cases = [
+            ("a guard result with neon_api not_checked", guard_result(neon_api="not_checked"), True),
+            ("a checked guard result, but no key for the rerun", guard_result(), False),
+        ]
+        for label, result, neon_key in cases:
+            # check gates the role password reset; the others are the migration steps.
+            for step in sorted(dburl.STEPS):
+                with self.subTest(label, step=step):
+                    self.write_guard(result)
+                    code, ran, out, err = self.run_step(step, env, neon_key=neon_key)
+                    record, text = self.read_record()
+                    self.assertEqual((code, ran, record["status"]), (2, [], "refused"), err)
+                    self.assertIn(NOT_CHECKED, record["reason"])
+                    self.assert_no_planted(text, out, err)
+
     def test_post_apply_needs_the_runtime_and_maintenance_urls(self) -> None:
         self.write_guard(guard_result())
         code, ran, _, _ = self.run_step("post-apply", {"SQAG_MIGRATOR_DATABASE_URL": url(COPY_ENDPOINT)})
@@ -292,7 +342,9 @@ class MigratorTests(Base):
         self.write_guard(guard_result())
         argv = ["run-migrator", "--guard-result", str(self.guard_file), "--step", "apply", "--result", str(self.record), "--map", str(self.map)]
         with contextlib.redirect_stderr(io.StringIO()):
-            code = dburl.main(argv, env={"SQAG_MIGRATOR_DATABASE_URL": url(COPY_ENDPOINT)}, runner=lambda command, env: 7)
+            code = dburl.main(
+                argv, env={guard.NEON_KEY_ENV: KEY, "SQAG_MIGRATOR_DATABASE_URL": url(COPY_ENDPOINT)}, runner=lambda command, env: 7
+            )
         record, _ = self.read_record()
         self.assertEqual((code, record["status"], record["exit_code"]), (7, "step_failed", 7))
 

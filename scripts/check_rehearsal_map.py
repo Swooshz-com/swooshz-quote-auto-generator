@@ -510,6 +510,7 @@ def check_live_copy(data: dict[str, Any], base: Path, compose: dict[str, Any]) -
 
 ENDPOINT_ID_RE = re.compile(r"^ep-[a-z0-9]+(?:-[a-z0-9]+)*$")
 BRANCH_ID_RE = re.compile(r"^br-[a-z0-9]+(?:-[a-z0-9]+)*$")
+PROJECT_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)+$")
 
 
 def check_production_guard(data: dict[str, Any], base: Path) -> list[str]:
@@ -526,6 +527,9 @@ def check_production_guard(data: dict[str, Any], base: Path) -> list[str]:
     projects = {str(r.get("project") or "") for r in branches}
     if not guard.get("neon_project") or projects != {guard.get("neon_project")}:
         errors.append("production_guard.neon_project must be the project of every neon_branch resource")
+    if not PROJECT_ID_RE.fullmatch(str(guard.get("neon_project_id") or "")):
+        # A project-scoped Neon key cannot list projects, so the guard reads the project by this id.
+        errors.append("production_guard.neon_project_id must be the Neon project's id (like word-word-12345678)")
     prefix = str(guard.get("branch_prefix") or "")
     if "rehearsal" not in prefix or not branches or not all(str(r.get("name") or "").startswith(prefix) for r in branches):
         errors.append("production_guard.branch_prefix must say rehearsal and start every neon_branch name")

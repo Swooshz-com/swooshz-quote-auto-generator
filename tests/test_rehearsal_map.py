@@ -222,7 +222,11 @@ class RehearsalMapTests(unittest.TestCase):
         for entry in guard["forbidden_endpoints"]:
             self.assertRegex(entry["endpoint_id"], r"^ep-")
             self.assertRegex(entry["branch_id"], r"^br-")
+        # A project-scoped Neon key cannot list projects, so the guard confirms the project by this id.
+        self.assertRegex(guard["neon_project_id"], r"^[a-z0-9]+(?:-[a-z0-9]+)+$")
         cases = [
+            (lambda d: d["production_guard"].pop("neon_project_id"), "neon_project_id must be"),
+            (lambda d: d["production_guard"].update(neon_project_id="Royal Shadow"), "neon_project_id must be"),
             (lambda d: d.pop("production_guard"), "production_guard must list"),
             (lambda d: d["production_guard"].update(forbidden_endpoints=[]), "forbidden_endpoints must list"),
             (lambda d: d["production_guard"]["forbidden_endpoints"][0].update(endpoint_id="weathered"), "needs an endpoint_id"),
