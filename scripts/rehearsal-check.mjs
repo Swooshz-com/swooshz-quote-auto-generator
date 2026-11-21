@@ -98,6 +98,11 @@ const CUSTOMER = "Rehearsal Synthetic Customer";
 const PROJECT = "Rehearsal Synthetic Exhibition";
 const COMPANY = "Rehearsal Synthetic Fabrication";
 const SIGNATORY = "Rehearsal Signatory";
+// The app limits quote saves per client over a rolling window (the server's
+// RATE_LIMIT_WINDOW_SECONDS, sent back as Retry-After). One quote's whole flow
+// fits in a window, so a run starts another quote only once its own earlier
+// saves have left the window, and never meets the limit.
+const QUOTE_SAVE_WINDOW_MS = 60000;
 const TERMINAL = ["completed", "degraded", "needs_review", "blocked", "failed"];
 const AI_DRAFT_TIMEOUT_MS = 240000;
 const GENERATION_TIMEOUT_MS = 120000;
@@ -377,7 +382,10 @@ class Run {
       db_guard: options.dbGuardResult ?? null,
     };
     // refused: method, route shape and HTTP code of each refused app request (no ids, no bodies).
-    this.trace = { jobs: [], saves: [], normalizations: [], pending: [], refused: [], sequence: 0 };
+    // saveTimes: when this run sent each quote save, for the save-window pacing.
+    this.trace = { jobs: [], saves: [], normalizations: [], pending: [], refused: [], saveTimes: [], sequence: 0 };
+    this.result.refused_requests = this.trace.refused;
+    this.result.quote_save_waits_ms = [];
     // Paid AI goes through the run's capped ledger; a check without one refuses any paid call.
     this.budget = options.budget ?? NO_PAID_AI;
     this.readOnly = null;
@@ -435,6 +443,7 @@ function attachTrace(run, page) {
     const url = new URL(request.url());
     if (url.origin === run.baseUrl && url.pathname === "/api/quote-sessions" && request.method() === "POST") {
       request.__rehearsalSequence = ++run.trace.sequence;
+      run.trace.saveTimes.push(Date.now());
     }
   });
   page.on("response", (response) => {
@@ -480,6 +489,7 @@ async function csrfFor(run) {
 }
 
 async function postJson(run, route, data, label, timeout = SAVE_TIMEOUT_MS) {
+  if (route === "/api/quote-sessions") run.trace.saveTimes.push(Date.now());
   const response = await run.api.post(`${run.baseUrl}${route}`, { data, headers: await csrfFor(run), timeout });
   const body = await response.json().catch(() => ({}));
   assert(response.ok(), `${label} returned HTTP ${response.status()} (${scrub(body.errors?.[0] || body.status || "rejected")}).`);
@@ -581,7 +591,19 @@ async function openDashboard(run) {
   await run.page.locator("#newQuoteButton").waitFor({ state: "visible", timeout: 30000 });
 }
 
+// How long to wait before starting another quote: until this run's last quote
+// save has left the app's save window (0 when it already has, or none was sent).
+export function quoteSaveWaitMs(saveTimes, now) {
+  const last = saveTimes.at(-1);
+  return Number.isFinite(last) ? Math.max(0, last + QUOTE_SAVE_WINDOW_MS - now) : 0;
+}
+
 async function createQuoteDraft(run, images, projectNumber) {
+  const wait = quoteSaveWaitMs(run.trace.saveTimes, Date.now());
+  if (wait > 0) {
+    run.result.quote_save_waits_ms.push(wait);
+    await new Promise((resolve) => setTimeout(resolve, wait));
+  }
   await freshPage(run);
   const page = run.page;
   await openDashboard(run);
@@ -1229,6 +1251,7 @@ export async function runChecks(options, playwright) {
     if (browser) await browser.close().catch(() => {});
     await fs.rm(run.workDir, { recursive: true, force: true }).catch(() => {});
     if (options.budget) run.result.ai_budget = options.budget.summary();
+    run.result.quote_saves = run.trace.saveTimes.length;
     run.result.finished_at = new Date().toISOString();
   }
   return run.result;

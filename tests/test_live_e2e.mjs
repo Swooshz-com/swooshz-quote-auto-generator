@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import { AI_CAP_MAX_USD, AiBudget, AiCapError, loadBudget, reportedUsd, saveBudget } from "../scripts/lib/ai-budget.mjs";
 import { derivedReasons, ManifestError, REASON_CODES, targetsDocument, validateManifest, walkTargets } from "../scripts/lib/live-cases.mjs";
-import { assertNoWriteAttempted, basisPageChecks, browserGuard, compareWithPassA, DB_GUARD_MAX_AGE_MS, exportFacts, loadRunInputs, needsDbGuard, parseArgs, readDbGuard, readPassAFiles, savedAck, saveStub, UsageError } from "../scripts/rehearsal-check.mjs";
+import { assertNoWriteAttempted, basisPageChecks, browserGuard, compareWithPassA, DB_GUARD_MAX_AGE_MS, exportFacts, loadRunInputs, needsDbGuard, parseArgs, readDbGuard, quoteSaveWaitMs, readPassAFiles, savedAck, saveStub, UsageError } from "../scripts/rehearsal-check.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const script = path.join(root, "scripts", "rehearsal-check.mjs");
@@ -358,6 +358,13 @@ function runScript(args) {
     child.once("close", (code) => resolve({ code, stderr }));
   });
 }
+
+test("a new quote waits until the run's last quote save has left the app's save window", () => {
+  assert.equal(quoteSaveWaitMs([], 1_000_000), 0);
+  assert.equal(quoteSaveWaitMs([900_000], 1_000_000), 0);
+  assert.equal(quoteSaveWaitMs([940_000, 990_000], 1_000_000), 50_000);
+  assert.equal(quoteSaveWaitMs([1_000_000], 1_000_000), 60_000);
+});
 
 test("a refused AI OK or manifest exits before any request", async () => {
   const server = http.createServer((request, response) => { server.hits += 1; response.end("{}"); });

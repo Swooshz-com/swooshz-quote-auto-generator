@@ -254,6 +254,9 @@ async function runAllProfiles(t, storage) {
     // The new pricing reference's AI enrichment is counted against the run's US$1 cap.
     assert.deepEqual(seed.parsed.ai_budget, { cap_usd: 1, spent_usd: 0.1, within_cap: true, entries: [{ label: "pricing reference enrichment", usd: 0.1, source: "fixed amount, cost not reported per quote" }] });
     assert.ok(seed.parsed.seed.published_session_id && seed.parsed.seed.draft_session_id && seed.parsed.seed.pricing_reference_id);
+    // The app's quote-save rate limit is real on the rehearsal too: the seed paces its quotes and is never refused.
+    assert.deepEqual(seed.parsed.refused_requests.filter((line) => line.endsWith(" 429")), [], "the seed met the app's rate limit");
+    assert.ok(Number.isInteger(seed.parsed.quote_saves) && seed.parsed.quote_saves > 0, JSON.stringify(seed.parsed.quote_saves));
     if (storage === "database") {
       // Database mode refuses generation without a saved company profile.
       assert.ok(front.log.some((line) => line === "POST /api/settings/profiles"), "seed did not save the company profile");
@@ -264,6 +267,7 @@ async function runAllProfiles(t, storage) {
       assert.deepEqual(step(again.parsed, "company profile").detail, { company_profile_id: seed.parsed.seed.company_profile_id, reused: true });
       assert.equal(step(again.parsed, "pricing reference").detail.reused, true);
       assert.equal(again.parsed.ai_budget.spent_usd, 0.1, "a reused pricing reference must not count again");
+      assert.deepEqual(again.parsed.refused_requests.filter((line) => line.endsWith(" 429")), [], "the second seed met the app's rate limit");
     } else {
       assert.equal(seed.parsed.seed.company_profile_id, null);
       assert.equal(step(seed.parsed, "company profile").status, "skipped");
@@ -329,6 +333,7 @@ async function runAllProfiles(t, storage) {
     const asset = path.join(dirs.results, "app.js");
     const verify = await result("verify", ["--seed-file", seed.file, "--no-ai", "--asset-out", asset]);
     const served = step(verify.parsed, "served app.js").detail;
+    assert.deepEqual(verify.parsed.refused_requests.filter((line) => line.endsWith(" 429")), [], "verify met the app's rate limit");
     const source = await fs.readFile(path.join(root, "webapp", "static", "app.js"));
     assert.deepEqual(await fs.readFile(asset), source);
     assert.equal(served.app_js_bytes, source.length);
