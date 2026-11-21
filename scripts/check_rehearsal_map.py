@@ -13,7 +13,10 @@ Fails when:
   other third-party container), publishes a host port, mounts a volume or
   host path, or loads an env file;
 - storage is not the map's rehearsal-only bucket, or the bucket has no
-  clear step.
+  clear step;
+- the production guard does not list live's default-branch endpoint, its
+  project or branch prefix differ from the Neon branch resources, or its
+  script is missing.
 
 It reads only repository files. It never reads env values.
 """
@@ -260,6 +263,13 @@ BRANCH_CREATE_STEPS = (
     ("rehearsal-<run id> branch", "reset passwords on the rehearsal branch only"),
     ("Never reset a password on the default branch", "never reset a password on the default branch"),
 )
+# A branch WITH data keeps live's ledger and owners; it still needs its own
+# password reset, and its name and delete step must keep it a rehearsal branch.
+DATA_BRANCH_CREATE_STEPS = (
+    ("WITH data at a recorded time", "branch live's default branch with data at a recorded time"),
+    ("rehearsal-copy-<run id> branch", "reset passwords on the rehearsal-copy branch only"),
+    ("Never reset a password on the default branch", "never reset a password on the default branch"),
+)
 
 
 def check_create_steps(data: dict[str, Any]) -> list[str]:
@@ -270,9 +280,19 @@ def check_create_steps(data: dict[str, Any]) -> list[str]:
     ]
     for branch in branches:
         created = str(branch.get("created_by") or "")
-        for needle, step in BRANCH_CREATE_STEPS:
+        branch_type = str(branch.get("branch_type") or "")
+        if branch_type.startswith("schema-only"):
+            steps = BRANCH_CREATE_STEPS
+        elif branch_type.startswith("with data"):
+            steps = DATA_BRANCH_CREATE_STEPS
+        else:
+            errors.append(f"resource {branch.get('id')} branch_type must start with 'schema-only' or 'with data'")
+            continue
+        for needle, step in steps:
             if needle not in created:
                 errors.append(f"resource {branch.get('id')} created_by must {step}")
+        if "Never delete a branch whose name does not start with rehearsal-" not in str(branch.get("delete") or ""):
+            errors.append(f"resource {branch.get('id')} delete must never delete a branch whose name does not start with rehearsal-")
     for service in (r for r in data.get("resources") or [] if isinstance(r, dict) and r.get("kind") == "coolify_service"):
         if "POST /api/v1/deploy?uuid=" not in str(service.get("created_by") or ""):
             errors.append(f"resource {service.get('id')} created_by must apply changes with POST /api/v1/deploy?uuid=, not a restart")
@@ -424,6 +444,107 @@ def check_compose(data: dict[str, Any], compose: dict[str, Any], compose_text: s
     return errors, app_env
 
 
+LIVE_COPY_RUN_NAMES = (
+    "SQAG_INTERNAL_WORKSPACE_ID",
+    "SQAG_INTERNAL_ALLOWED_EMAILS",
+    "SQAG_INTERNAL_ALLOWED_EMAILS_ADMIN",
+    "SQAG_INTERNAL_IDENTITY_BINDINGS_JSON",
+)
+
+
+def check_live_copy(data: dict[str, Any], base: Path, compose: dict[str, Any]) -> list[str]:
+    """Pass A's app (the candidate on a copy of live data) keeps the rehearsal
+    app's exact shape: the same service settings and env, except the four
+    identity names a copy of live data needs, which are run values only."""
+    live_copy = data.get("live_copy")
+    if not isinstance(live_copy, dict):
+        return ["live_copy must describe Pass A's app (compose, app_service, run_names, run_values)"]
+    errors: list[str] = []
+    name = str(live_copy.get("app_service") or "")
+    live_names = {str(item).lower() for item in data.get("live_names") or []}
+    if "rehearsal" not in name or name == data.get("app_service") or name.lower() in live_names:
+        errors.append("live_copy.app_service must say rehearsal and differ from the rehearsal and live names")
+    if not any(isinstance(r, dict) and r.get("kind") == "coolify_service" and r.get("name") == name for r in data.get("resources") or []):
+        errors.append("live_copy.app_service must be a coolify_service resource in the map")
+    if list(live_copy.get("run_names") or []) != list(LIVE_COPY_RUN_NAMES):
+        errors.append(f"live_copy.run_names must be exactly {list(LIVE_COPY_RUN_NAMES)}")
+    run_values = live_copy.get("run_values") if isinstance(live_copy.get("run_values"), dict) else {}
+    for needed in LIVE_COPY_RUN_NAMES:
+        if not str(run_values.get(needed) or "").strip():
+            errors.append(f"live_copy.run_values must say where {needed} comes from")
+    if live_copy.get("ai_cap_usd") != 1:
+        errors.append("live_copy.ai_cap_usd must be 1 (the owner's US$1 per run cap)")
+    for field in ("manifest", "copy_script"):
+        if not (base / str(live_copy.get(field) or "")).is_file():
+            errors.append(f"live_copy.{field} must name a file in the repository")
+    try:
+        text = (base / str(live_copy.get("compose") or "")).read_text(encoding="utf-8")
+        copy_compose = parse_mini_yaml(text)
+    except (OSError, UnicodeDecodeError, MiniYamlError, json.JSONDecodeError) as exc:
+        return errors + [f"live_copy compose unreadable: {type(exc).__name__}"]
+    lowered = text.lower()
+    for live_name in data.get("live_names") or []:
+        if str(live_name).lower() in lowered:
+            errors.append(f"live_copy compose refers to live name {live_name}")
+    services = copy_compose.get("services") if isinstance(copy_compose, dict) else None
+    rehearsal = (compose.get("services") or {}).get(data.get("app_service")) if isinstance(compose, dict) else None
+    if not isinstance(services, dict) or set(services) != {name} or not isinstance(rehearsal, dict):
+        return errors + [f"live_copy compose must hold exactly one service, {name!r}"]
+    if set(copy_compose) != set(compose):
+        errors.append("live_copy compose must have the same top-level keys as the rehearsal compose")
+    app = services[name] if isinstance(services[name], dict) else {}
+    if {k: v for k, v in app.items() if k != "environment"} != {k: v for k, v in rehearsal.items() if k != "environment"}:
+        errors.append("live_copy service settings must equal the rehearsal service's (image input, pull policy, limits, health check)")
+    env = app.get("environment") if isinstance(app.get("environment"), dict) else {}
+    base_env = rehearsal.get("environment") if isinstance(rehearsal.get("environment"), dict) else {}
+    if set(env) != set(base_env) | set(LIVE_COPY_RUN_NAMES):
+        errors.append("live_copy env names must be the rehearsal app's plus the identity bindings name")
+    for key, value in env.items():
+        if key in LIVE_COPY_RUN_NAMES:
+            if value != "${" + key + "}":
+                errors.append(f"live_copy {key} must be set as ${{{key}}}, never written into the compose file")
+        elif base_env.get(key) != value:
+            errors.append(f"live_copy {key} must equal the rehearsal compose value")
+    return errors
+
+
+ENDPOINT_ID_RE = re.compile(r"^ep-[a-z0-9]+(?:-[a-z0-9]+)*$")
+BRANCH_ID_RE = re.compile(r"^br-[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def check_production_guard(data: dict[str, Any], base: Path) -> list[str]:
+    """The guard that keeps every copy write off live's database reads this
+    section, so a missing or malformed record would let it pass nothing or
+    the wrong thing."""
+    guard = data.get("production_guard")
+    if not isinstance(guard, dict):
+        return ["production_guard must list live's Neon endpoints (neon_project, branch_prefix, forbidden_endpoints)"]
+    errors: list[str] = []
+    if not (base / str(guard.get("script") or "")).is_file():
+        errors.append("production_guard.script must name a file in the repository")
+    branches = [r for r in data.get("resources") or [] if isinstance(r, dict) and r.get("kind") == "neon_branch"]
+    projects = {str(r.get("project") or "") for r in branches}
+    if not guard.get("neon_project") or projects != {guard.get("neon_project")}:
+        errors.append("production_guard.neon_project must be the project of every neon_branch resource")
+    prefix = str(guard.get("branch_prefix") or "")
+    if "rehearsal" not in prefix or not branches or not all(str(r.get("name") or "").startswith(prefix) for r in branches):
+        errors.append("production_guard.branch_prefix must say rehearsal and start every neon_branch name")
+    endpoints = guard.get("forbidden_endpoints")
+    if not isinstance(endpoints, list) or not endpoints:
+        return errors + ["production_guard.forbidden_endpoints must list live's default-branch endpoint"]
+    for entry in endpoints:
+        if not isinstance(entry, dict) or not str(entry.get("name") or "").strip():
+            errors.append("each production_guard.forbidden_endpoints entry needs a name")
+            continue
+        if not ENDPOINT_ID_RE.fullmatch(str(entry.get("endpoint_id") or "")):
+            errors.append(f"production_guard endpoint {entry.get('name')!r} needs an endpoint_id like ep-...")
+        if not BRANCH_ID_RE.fullmatch(str(entry.get("branch_id") or "")):
+            errors.append(f"production_guard endpoint {entry.get('name')!r} needs a branch_id like br-...")
+    if not str(guard.get("source") or "").strip():
+        errors.append("production_guard.source must say where the ids were read")
+    return errors
+
+
 def run_checks(map_path: Path) -> list[str]:
     try:
         data = json.loads(map_path.read_text(encoding="utf-8"))
@@ -451,6 +572,8 @@ def run_checks(map_path: Path) -> list[str]:
     compose_errors, app_env = check_compose(data, compose, compose_text)
     errors += compose_errors
     errors += check_env_sources(data, settings, app_env)
+    errors += check_live_copy(data, base, compose)
+    errors += check_production_guard(data, base)
     return errors
 
 
