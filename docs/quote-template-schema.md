@@ -53,7 +53,7 @@ only and writes all text as inline strings.
 | `page` | object | below |
 | `header` | object | `rows` 1 to 40: rows reserved at the top of page 1 for header blocks; must be fewer than `page.first_page_rows` |
 | `grid` | object | `columns`: 4 to 12 Excel columns, each `{width: 4 to 60, hidden?: bool}`; at least one visible |
-| `theme` | object | `font` (`Calibri` or `Arial`, the fonts installed for PDF rendering), `size_pt` 7 to 20, `color` and `heading_color` as `#RRGGBB` |
+| `theme` | object | `font` (`Calibri` or `Arial`, the fonts installed for PDF rendering), `size_pt` 7 to 20 in half-point steps (such as 11 or 11.5), `color` and `heading_color` as `#RRGGBB` |
 | `labels` | object | `total` (1 to 40), `attention` (0 to 40), `project_number` (0 to 40). Tax and currency labels come from the quote itself. |
 | `blocks` | list | 2 to 30 blocks, below |
 
@@ -127,7 +127,10 @@ placement width (7 pixels a unit plus 5) and 0.92 of its width in the theme
 font's unit, in whole 96-dpi pixels. Excel's hinted digit is at least 0.926 of the
 unit for both fonts at every half-point size from 7 to 20 and every Windows
 display scaling, so a drawing placed inside that width stays inside its columns
-in Excel. A logo's `width_mm` must fit its block's width
+in Excel. That margin is measured at half-point sizes only; between them the
+hinted digit can be narrower (0.907 of the unit at Calibri 11.6 at 96 dpi, where
+a logo would run 1.5 pt past its column), which is why font sizes must be whole
+or half points. A logo's `width_mm` must fit its block's width
 (`blocks[i].logo.width_mm`), or Excel would cut it at the print area; its
 `height_mm` may run below the block's rows. Standard's 47.8 mm logo fits column I
 at Calibri 13 (193 px, 51.1 mm) and needs a narrower logo or column at smaller
@@ -136,8 +139,9 @@ theme fonts (at most 39.1 mm at Calibri 9).
 ## Blocks
 
 Every block has `type`, `area` (`header` or `body`), `col` and `span` (grid
-columns, inside the grid) and an optional `style` (`font`, `size_pt`, `bold`,
-`italic`, `color`, `align`: `left`, `center` or `right`).
+columns, inside the grid) and an optional `style` (`font`, `size_pt` 7 to 20
+in half-point steps, `bold`, `italic`, `color`, `align`: `left`, `center` or
+`right`).
 
 - **Header blocks** also have `row` and `rows` inside `header.rows`. Header
   blocks must not overlap.

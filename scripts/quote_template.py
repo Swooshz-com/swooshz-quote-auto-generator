@@ -53,8 +53,11 @@ SPARE_ROWS_PER_PAGE = 1
 MIN_PRINT_SCALE = 0.13
 # Excel's hinted digit is at least 0.926 times the unit over both fonts, every half-point size from 7 to
 # 20 and every Windows scaling preset (486 cases read from GDI), so pictures and text boxes are placed
-# in whole 96-dpi pixels of 0.92 units, never wider than Excel draws the column.
+# in whole 96-dpi pixels of 0.92 units, never wider than Excel draws the column. That holds only at
+# half-point sizes (Excel's own font-size steps): between them the hinted digit can be narrower (0.907
+# of the unit at Calibri 11.6 at 96 dpi), so the reader accepts font sizes in half-point steps only.
 MIN_HINTED_DIGIT_RATIO = 0.92
+FONT_SIZE_STEP_PT = 0.5
 # A quantity column must hold this many digits at the item table's font size; a longer quantity on a
 # quote is refused when the quote is made. Digit advance as a fraction of the font size.
 MIN_QUANTITY_DIGITS = 3
@@ -129,6 +132,14 @@ def _number(value: Any, path: str, low: float, high: float) -> float:
     if not in_range:
         _refuse(path, f"must be between {low:g} and {high:g}")
     return float(value)
+
+
+def _font_size(value: Any, path: str) -> float:
+    """A font size from 7 to 20 points in half-point steps (see FONT_SIZE_STEP_PT)."""
+    size = _number(value, path, 7, 20)
+    if size / FONT_SIZE_STEP_PT != round(size / FONT_SIZE_STEP_PT):
+        _refuse(path, "must be a whole or half point size, such as 11 or 11.5")
+    return size
 
 
 def _boolean(value: Any, path: str) -> bool:
@@ -232,7 +243,7 @@ def _read_theme(value: Any) -> dict[str, Any]:
     theme = _object(value, "theme", ("font", "size_pt", "color", "heading_color"))
     return {
         "font": _choice(theme["font"], "theme.font", ALLOWED_FONTS),
-        "size_pt": _number(theme["size_pt"], "theme.size_pt", 7, 20),
+        "size_pt": _font_size(theme["size_pt"], "theme.size_pt"),
         "color": _color(theme["color"], "theme.color"),
         "heading_color": _color(theme["heading_color"], "theme.heading_color"),
     }
@@ -253,7 +264,7 @@ def _read_style(value: Any, path: str) -> dict[str, Any]:
     if "font" in style:
         result["font"] = _choice(style["font"], f"{path}.font", ALLOWED_FONTS)
     if "size_pt" in style:
-        result["size_pt"] = _number(style["size_pt"], f"{path}.size_pt", 7, 20)
+        result["size_pt"] = _font_size(style["size_pt"], f"{path}.size_pt")
     for key in ("bold", "italic"):
         if key in style:
             result[key] = _boolean(style[key], f"{path}.{key}")

@@ -857,6 +857,44 @@ class LogoFitTest(unittest.TestCase):
             right_edge = int(anchor.findtext(f"{XDR}from/{XDR}colOff")) + int(anchor.find(f"{XDR}ext").get("cx"))
             self.assertLessEqual(right_edge, self.COLUMN_I_AT_120_DPI_EMU)
 
+    # At Calibri 11.5 and 11.6 Excel at 96 dpi builds the font at 15 px, whose widest digit is 7 px, and
+    # draws column I (26.875 units) at trunc(((256 * 26.875 + trunc(128 / 7)) / 256) * 7) = 188 px, 141 pt.
+    COLUMN_I_AT_96_DPI_EMU = 188 * 9525
+
+    def right_edges(self, definition):
+        next(block for block in definition["blocks"] if block["type"] == "logo")["logo"]["align"] = "right"
+        brief = synthetic_brief()
+        brief["company"]["logo_data_url"] = "data:image/png;base64," + base64.b64encode(wide_png(600, 100)).decode()
+        tmp, path = render(definition, brief, synthetic_lines(3))
+        with tmp, zipfile.ZipFile(path) as archive:
+            drawing = ET.fromstring(archive.read("xl/drawings/drawing1.xml"))
+        anchors = drawing.findall(f"{XDR}oneCellAnchor")
+        self.assertTrue(anchors)
+        for anchor in anchors:
+            self.assertEqual(anchor.findtext(f"{XDR}from/{XDR}col"), "8")
+        return [int(a.findtext(f"{XDR}from/{XDR}colOff")) + int(a.find(f"{XDR}ext").get("cx")) for a in anchors]
+
+    def test_a_font_size_between_half_points_is_refused(self):
+        # The 0.92 margin holds at half-point sizes only. At Calibri 11.6 Excel's 7 px digit is 0.907 of the
+        # reader's unit, and the reader used to accept Standard there with 54 rows and a 50.2 mm logo whose
+        # right edge, right aligned, sat at 142.5 pt: past column I as Excel draws it at 96 dpi.
+        with self.assertRaises(qt.QuoteTemplateError) as caught:
+            qt.read_quote_template(standard_with_theme("Calibri", 11.6, 54, 50.2))
+        self.assertEqual(caught.exception.path, "theme.size_pt")
+        self.assertEqual(caught.exception.message, "must be a whole or half point size, such as 11 or 11.5")
+        definition = standard_with_theme("Calibri", 11.5, 53, 35)
+        definition["blocks"][-1]["style"]["size_pt"] = 9.75
+        with self.assertRaises(qt.QuoteTemplateError) as caught:
+            qt.read_quote_template(definition)
+        self.assertEqual(caught.exception.path, f"blocks[{len(definition['blocks']) - 1}].style.size_pt")
+
+    def test_the_half_point_neighbour_keeps_its_widest_logo_inside_column_i(self):
+        # Calibri 11.5 holds 53 rows and a logo of at most 49.2 mm; right aligned it ends at 139.5 pt.
+        with self.assertRaises(qt.QuoteTemplateError):
+            qt.read_quote_template(standard_with_theme("Calibri", 11.5, 53, 49.3))
+        for right_edge in self.right_edges(standard_with_theme("Calibri", 11.5, 53, 49.2)):
+            self.assertLessEqual(right_edge, self.COLUMN_I_AT_96_DPI_EMU)
+
 
 class QuantityColumnTest(unittest.TestCase):
     """The reader refuses a quantity column the renderer would refuse ordinary quantities in. Both measure
