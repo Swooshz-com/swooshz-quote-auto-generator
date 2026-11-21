@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import { AI_CAP_MAX_USD, AiBudget, AiCapError, loadBudget, reportedUsd, saveBudget } from "../scripts/lib/ai-budget.mjs";
 import { derivedReasons, ManifestError, REASON_CODES, targetsDocument, validateManifest, walkTargets } from "../scripts/lib/live-cases.mjs";
-import { assertNoWriteAttempted, basisPageChecks, browserGuard, compareWithPassA, DB_GUARD_MAX_AGE_MS, exportFacts, loadRunInputs, needsDbGuard, parseArgs, readDbGuard, quoteSaveWaitMs, readPassAFiles, savedAck, saveStub, UsageError } from "../scripts/rehearsal-check.mjs";
+import { assertNoWriteAttempted, basisPageChecks, browserGuard, compareWithPassA, DB_GUARD_MAX_AGE_MS, exportFacts, loadRunInputs, needsDbGuard, parseArgs, readDbGuard, quoteSaveWaitMs, readPassAFiles, savedAck, saveStub, showAllSessions, UsageError } from "../scripts/rehearsal-check.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const script = path.join(root, "scripts", "rehearsal-check.mjs");
@@ -364,6 +364,39 @@ test("a new quote waits until the run's last quote save has left the app's save 
   assert.equal(quoteSaveWaitMs([900_000], 1_000_000), 0);
   assert.equal(quoteSaveWaitMs([940_000, 990_000], 1_000_000), 50_000);
   assert.equal(quoteSaveWaitMs([1_000_000], 1_000_000), 60_000);
+});
+
+// A page whose page-size control sends the given requests when it changes.
+function pagingPage(value, sends) {
+  const listeners = new Set();
+  return {
+    selected: [],
+    on(event, fn) { if (event === "request") listeners.add(fn); },
+    off(event, fn) { if (event === "request") listeners.delete(fn); },
+    waitForTimeout: async () => {},
+    locator(selector) {
+      assert.equal(selector, "#dashboardPageSizeSelect:enabled");
+      const page = this;
+      return {
+        waitFor: async () => {},
+        inputValue: async () => value,
+        async selectOption(option) {
+          page.selected.push(option);
+          for (const method of sends) for (const fn of listeners) fn({ method: () => method });
+        },
+      };
+    },
+  };
+}
+
+test("showing all quotes on the dashboard fails the run if it sends anything but a read", async () => {
+  const readOnly = pagingPage("5", ["GET"]);
+  assert.equal(await showAllSessions(readOnly), true);
+  assert.deepEqual(readOnly.selected, ["0"]);
+  await assert.rejects(showAllSessions(pagingPage("5", ["GET", "POST"])), /1 request\(s\) that are not reads: POST/);
+  const already = pagingPage("0", ["POST"]);
+  assert.equal(await showAllSessions(already), false);
+  assert.deepEqual(already.selected, []);
 });
 
 test("a refused AI OK or manifest exits before any request", async () => {

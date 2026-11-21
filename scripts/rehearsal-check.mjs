@@ -386,6 +386,8 @@ class Run {
     this.trace = { jobs: [], saves: [], normalizations: [], pending: [], refused: [], saveTimes: [], sequence: 0 };
     this.result.refused_requests = this.trace.refused;
     this.result.quote_save_waits_ms = [];
+    // How often the dashboard was switched to "All sessions" to find a quote.
+    this.result.dashboard_all_sessions = 0;
     // Paid AI goes through the run's capped ledger; a check without one refuses any paid call.
     this.budget = options.budget ?? NO_PAID_AI;
     this.readOnly = null;
@@ -708,12 +710,39 @@ async function freshPage(run) {
   await previous.close().catch(() => {});
 }
 
+// The dashboard shows five quotes a page by default, so an older quote is not
+// in the page at all. "All sessions" is a view setting the app keeps in this
+// browser only (localStorage). Any request other than a read sent while it is
+// chosen fails the run, and on live the read-only guard also blocks it.
+export async function showAllSessions(page) {
+  const select = page.locator("#dashboardPageSizeSelect:enabled");
+  await select.waitFor({ state: "attached", timeout: 20000 });
+  if ((await select.inputValue()) === "0") return false;
+  const sent = [];
+  const watch = (request) => { if (!READ_METHODS.has(request.method())) sent.push(request.method()); };
+  page.on("request", watch);
+  try {
+    await select.selectOption("0");
+    await page.waitForTimeout(300);
+  } finally {
+    page.off("request", watch);
+  }
+  if (sent.length) throw new Error(`Showing all quotes on the dashboard sent ${sent.length} request(s) that are not reads: ${sent.join(", ")}.`);
+  return true;
+}
+
+async function waitForDashboardQuote(run, page, sessionId, state, timeout) {
+  if (await showAllSessions(page)) run.result.dashboard_all_sessions += 1;
+  const card = page.locator(`#dashboardSessionsList [data-quote-session-id="${sessionId}"]`);
+  await card.waitFor({ state, timeout });
+  return card;
+}
+
 async function reopenQuote(run, sessionId) {
   await freshPage(run);
   const page = run.page;
   await openDashboard(run);
-  const card = page.locator(`#dashboardSessionsList [data-quote-session-id="${sessionId}"]`);
-  await card.waitFor({ state: "visible", timeout: 20000 });
+  const card = await waitForDashboardQuote(run, page, sessionId, "visible", 20000);
   await card.click();
   await page.locator('#dashboardSelectedSessionPanel [data-dashboard-panel-action="modify-session"]').click();
   await page.locator("#panel-analysis.is-active").waitFor({ state: "visible", timeout: 30000 });
@@ -1000,7 +1029,7 @@ async function walkQuote(run, sessionId) {
   if (run.options.expectedFiles) Object.assign(detail, compareWithPassA(sessionId, readback, files, run.options.expectedFiles));
   await freshPage(run);
   await openDashboard(run);
-  await run.page.locator(`#dashboardSessionsList [data-quote-session-id="${sessionId}"]`).waitFor({ state: "attached", timeout: 20000 });
+  await waitForDashboardQuote(run, run.page, sessionId, "attached", 20000);
   const opened = await run.page.evaluate((id) => modifyDashboardQuote(id), sessionId);
   assert(opened === true, "The quote did not reopen.");
   await run.page.locator("#panel-analysis.is-active").waitFor({ state: "visible", timeout: 30000 });
@@ -1120,7 +1149,7 @@ async function clickBudgetOnQuote(run, sessionId) {
       quotePosts.push({ files });
     });
     await page.goto(`${run.baseUrl}/`, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.locator(`#dashboardSessionsList [data-quote-session-id="${sessionId}"]`).waitFor({ state: "attached", timeout: 30000 });
+    await waitForDashboardQuote(run, page, sessionId, "attached", 30000);
     assert(await page.evaluate((id) => modifyDashboardQuote(id), sessionId) === true, "The quote did not reopen for the click probe.");
     // A reopened quote may open on another panel: open Quote Basis as a user would, then let
     // any save the switch armed finish before the first measured click.

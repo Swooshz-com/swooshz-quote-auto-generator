@@ -293,6 +293,12 @@ async function runAllProfiles(t, storage) {
     assert.deepEqual(front.log.filter((line) => !/^(GET|HEAD) /.test(line)), ["POST /login"], "Pass A sent a write to the server");
     assert.equal(step(passA.parsed, "no write attempted").status, "pass");
     assert.equal(passA.parsed.downloaded_files, true);
+    if (storage === "database") {
+      // Two seeds leave more quotes than one dashboard page, so the walk must find quotes past the first page.
+      const pageSize = Number(/const DASHBOARD_DEFAULT_PAGE_SIZE = ([0-9]+);/.exec(await fs.readFile(path.join(root, "webapp", "static", "app.js"), "utf8"))[1]);
+      assert.ok(step(passA.parsed, "quote list matches the dashboard").detail.quotes > pageSize, "database mode seeded no more quotes than one dashboard page");
+      assert.ok(passA.parsed.dashboard_all_sessions > 0, "Pass A never showed all quotes on the dashboard");
+    }
     const published = step(passA.parsed, "quote 1 reopens read-only").detail;
     assert.equal(published.id, seed.parsed.seed.published_session_id);
     assert.equal(published.generated, true);
@@ -328,6 +334,8 @@ async function runAllProfiles(t, storage) {
     assert.deepEqual(front.log.filter((line) => line.includes("/download/")), [], "Pass B downloaded a file on live");
     assert.equal(passB.parsed.downloaded_files, false);
     assert.equal(passB.parsed.compared_with_pass_a, true);
+    // Pass B also showed all quotes on the dashboard, and the proxy check above saw no write from it.
+    assert.ok(passB.parsed.dashboard_all_sessions > 0, "Pass B never showed all quotes on the dashboard");
     for (const n of [1, 2]) assert.equal(step(passB.parsed, `quote ${n} reopens read-only`).detail.pass_a, "same files");
     if (countsBeforeB) assert.deepEqual(tableRowCounts(), countsBeforeB, "Pass B wrote rows to the database (telemetry included)");
     const asset = path.join(dirs.results, "app.js");
