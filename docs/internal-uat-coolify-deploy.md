@@ -56,14 +56,20 @@ create, test, delete, with no new decisions per run.
   `--ai-ok`.
 - **Production-branch guard:** `scripts/neon_branch_guard.py` checks a database
   URL before anything writes to a rehearsal database. It refuses live's
-  default-branch endpoint listed in the map's `production_guard`, a branch
+  default-branch endpoint listed in the map's `production_guard` and its
+  per-compute hosts (`ep-<id>-<suffix>`, with or without `-pooler`), a branch
   Neon marks as default or one whose name does not start with `rehearsal-`,
   and any host it cannot place. It prints the host and branch name only.
-  After it passes, `scripts/rehearsal_database_url.py` is the only way a
-  rehearsal step uses a database URL: `set-service` writes a rehearsal
-  service's `SQAG_DATABASE_URL` through Coolify's API and `run-migrator` runs
-  each migration step. Both run the guard again on the exact URL they use and
-  refuse one that is not on the guarded branch's endpoint. Writing checks on
+  It asks Neon's API with the key `NEONDB_SWOOSHZ_SQAG_API_KEY` from the
+  credential store; that key is scoped to the one project, so the guard reads
+  the project by the map's `neon_project_id`. After it passes,
+  `scripts/rehearsal_database_url.py` is the only way a rehearsal step uses a
+  database URL: `set-service` writes a rehearsal service's `SQAG_DATABASE_URL`
+  through Coolify's API and `run-migrator` runs each migration step. Both run
+  the guard again on the exact URL they use and refuse one that is not on the
+  guarded branch's endpoint. They, and the live object copy, refuse a guard
+  result that Neon's API did not confirm (`neon_api: not_checked`, the key
+  not set). Writing checks on
   a rehearsal host, and every check on the copy of live, refuse to start
   without `set-service`'s record for that service (`--db-guard`).
 
@@ -175,15 +181,16 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      live.
    - **Production-branch guard**, before the first write to the branch. Hold
      the branch's URL in this session only, never in a file or the chat. The
-     guard checks the branch with Neon's API when `NEON_API_KEY` is set
-     (through `toolkit env run`); without it, it checks the endpoint only and
-     records `neon_api: not_checked`. Require exit 0 and the printed branch
-     name `rehearsal-<short>`:
+     guard checks the branch with Neon's API when `NEONDB_SWOOSHZ_SQAG_API_KEY`
+     is set (through `toolkit env run`, under that credential-store name);
+     without it, it checks the endpoint only and records
+     `neon_api: not_checked`, which every writing step below refuses. Require
+     exit 0 and the printed branch name `rehearsal-<short>`:
 
      ```powershell
      $out = "_tmp\deploy-$short-out"
      $env:SQAG_GUARD_DATABASE_URL = <the rehearsal-<short> branch's URL>
-     node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names NEON_API_KEY -- python scripts\neon_branch_guard.py --database-url-env SQAG_GUARD_DATABASE_URL --result "$out\db-guard.json"
+     node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names NEONDB_SWOOSHZ_SQAG_API_KEY -- python scripts\neon_branch_guard.py --database-url-env SQAG_GUARD_DATABASE_URL --result "$out\db-guard.json"
      Remove-Item Env:SQAG_GUARD_DATABASE_URL
      ```
 
@@ -193,9 +200,8 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
    - Before the role password reset, check that the migrator URL you hold is
      the guarded branch's, with the guard only (`--step check`). Then reset
      the roles' passwords on the branch the result names: its `branch_id`,
-     recorded when the guard checked Neon's API. Without it
-     (`neon_api: not_checked`), first check in Neon that the branch
-     `rehearsal-<short>` owns the result's `endpoint_id`. Never reset a
+     recorded when the guard checked Neon's API (`--step check` refuses a
+     result without it). Never reset a
      password on the default branch. Then set the migrator URL with the new
      password and run the read-only preflight through the same script (see
      [the migration runbook](postgres-migration-runbook.md)). It must report
@@ -204,9 +210,9 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
 
      ```powershell
      $env:SQAG_MIGRATOR_DATABASE_URL = <the branch's migrator URL>
-     node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names NEON_API_KEY -- python scripts\rehearsal_database_url.py run-migrator --guard-result "$out\db-guard.json" --step check --result "$out\migrator-check.json"
+     node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names NEONDB_SWOOSHZ_SQAG_API_KEY -- python scripts\rehearsal_database_url.py run-migrator --guard-result "$out\db-guard.json" --step check --result "$out\migrator-check.json"
      # reset the roles' passwords on the result's branch_id, then hold the migrator URL with its new password
-     node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names NEON_API_KEY -- python scripts\rehearsal_database_url.py run-migrator --guard-result "$out\db-guard.json" --step pre-apply --result "$out\migrator-pre-apply.json"
+     node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names NEONDB_SWOOSHZ_SQAG_API_KEY -- python scripts\rehearsal_database_url.py run-migrator --guard-result "$out\db-guard.json" --step pre-apply --result "$out\migrator-pre-apply.json"
      ```
 
      Each step exits 2 and runs nothing when a URL it holds is not on the
@@ -231,7 +237,7 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
 
      ```powershell
      $env:SQAG_REHEARSAL_RUNTIME_DATABASE_URL = <the branch's runtime URL, after the password reset>
-     node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names NEON_API_KEY,COOLIFY_SWOOSHZ_API_URL,COOLIFY_SWOOSHZ_API_TOKEN -- python scripts\rehearsal_database_url.py set-service --guard-result "$out\db-guard.json" --database-url-env SQAG_REHEARSAL_RUNTIME_DATABASE_URL --service-uuid <quote-rehearsal service uuid> --result "$out\db-url-set.json"
+     node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names NEONDB_SWOOSHZ_SQAG_API_KEY,COOLIFY_SWOOSHZ_API_URL,COOLIFY_SWOOSHZ_API_TOKEN -- python scripts\rehearsal_database_url.py set-service --guard-result "$out\db-guard.json" --database-url-env SQAG_REHEARSAL_RUNTIME_DATABASE_URL --service-uuid <quote-rehearsal service uuid> --result "$out\db-url-set.json"
      Remove-Item Env:SQAG_REHEARSAL_RUNTIME_DATABASE_URL
      ```
    - Apply every compose or variable change, and every image swap, with
@@ -298,7 +304,7 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
 
    ```powershell
    foreach ($step in "pre-apply", "apply", "post-apply") {
-     node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names NEON_API_KEY -- python scripts\rehearsal_database_url.py run-migrator --guard-result "$out\db-guard.json" --step $step --result "$out\migrator-$step.json"
+     node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names NEONDB_SWOOSHZ_SQAG_API_KEY -- python scripts\rehearsal_database_url.py run-migrator --guard-result "$out\db-guard.json" --step $step --result "$out\migrator-$step.json"
      if ($LASTEXITCODE -ne 0) { break }
    }
    ```
@@ -381,7 +387,7 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
 
      ```powershell
      $env:SQAG_LIVE_COPY_DATABASE_URL = <the copy branch's runtime URL>
-     $r2 = "NEON_API_KEY,SWOOSHZ_SQAG_LIVE_R2_READONLY_ENDPOINT_URL,SWOOSHZ_SQAG_LIVE_R2_READONLY_ACCESS_KEY_ID,SWOOSHZ_SQAG_LIVE_R2_READONLY_SECRET_ACCESS_KEY,SWOOSHZ_SQAG_REHEARSAL_R2_ENDPOINT_URL,SWOOSHZ_SQAG_REHEARSAL_R2_ACCESS_KEY_ID,SWOOSHZ_SQAG_REHEARSAL_R2_SECRET_ACCESS_KEY"
+     $r2 = "NEONDB_SWOOSHZ_SQAG_API_KEY,SWOOSHZ_SQAG_LIVE_R2_READONLY_ENDPOINT_URL,SWOOSHZ_SQAG_LIVE_R2_READONLY_ACCESS_KEY_ID,SWOOSHZ_SQAG_LIVE_R2_READONLY_SECRET_ACCESS_KEY,SWOOSHZ_SQAG_REHEARSAL_R2_ENDPOINT_URL,SWOOSHZ_SQAG_REHEARSAL_R2_ACCESS_KEY_ID,SWOOSHZ_SQAG_REHEARSAL_R2_SECRET_ACCESS_KEY"
      node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names $r2 -- python scripts\copy_live_objects_to_rehearsal.py --targets "$out\walk-targets.json" --source-bucket <live bucket> --expect-dest-bucket sqag-rehearsal --mode plan --confirm-live-read --report "$out\copy-plan.json"
      node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names $r2 -- python scripts\copy_live_objects_to_rehearsal.py --targets "$out\walk-targets.json" --source-bucket <live bucket> --expect-dest-bucket sqag-rehearsal --mode copy --confirm-live-read --report "$out\copy.json"
      Remove-Item Env:SQAG_LIVE_COPY_DATABASE_URL

@@ -3,10 +3,10 @@
 
 Run on the operator's laptop so the rehearsal app on the Neon data branch can reopen
 those quotes. SQAG_LIVE_COPY_DATABASE_URL is the data branch's per-run URL, set in the
-session only (never stored). The bucket tokens, and NEON_API_KEY for the guard's branch
-check, come from the credential store through toolkit env run (names only):
+session only (never stored). The bucket tokens, and NEONDB_SWOOSHZ_SQAG_API_KEY for the
+guard's branch check, come from the credential store through toolkit env run (names only):
 
-    node "<toolkit>/repo/scripts/toolkit-env.cjs" run --names NEON_API_KEY,SWOOSHZ_SQAG_LIVE_R2_READONLY_ENDPOINT_URL,SWOOSHZ_SQAG_LIVE_R2_READONLY_ACCESS_KEY_ID,SWOOSHZ_SQAG_LIVE_R2_READONLY_SECRET_ACCESS_KEY,SWOOSHZ_SQAG_REHEARSAL_R2_ENDPOINT_URL,SWOOSHZ_SQAG_REHEARSAL_R2_ACCESS_KEY_ID,SWOOSHZ_SQAG_REHEARSAL_R2_SECRET_ACCESS_KEY -- python scripts/copy_live_objects_to_rehearsal.py --targets <targets.json> --source-bucket <live bucket> --expect-dest-bucket sqag-rehearsal --mode plan --confirm-live-read
+    node "<toolkit>/repo/scripts/toolkit-env.cjs" run --names NEONDB_SWOOSHZ_SQAG_API_KEY,SWOOSHZ_SQAG_LIVE_R2_READONLY_ENDPOINT_URL,SWOOSHZ_SQAG_LIVE_R2_READONLY_ACCESS_KEY_ID,SWOOSHZ_SQAG_LIVE_R2_READONLY_SECRET_ACCESS_KEY,SWOOSHZ_SQAG_REHEARSAL_R2_ENDPOINT_URL,SWOOSHZ_SQAG_REHEARSAL_R2_ACCESS_KEY_ID,SWOOSHZ_SQAG_REHEARSAL_R2_SECRET_ACCESS_KEY -- python scripts/copy_live_objects_to_rehearsal.py --targets <targets.json> --source-bucket <live bucket> --expect-dest-bucket sqag-rehearsal --mode plan --confirm-live-read
 
 --targets is JSON: {"schema": "sqag-live-walk-targets/v1", "quote_ids": ["quote-<24 hex>"]}.
 Run --mode plan first (reads rows and source heads, writes nothing), then --mode copy;
@@ -15,7 +15,8 @@ copy is safe to repeat. Output is counts only. Exit: 0 ok, 1 mismatch or storage
 
 Before any database or bucket call, the run checks SQAG_LIVE_COPY_DATABASE_URL with
 scripts/neon_branch_guard.py and refuses (exit 2) a host that is Neon's default (production)
-branch. The guard's one line goes to stderr; stdout stays the JSON report.
+branch, or a branch Neon's API did not confirm (the key unset: neon_api not_checked). The
+guard's one line goes to stderr; stdout stays the JSON report.
 """
 
 from __future__ import annotations
@@ -122,12 +123,14 @@ def check_buckets(source_bucket: str, dest_bucket: str, map_path: Path) -> None:
 
 
 def check_production_guard(env: Mapping[str, str], map_path: Path) -> None:
-    """Refuse a database URL that names Neon's default (production) branch. Runs before any call."""
+    """Refuse a database URL that names Neon's default (production) branch, or one Neon's API did
+    not confirm. Runs before any call."""
     try:
         rehearsal_map = neon_branch_guard.load_map(map_path)
-        neon_branch_guard.check_database_target(
+        result = neon_branch_guard.check_database_target(
             env[DB_URL_ENV].strip(), rehearsal_map, neon_branch_guard.neon_client_from_env(env)
         )
+        neon_branch_guard.require_neon_checked(result)
     except neon_branch_guard.GuardRefusal as exc:
         raise Refusal(f"production database guard refused: {exc}") from None
 

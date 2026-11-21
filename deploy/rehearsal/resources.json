@@ -232,9 +232,10 @@
   "image_retention": "Keep the current live image, the previous live image and the candidate. Removing any other image or old container is a separate owner-approved server action.",
   "workspace_id": "sqag-rehearsal",
   "production_guard": {
-    "purpose": "Every step that writes to a rehearsal database runs scripts/neon_branch_guard.py first. It refuses a database host whose endpoint is listed here, a branch that is Neon's default or does not start with branch_prefix, or a host it cannot place. After it passes, scripts/rehearsal_database_url.py runs it again on the exact URL each step uses: set-service writes a rehearsal service's SQAG_DATABASE_URL through Coolify's API, and run-migrator guards the migrator URL before the role password reset and each migration step. The live object copy runs it on its own database URL. Names and ids only.",
+    "purpose": "Every step that writes to a rehearsal database runs scripts/neon_branch_guard.py first, with the Neon key NEONDB_SWOOSHZ_SQAG_API_KEY from the credential store. It refuses a database host whose endpoint is listed here or starts with one followed by - (Neon's per-compute hosts of that endpoint), a branch that is Neon's default or does not start with branch_prefix, or a host it cannot place. The key is scoped to this one project, so when Neon refuses to list projects the guard reads the project by neon_project_id and requires the name neon_project. After it passes, scripts/rehearsal_database_url.py runs it again on the exact URL each step uses: set-service writes a rehearsal service's SQAG_DATABASE_URL through Coolify's API, and run-migrator guards the migrator URL before the role password reset and each migration step. The live object copy runs it on its own database URL. Each of these refuses a result that Neon's API did not confirm (neon_api not_checked). Names and ids only.",
     "script": "scripts/neon_branch_guard.py",
     "neon_project": "swooshz-sqag",
+    "neon_project_id": "royal-shadow-60173128",
     "branch_prefix": "rehearsal-",
     "forbidden_endpoints": [
       {
@@ -243,7 +244,7 @@
         "branch_id": "br-blue-breeze-azlylkzw"
       }
     ],
-    "source": "Evidence store record alpha1-retirement-record-20261106 (live's default branch and its compute). The first run confirms both ids are still live's before relying on them."
+    "source": "Evidence store record alpha1-retirement-record-20261106 (live's default branch and its compute). Confirmed read-only through Neon's API on 21 Nov 2026 with the project id (evidence store, issue 390, pass-a-25068d9 hold record)."
   },
   "live_copy": {
     "purpose": "Pass A of the live-data end-to-end test: the candidate image on a copy of live data, before live switches. Nothing is written to live.",

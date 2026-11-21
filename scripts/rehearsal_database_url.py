@@ -17,14 +17,16 @@ run-migrator  Runs one migration step on the branch: check (the guard only, befo
               SQAG_MAINTENANCE_DATABASE_URL (post-apply needs both) before the step runs.
 
 Both commands need the guard's passing result for the branch (--guard-result, at most 12
-hours old) and run the guard again on every URL they use: a URL on live's endpoint, on
-another endpoint than the guarded one, or that the guard cannot place is refused before
+hours old, checked with Neon's API) and run the guard again, with the Neon key, on every URL
+they use: a URL on live's endpoint, on another endpoint than the guarded one, that the guard
+cannot place, or that Neon's API did not confirm (neon_api not_checked) is refused before
 any call. URLs are never printed, logged or stored; records hold hosts, ids and statuses.
 
-    node <toolkit>/repo/scripts/toolkit-env.cjs run --names NEON_API_KEY,COOLIFY_SWOOSHZ_API_URL,COOLIFY_SWOOSHZ_API_TOKEN -- \\
+    node <toolkit>/repo/scripts/toolkit-env.cjs run --names NEONDB_SWOOSHZ_SQAG_API_KEY,COOLIFY_SWOOSHZ_API_URL,COOLIFY_SWOOSHZ_API_TOKEN -- \\
       python scripts/rehearsal_database_url.py set-service --guard-result <db-guard.json> \\
         --database-url-env <NAME> --service-uuid <uuid> --result <db-url-set.json>
-    python scripts/rehearsal_database_url.py run-migrator --guard-result <db-guard.json> \\
+    node <toolkit>/repo/scripts/toolkit-env.cjs run --names NEONDB_SWOOSHZ_SQAG_API_KEY -- \\
+      python scripts/rehearsal_database_url.py run-migrator --guard-result <db-guard.json> \\
         --step check|pre-apply|apply|post-apply --result <migrator-step.json>
 
 Exit codes: 0 pass; 2 refused before any call; 1 Coolify or unexpected error; a failed
@@ -76,7 +78,7 @@ def _stamp(moment: datetime) -> str:
 
 
 def load_guard_result(path: Path, now: datetime) -> dict[str, Any]:
-    """The guard's passing result for the branch, at most 12 hours old."""
+    """The guard's passing result for the branch, checked with Neon's API, at most 12 hours old."""
     try:
         result = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -85,6 +87,7 @@ def load_guard_result(path: Path, now: datetime) -> dict[str, Any]:
         raise guard.GuardRefusal("--guard-result is not a production-branch guard result")
     if result.get("status") != "pass":
         raise guard.GuardRefusal("the production-branch guard did not pass for this branch")
+    guard.require_neon_checked(result)
     endpoint_id = result.get("endpoint_id")
     if not isinstance(endpoint_id, str) or guard.ENDPOINT_ID_RE.fullmatch(endpoint_id) is None:
         raise guard.GuardRefusal("--guard-result names no endpoint")
@@ -98,13 +101,15 @@ def load_guard_result(path: Path, now: datetime) -> dict[str, Any]:
 
 
 def guarded_url(env: Mapping[str, str], name: str, guarded: Mapping[str, Any], rehearsal_map: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
-    """(URL, this guard run's result) for the variable `name`, refused unless it is the guarded branch."""
+    """(URL, this guard run's result) for the variable `name`, refused unless Neon's API confirmed
+    its branch and it is on the guarded branch's endpoint."""
     if not guard.ENV_NAME_RE.fullmatch(name):
         raise guard.GuardRefusal("the URL variable must be an environment variable name (letters, digits, underscore)")
     value = str(env.get(name) or "").strip()
     if not value:
         raise guard.GuardRefusal(f"{name} is unset or empty")
     result = guard.check_database_target(value, rehearsal_map, guard.neon_client_from_env(env))
+    guard.require_neon_checked(result)
     if result["endpoint_id"] != guarded["endpoint_id"]:
         raise guard.GuardRefusal(f"{name} is not on the guarded branch's endpoint")
     return value, result
@@ -155,7 +160,7 @@ def run_migrator(args: argparse.Namespace, env: Mapping[str, str], runner: Calla
     names = [MIGRATOR_URL] + [name for name in (RUNTIME_URL, MAINTENANCE_URL) if args.step == "post-apply" or name in env]
     for name in names:
         guarded_url(env, name, guarded, rehearsal_map)
-    record.update(endpoint_id=guarded["endpoint_id"], checked_variables=sorted(names))
+    record.update(endpoint_id=guarded["endpoint_id"], neon_api=guarded["neon_api"], checked_variables=sorted(names))
     command = STEPS[args.step]
     code = runner([sys.executable, *command], dict(env)) if command else 0
     record.update(exit_code=code, status="pass" if code == 0 else "step_failed", reason=None if code == 0 else "the migration step failed")

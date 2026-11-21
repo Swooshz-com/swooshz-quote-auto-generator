@@ -22,6 +22,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import scripts.copy_live_objects_to_rehearsal as copy_script  # noqa: E402
+from scripts import neon_branch_guard  # noqa: E402
+from tests.neon_guard_fakes import COPY_BRANCH, KEY, FakeNeon, fake_client_from_env  # noqa: E402
 from webapp import object_storage  # noqa: E402
 
 MAP_BUCKET = json.loads((ROOT / "deploy" / "rehearsal" / "resources.json").read_text(encoding="utf-8"))["storage"][
@@ -32,6 +34,9 @@ REGION = "c-0.fake-region-1.aws.neon.tech"
 PRODUCTION_ENDPOINT = "ep-fake-production-000001"
 PRODUCTION_HOST = f"{PRODUCTION_ENDPOINT}.{REGION}"
 PRODUCTION_POOLER_HOST = f"{PRODUCTION_ENDPOINT}-pooler.{REGION}"
+# Per-compute hosts of the same endpoint (a binding suffix, then an optional -pooler).
+PRODUCTION_BINDING_HOST = f"{PRODUCTION_ENDPOINT}-gvz.{REGION}"
+PRODUCTION_BINDING_POOLER_HOST = f"{PRODUCTION_ENDPOINT}-gvz-pooler.{REGION}"
 # A temp map with the production guard section, so the guard's rules run against a fixture
 # and not against whatever the real map holds.
 GUARD_DIR = tempfile.TemporaryDirectory()
@@ -67,7 +72,7 @@ DB_URL = (
     "postgresql://runtime-user:planted-db-password@ep-fake-rehearsal-000001.c-0.fake-region-1.aws.neon.tech"
     "/neondb?sslmode=require"
 )
-REHEARSAL_GUARD_LINE = "target host ep-fake-rehearsal-000001.c-0.fake-region-1.aws.neon.tech branch not checked\n"
+REHEARSAL_GUARD_LINE = f"target host ep-fake-rehearsal-000001.c-0.fake-region-1.aws.neon.tech branch {COPY_BRANCH}\n"
 LIVE_ENDPOINT = "https://live-r2.example.test"
 REHEARSAL_ENDPOINT = "https://rehearsal-r2.example.test"
 LIVE_KEY_ID = "live-key-id-planted"
@@ -76,6 +81,7 @@ LIVE_SECRET = "live-secret-planted-value"
 REHEARSAL_SECRET = "rehearsal-secret-planted-value"
 PLANTED = (
     DB_URL,
+    KEY,
     "planted-db-password",
     WORKSPACE,
     PLANTED_NAME,
@@ -232,6 +238,7 @@ def base_env() -> dict[str, str]:
     values = (LIVE_ENDPOINT, LIVE_KEY_ID, LIVE_SECRET, REHEARSAL_ENDPOINT, REHEARSAL_KEY_ID, REHEARSAL_SECRET)
     env = dict(zip(copy_script.SOURCE_NAMES + copy_script.DEST_NAMES, values))
     env[copy_script.DB_URL_ENV] = DB_URL
+    env[neon_branch_guard.NEON_KEY_ENV] = KEY
     return env
 
 
@@ -274,6 +281,11 @@ class CopyLiveObjectsTests(unittest.TestCase):
         self.db = FakeDb(DEFAULT_ROWS)
         self.source = FakeS3(live_objects())
         self.dest = FakeS3()
+        # Neon's API is faked: it confirms a rehearsal branch whenever the key's name is set.
+        self.neon = FakeNeon()
+        patcher = mock.patch.object(neon_branch_guard, "neon_client_from_env", fake_client_from_env(self.neon))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def run_script(self, argv: list[str], *, env=None, rows=None, source=None, dest=None):
         self.db = FakeDb(DEFAULT_ROWS if rows is None else rows)
@@ -299,7 +311,7 @@ class CopyLiveObjectsTests(unittest.TestCase):
             )
 
     def test_production_branch_host_is_refused_before_any_call(self) -> None:
-        for host in (PRODUCTION_HOST, PRODUCTION_POOLER_HOST):
+        for host in (PRODUCTION_HOST, PRODUCTION_POOLER_HOST, PRODUCTION_BINDING_HOST, PRODUCTION_BINDING_POOLER_HOST):
             with self.subTest(host):
                 url = f"postgresql://runtime-user:planted-db-password@{host}/neondb?sslmode=require"
                 code, report = self.run_script(
@@ -310,8 +322,20 @@ class CopyLiveObjectsTests(unittest.TestCase):
                 self.assertIn(f"target host {host} branch not checked\n", self.stderr.getvalue())
                 self.assertEqual((self.opened, self.db.statements), ([], []))
                 self.assertEqual((self.source.calls, self.dest.calls), ([], []))
+                self.assertEqual(self.neon.calls, [])
                 for text in (json.dumps(report), self.stderr.getvalue()):
                     self.assertNotIn("planted-db-password", text)
+
+    def test_a_branch_neon_did_not_confirm_is_refused_before_any_call(self) -> None:
+        env = {k: v for k, v in base_env().items() if k != neon_branch_guard.NEON_KEY_ENV}
+        for mode in ("plan", "copy"):
+            with self.subTest(mode):
+                code, report = self.run_script(argv_for(self.targets, mode), env=env)
+                self.assertEqual((code, report["status"]), (2, "refused"), report)
+                self.assertTrue(report["error"].startswith("production database guard refused: the guard did not check"), report)
+                self.assertIn(neon_branch_guard.NEON_KEY_ENV, report["error"])
+                self.assertEqual((self.opened, self.db.statements), ([], []))
+                self.assertEqual((self.source.calls, self.dest.calls), ([], []))
 
     def test_refusals_stop_before_any_db_or_storage_call(self) -> None:
         cases: list[tuple[str, list[str], dict[str, str]]] = [
