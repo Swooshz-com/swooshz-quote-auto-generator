@@ -8,15 +8,20 @@
 //        [--ai-ok --ai-ledger <run ledger.json> [--ai-cap-usd 1]]
 //        [--manifest deploy/rehearsal/live-cases.json [--targets-out <file.json> [--targets-only]]
 //         [--download-files [--click-budget] | --expect-files <Pass A result.json>]]
-//        [--db-guard <neon_branch_guard result.json>]
+//        [--db-guard <rehearsal_database_url.py set-service record.json>]
 //        [--allow-loopback-http [--file-storage]]
 //
 // Database guard: a writing profile (seed, verify, reopen) on any non-loopback
 // host, and every run on the copy of live (a host that says rehearsal-copy),
-// needs --db-guard: the result of scripts/neon_branch_guard.py on the database
-// URL that app was given, passed and at most 12 hours old. The guard refuses
-// live's default (production) branch, so a mistyped database URL stops the run
-// before it writes to live. Its host and branch name go into the result.
+// needs --db-guard: the record of scripts/rehearsal_database_url.py set-service
+// for the service under test (the first label of --base-url), passed and at most
+// 12 hours old. That script is the only way the doc sets a rehearsal service's
+// SQAG_DATABASE_URL: it runs the production-branch guard
+// (scripts/neon_branch_guard.py) on the very URL it writes to Coolify and
+// refuses live's endpoint or any endpoint but the guarded branch's. This check
+// cannot see the database behind the app; it relies on the URL having been set
+// only that way, never by hand. The record's service, host and branch name go
+// into the result.
 //
 // Paid AI (seed's pricing-reference enrichment, verify's image analysis) needs
 // --ai-ok and a ledger file shared by every check in the run; the run stops
@@ -163,7 +168,7 @@ export function parseArgs(argv, env = process.env) {
   options.baseUrl = checkBaseUrl(options.baseUrl, options.profile, options.allowLoopbackHttp, env);
   checkWalkHost(options);
   if (needsDbGuard(options) && !options.dbGuard) {
-    throw new UsageError("this run writes to a rehearsal database: run scripts/neon_branch_guard.py on its database URL first and pass --db-guard <result.json>");
+    throw new UsageError("this run writes to a rehearsal database: set the service's database URL with scripts/rehearsal_database_url.py set-service and pass --db-guard <its record>");
   }
   options.credentials = readCredentials(env, loginNames(options.profile, options.baseUrl));
   return options;
@@ -204,8 +209,8 @@ function checkWalkHost(options) {
   }
 }
 
-// Writing to a hosted database, or anything on the copy of live, needs the
-// production-branch guard's pass first.
+// Writing to a hosted database, or anything on the copy of live, needs the record
+// that the service's database URL was set from the guarded branch.
 export function needsDbGuard(options) {
   const host = new URL(options.baseUrl).hostname.toLowerCase();
   if (LOOPBACK_HOSTS.has(host)) return false;
@@ -214,21 +219,28 @@ export function needsDbGuard(options) {
 
 export const DB_GUARD_MAX_AGE_MS = 12 * 60 * 60 * 1000;
 
-export async function readDbGuard(file, now = Date.now()) {
-  let guard;
+// --db-guard is the record of scripts/rehearsal_database_url.py set-service: the
+// service's SQAG_DATABASE_URL was written from a URL the production-branch guard
+// passed, and that service is the app under test (its host's first label).
+export async function readDbGuard(file, baseUrl, now = Date.now()) {
+  let record;
   try {
-    guard = JSON.parse(await fs.readFile(file, "utf8"));
+    record = JSON.parse(await fs.readFile(file, "utf8"));
   } catch {
     throw new UsageError("--db-guard is unreadable");
   }
-  if (guard?.schema !== "sqag-db-guard/v1" || guard.status !== "pass") {
-    throw new UsageError("--db-guard is not a passing production-branch guard result: the database may be live's, so nothing was sent");
+  if (record?.schema !== "sqag-db-url-set/v1" || record.status !== "pass") {
+    throw new UsageError("--db-guard is not a passing set-service record: the database may be live's, so nothing was sent");
   }
-  const checked = Date.parse(String(guard.checked_at || ""));
+  const checked = Date.parse(String(record.checked_at || ""));
   if (!Number.isFinite(checked) || checked > now + 60000 || now - checked > DB_GUARD_MAX_AGE_MS) {
-    throw new UsageError("--db-guard is older than 12 hours or undated: run the guard again");
+    throw new UsageError("--db-guard is older than 12 hours or undated: run the guard and set-service again");
   }
-  return { host: String(guard.host || ""), branch_name: guard.branch_name ?? null, neon_api: String(guard.neon_api || ""), checked_at: guard.checked_at };
+  const service = new URL(baseUrl).hostname.toLowerCase().split(".")[0];
+  if (!record.service_name || record.service_name !== service) {
+    throw new UsageError("--db-guard is for another service than --base-url");
+  }
+  return { service_name: record.service_name, host: String(record.host || ""), branch_name: record.branch_name ?? null, neon_api: String(record.neon_api || ""), checked_at: record.checked_at };
 }
 
 // Paid AI runs only with the owner's OK and a run ledger, refused before any request.
@@ -1320,7 +1332,7 @@ export async function loadRunInputs(options) {
     // Listing candidates for the owner to approve is the one use of an unapproved manifest.
     options.manifestIds = validateManifest(manifest, { requireApproval: !options.targetsOnly });
   }
-  if (options.dbGuard) options.dbGuardResult = await readDbGuard(options.dbGuard);
+  if (options.dbGuard) options.dbGuardResult = await readDbGuard(options.dbGuard, options.baseUrl);
   if (options.expectFiles) options.expectedFiles = await readPassAFiles(options.expectFiles);
   if (aiNeeded(options)) options.budget = await loadBudget(options.aiLedger, { ok: options.aiOk, capUsd: options.aiCapUsd });
   return options;

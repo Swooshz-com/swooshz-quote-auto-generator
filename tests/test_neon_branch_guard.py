@@ -1,8 +1,9 @@
 """Production database guard tests: offline, with a fake Neon client and temp maps.
 
 No network. The Neon API is faked; the NeonClient tests patch the HTTP opener, so nothing
-leaves the process. Hosts and ids are fakes, except the production endpoint and branch ids
-that the rehearsal map records. Credentials, query values and the key are synthetic.
+leaves the process. Hosts, regions and ids are fakes: the production endpoint is a fake one
+recorded in each test's map, so the rules run against a fixture and live's real names stay
+only in deploy/rehearsal/resources.json. Credentials, query values and the key are synthetic.
 """
 
 from __future__ import annotations
@@ -27,14 +28,15 @@ if str(ROOT) not in sys.path:
 
 from scripts import neon_branch_guard as guard  # noqa: E402
 
-PRODUCTION_ENDPOINT = "ep-weathered-king-az5onvhs"
-PRODUCTION_BRANCH = "br-blue-breeze-azlylkzw"
-PRODUCTION_HOST = f"{PRODUCTION_ENDPOINT}.c-3.ap-southeast-1.aws.neon.tech"
-PRODUCTION_POOLER_HOST = f"{PRODUCTION_ENDPOINT}-pooler.c-3.ap-southeast-1.aws.neon.tech"
+REGION = "c-0.fake-region-1.aws.neon.tech"
+PRODUCTION_ENDPOINT = "ep-fake-production-000001"
+PRODUCTION_BRANCH = "br-fake-production-000001"
+PRODUCTION_HOST = f"{PRODUCTION_ENDPOINT}.{REGION}"
+PRODUCTION_POOLER_HOST = f"{PRODUCTION_ENDPOINT}-pooler.{REGION}"
 REHEARSAL_ENDPOINT = "ep-fake-rehearsal-000001"
 REHEARSAL_BRANCH = "br-fake-rehearsal-000001"
-REHEARSAL_HOST = f"{REHEARSAL_ENDPOINT}.c-3.ap-southeast-1.aws.neon.tech"
-REHEARSAL_POOLER_HOST = f"{REHEARSAL_ENDPOINT}-pooler.c-3.ap-southeast-1.aws.neon.tech"
+REHEARSAL_HOST = f"{REHEARSAL_ENDPOINT}.{REGION}"
+REHEARSAL_POOLER_HOST = f"{REHEARSAL_ENDPOINT}-pooler.{REGION}"
 PROJECT_NAME = "swooshz-sqag"
 PROJECT_ID = "fake-project-000001"
 OTHER_PROJECT_ID = "fake-project-000002"
@@ -50,6 +52,7 @@ RESULT_KEYS = {
     "status",
     "host",
     "endpoint_id",
+    "branch_id",
     "branch_name",
     "branch_default",
     "neon_api",
@@ -173,6 +176,15 @@ class GuardTests(GuardTestCase):
             ("host override in the query", url(REHEARSAL_HOST, query=f"host={PRODUCTION_HOST}"), None, "host override", None),
             ("hostaddr override in the query", url(REHEARSAL_HOST, query="hostaddr=203.0.113.7"), None, "host override", None),
             ("service override in the query", url(REHEARSAL_HOST, query="service=fake-service-planted"), None, "host override", None),
+            # Neon reads the endpoint from options when SNI is off, so either key can name another endpoint.
+            (
+                "endpoint option in the query",
+                url(REHEARSAL_HOST, query=f"sslmode=require&options=endpoint%3D{PRODUCTION_ENDPOINT}"),
+                None,
+                "host override",
+                None,
+            ),
+            ("SNI turned off in the query", url(REHEARSAL_HOST, query="sslmode=require&sslsni=0"), None, "host override", None),
             ("second at sign", f"postgresql://{USER}:{PASSWORD}@raw@{REHEARSAL_HOST}/neondb", None, UNKNOWN, None),
             ("no host", "postgresql:///neondb", None, UNKNOWN, None),
             ("keyword form", f"host={PRODUCTION_HOST} dbname=neondb", None, UNKNOWN, None),
@@ -212,8 +224,8 @@ class GuardTests(GuardTestCase):
                 result, err = self.passed(url(host))
                 self.assertEqual(set(result), RESULT_KEYS)
                 self.assertEqual(
-                    (result["status"], result["neon_api"], result["branch_name"], result["branch_default"], result["reason"]),
-                    ("pass", "not_checked", None, None, None),
+                    (result["status"], result["neon_api"], result["branch_id"], result["branch_name"], result["branch_default"], result["reason"]),
+                    ("pass", "not_checked", None, None, None, None),
                 )
                 self.assertEqual((result["host"], result["endpoint_id"]), (host, REHEARSAL_ENDPOINT))
                 self.assertEqual(err, f"target host {host} branch not checked\n")
@@ -224,9 +236,10 @@ class GuardTests(GuardTestCase):
         neon = FakeNeon()
         result, err = self.passed(url(REHEARSAL_HOST), neon=neon)
         self.assertEqual(set(result), RESULT_KEYS)
+        # The branch id is recorded for the role password reset, which Neon names by branch.
         self.assertEqual(
-            (result["status"], result["neon_api"], result["branch_name"], result["branch_default"], result["reason"]),
-            ("pass", "checked", COPY_BRANCH, False, None),
+            (result["status"], result["neon_api"], result["branch_id"], result["branch_name"], result["branch_default"], result["reason"]),
+            ("pass", "checked", REHEARSAL_BRANCH, COPY_BRANCH, False, None),
         )
         self.assertEqual((result["host"], result["endpoint_id"]), (REHEARSAL_HOST, REHEARSAL_ENDPOINT))
         self.assertEqual(neon.calls, ["projects", "endpoint", "branch"])

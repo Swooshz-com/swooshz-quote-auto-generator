@@ -59,8 +59,13 @@ create, test, delete, with no new decisions per run.
   default-branch endpoint listed in the map's `production_guard`, a branch
   Neon marks as default or one whose name does not start with `rehearsal-`,
   and any host it cannot place. It prints the host and branch name only.
-  Writing checks on a rehearsal host, and every check on the copy of live,
-  refuse to start without its passing result (`--db-guard`).
+  After it passes, `scripts/rehearsal_database_url.py` is the only way a
+  rehearsal step uses a database URL: `set-service` writes a rehearsal
+  service's `SQAG_DATABASE_URL` through Coolify's API and `run-migrator` runs
+  each migration step. Both run the guard again on the exact URL they use and
+  refuse one that is not on the guarded branch's endpoint. Writing checks on
+  a rehearsal host, and every check on the copy of live, refuse to start
+  without `set-service`'s record for that service (`--db-guard`).
 
 ### One-time rehearsal setup
 
@@ -176,31 +181,59 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      name `rehearsal-<short>`:
 
      ```powershell
+     $out = "_tmp\deploy-$short-out"
      $env:SQAG_GUARD_DATABASE_URL = <the rehearsal-<short> branch's URL>
-     node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names NEON_API_KEY -- python scripts\neon_branch_guard.py --database-url-env SQAG_GUARD_DATABASE_URL --result "_tmp\deploy-$short-out\db-guard.json"
+     node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names NEON_API_KEY -- python scripts\neon_branch_guard.py --database-url-env SQAG_GUARD_DATABASE_URL --result "$out\db-guard.json"
      Remove-Item Env:SQAG_GUARD_DATABASE_URL
      ```
 
-     Every writing check on this rehearsal passes `--db-guard` with that file
-     and refuses to start without a passing one under 12 hours old. Run the
-     guard again if the branch's URL changes.
-   - Reset the passwords of the roles on the `rehearsal-<short>` branch,
-     named by its branch id, so no live password is used. Never reset a
-     password on the default branch.
-   - Run the read-only preflight on the branch with the branch's migrator URL
-     (see [the migration runbook](postgres-migration-runbook.md)). It must
-     report ready, with live's applied IDs and only the candidate's new
-     migrations pending.
+     The result (under 12 hours old) is the `--guard-result` of every
+     `scripts/rehearsal_database_url.py` step on this branch. Run the guard
+     again if the branch's URL changes.
+   - Before the role password reset, check that the migrator URL you hold is
+     the guarded branch's, with the guard only (`--step check`). Then reset
+     the roles' passwords on the branch the result names: its `branch_id`,
+     recorded when the guard checked Neon's API. Without it
+     (`neon_api: not_checked`), first check in Neon that the branch
+     `rehearsal-<short>` owns the result's `endpoint_id`. Never reset a
+     password on the default branch. Then set the migrator URL with the new
+     password and run the read-only preflight through the same script (see
+     [the migration runbook](postgres-migration-runbook.md)). It must report
+     ready, with live's applied IDs and only the candidate's new migrations
+     pending:
+
+     ```powershell
+     $env:SQAG_MIGRATOR_DATABASE_URL = <the branch's migrator URL>
+     node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names NEON_API_KEY -- python scripts\rehearsal_database_url.py run-migrator --guard-result "$out\db-guard.json" --step check --result "$out\migrator-check.json"
+     # reset the roles' passwords on the result's branch_id, then hold the migrator URL with its new password
+     node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names NEON_API_KEY -- python scripts\rehearsal_database_url.py run-migrator --guard-result "$out\db-guard.json" --step pre-apply --result "$out\migrator-pre-apply.json"
+     ```
+
+     Each step exits 2 and runs nothing when a URL it holds is not on the
+     guarded branch's endpoint.
    - In Coolify, create the Docker Compose service `quote-rehearsal` on the
      same server and project as live and paste `deploy/rehearsal/compose.yaml`.
      Set each variable from the source the map gives it: shared settings from
      the `shared` values in `deploy/internal/release-settings.json`, generated
-     secrets, the branch's runtime URL, the credential-store entries the map
-     names (the R2 token, the R2 endpoint and the AI key) and the run values. Set
-     `REHEARSAL_IMAGE_ID` to the image live runs now. Give it the host
+     secrets, the credential-store entries the map names (the R2 token, the R2
+     endpoint and the AI key) and the run values. Set `REHEARSAL_IMAGE_ID` to
+     the image live runs now. Give it the host
      `quote-rehearsal.<server-ip>.sslip.io`. Coolify services have no basic
      auth, so access control is the app's own sign-in with the run's test-only
      logins.
+   - Never paste the database URL into Coolify. `set-service` writes the
+     service's `SQAG_DATABASE_URL` through Coolify's API from the runtime URL
+     you hold in this session, after it runs the guard again on that exact
+     value. It reads only the service's name (it must be a `coolify_service`
+     in the map), never its environment values, and its record is the
+     `--db-guard` file of every check below. Run it again whenever the URL
+     changes:
+
+     ```powershell
+     $env:SQAG_REHEARSAL_RUNTIME_DATABASE_URL = <the branch's runtime URL, after the password reset>
+     node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names NEON_API_KEY,COOLIFY_SWOOSHZ_API_URL,COOLIFY_SWOOSHZ_API_TOKEN -- python scripts\rehearsal_database_url.py set-service --guard-result "$out\db-guard.json" --database-url-env SQAG_REHEARSAL_RUNTIME_DATABASE_URL --service-uuid <quote-rehearsal service uuid> --result "$out\db-url-set.json"
+     Remove-Item Env:SQAG_REHEARSAL_RUNTIME_DATABASE_URL
+     ```
    - Apply every compose or variable change, and every image swap, with
      Coolify's deploy API for the service: `POST /api/v1/deploy?uuid=<service
      uuid>`. A service restart does not re-render the compose, so it keeps the
@@ -243,7 +276,7 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
    $rehearsal = "https://quote-rehearsal.<server-ip>.sslip.io"
    $out = "_tmp\deploy-$short-out"
    $ledger = "$out\ai-ledger.json"
-   $guard = "$out\db-guard.json"
+   $guard = "$out\db-url-set.json"
    node scripts\rehearsal-check.mjs --profile seed --base-url $rehearsal --result "$out\seed.json" --ai-ok --ai-ledger $ledger --db-guard $guard
    ```
 
@@ -257,9 +290,21 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
    own result file; a failed step holds promotion.
 
 5. **Migrate the rehearsal database** if the candidate has pending migrations:
-   pre-apply check, one apply, post-apply check, all on the branch with its
-   migrator URL. Then run the reopen profile on the current image to prove it
-   still serves the seed on the new schema:
+   pre-apply check, one apply, post-apply check, all on the branch and each
+   through `scripts/rehearsal_database_url.py run-migrator`. Hold the
+   branch's migrator, runtime and maintenance URLs in this session only; each
+   step guards every one it holds (post-apply needs all three) and runs
+   nothing if one is not on the guarded branch's endpoint:
+
+   ```powershell
+   foreach ($step in "pre-apply", "apply", "post-apply") {
+     node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names NEON_API_KEY -- python scripts\rehearsal_database_url.py run-migrator --guard-result "$out\db-guard.json" --step $step --result "$out\migrator-$step.json"
+     if ($LASTEXITCODE -ne 0) { break }
+   }
+   ```
+
+   Then run the reopen profile on the current image to prove it still serves
+   the seed on the new schema:
    `node scripts\rehearsal-check.mjs --profile reopen --base-url $rehearsal --seed-file "$out\seed.json" --result "$out\reopen-migrated.json" --db-guard $guard`.
 
 6. **Upgrade.** Set `REHEARSAL_IMAGE_ID` to the candidate image id, redeploy
@@ -288,9 +333,13 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      with data, as the map's `neon-data-branch` says, and record the time.
      Before anything writes to it, run the production-branch guard (step 3)
      on its URL with the result `"$out\db-guard-copy.json"`. Require exit 0
-     and the branch name `rehearsal-copy-<short>`. Then reset the roles'
-     passwords on that branch only and apply the candidate's pending
-     migrations to it as in step 5. Run the guard again if the URL changes.
+     and the branch name `rehearsal-copy-<short>`. Run the guard again if the
+     URL changes.
+   - As in step 3, with `--guard-result "$out\db-guard-copy.json"` and
+     result files named `copy-migrator-<step>.json`: run `run-migrator --step
+     check` on the migrator URL you hold, reset the roles' passwords on the
+     result's `branch_id` only, then apply the candidate's pending migrations
+     with `run-migrator` as in step 5.
    - On the branch, read the one `workspace_id` in
      `public.sqag_quote_sessions` (an opaque id; read nothing else).
    - Generate this run's copy password straight into the laptop credential
@@ -300,18 +349,21 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
    - In Coolify, create the service `quote-rehearsal-copy` from
      `deploy/rehearsal/compose-live-copy.yaml` with the host
      `quote-rehearsal-copy.<server-ip>.sslip.io`. Set its values as for
-     `quote-rehearsal` in step 3, with `REHEARSAL_IMAGE_ID` the candidate, the
-     branch's runtime URL, `SWOOSHZ_SQAG_REHEARSAL_UAT_LOGIN_PASSWORD` as the
-     admin password and the map's `live_copy` run values: the workspace id,
-     the owner's own sign-in email (twice) and `[]` for the identity bindings,
-     or the one row the owner supplies. Derive the proxy subnet as in step 3
-     and wait for health.
+     `quote-rehearsal` in step 3, with `REHEARSAL_IMAGE_ID` the candidate,
+     `SWOOSHZ_SQAG_REHEARSAL_UAT_LOGIN_PASSWORD` as the admin password and the
+     map's `live_copy` run values: the workspace id, the owner's own sign-in
+     email (twice) and `[]` for the identity bindings, or the one row the
+     owner supplies. Set its `SQAG_DATABASE_URL` only with `set-service` as in
+     step 3, from the copy branch's runtime URL, with
+     `--guard-result "$out\db-guard-copy.json"`, the copy service's uuid and
+     `--result "$out\db-url-set-copy.json"`. Derive the proxy subnet as in
+     step 3 and wait for health.
    - List the walk targets. On a host that says rehearsal the walk signs in
      with the rehearsal names, so live's password never reaches the copy:
 
      ```powershell
      $copy = "https://quote-rehearsal-copy.<server-ip>.sslip.io"
-     $copyGuard = "$out\db-guard-copy.json"
+     $copyGuard = "$out\db-url-set-copy.json"
      $env:SQAG_REHEARSAL_LOGIN_EMAIL = "<the owner's own sign-in email>"
      $env:SQAG_REHEARSAL_LOGIN_PASSWORD = <SWOOSHZ_SQAG_REHEARSAL_UAT_LOGIN_PASSWORD from the credential store>
      node scripts\rehearsal-check.mjs --profile live-readonly --base-url $copy --manifest deploy\rehearsal\live-cases.json --targets-out "$out\walk-targets.json" --targets-only --result "$out\copy-targets.json" --db-guard $copyGuard

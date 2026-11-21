@@ -137,6 +137,21 @@ class Git:
         self.run("push", "origin", f"HEAD:refs/heads/{BRANCH}")
 
 
+class CoolifyHttpError(RuntimeError):
+    """A Coolify call answered with an HTTP error. Only the method and status are kept, never the body."""
+
+    def __init__(self, method: str, status: int) -> None:
+        super().__init__(f"Coolify {method} returned HTTP {status}")
+        self.status = status
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect would resend the token to another address, so it becomes an error instead."""
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        return None
+
+
 class Coolify:
     def __init__(self, env: dict[str, str]) -> None:
         base = str(env.get("COOLIFY_SWOOSHZ_API_URL") or "").rstrip("/")
@@ -146,14 +161,18 @@ class Coolify:
         self.base = base if base.endswith("/api/v1") else base + "/api/v1"
         self.token = token
 
-    def call(self, method: str, path: str) -> Any:
-        request = urllib.request.Request(self.base + path, method=method, headers={
-            "Authorization": f"Bearer {self.token}", "Accept": "application/json"})
+    def call(self, method: str, path: str, body: Any = None) -> Any:
+        headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/json"}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with urllib.request.build_opener(_NoRedirect).open(request, timeout=60) as response:
                 return json.loads(response.read() or b"{}")
         except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"Coolify {method} returned HTTP {exc.code}") from None
+            raise CoolifyHttpError(method, exc.code) from None
 
     def app_name(self, uuid: str) -> str:
         return str(self.call("GET", f"/applications/{uuid}").get("name") or "")

@@ -27,9 +27,11 @@ from webapp import object_storage  # noqa: E402
 MAP_BUCKET = json.loads((ROOT / "deploy" / "rehearsal" / "resources.json").read_text(encoding="utf-8"))["storage"][
     "bucket"
 ]
-PRODUCTION_ENDPOINT = "ep-weathered-king-az5onvhs"
-PRODUCTION_HOST = f"{PRODUCTION_ENDPOINT}.c-3.ap-southeast-1.aws.neon.tech"
-PRODUCTION_POOLER_HOST = f"{PRODUCTION_ENDPOINT}-pooler.c-3.ap-southeast-1.aws.neon.tech"
+# A fake production endpoint and region: live's real names stay only in the rehearsal map.
+REGION = "c-0.fake-region-1.aws.neon.tech"
+PRODUCTION_ENDPOINT = "ep-fake-production-000001"
+PRODUCTION_HOST = f"{PRODUCTION_ENDPOINT}.{REGION}"
+PRODUCTION_POOLER_HOST = f"{PRODUCTION_ENDPOINT}-pooler.{REGION}"
 # A temp map with the production guard section, so the guard's rules run against a fixture
 # and not against whatever the real map holds.
 GUARD_DIR = tempfile.TemporaryDirectory()
@@ -43,7 +45,7 @@ GUARD_MAP.write_text(
                 "branch_prefix": "rehearsal-",
                 "forbidden_endpoints": [
                     {"name": "live default branch compute", "endpoint_id": PRODUCTION_ENDPOINT,
-                     "branch_id": "br-blue-breeze-azlylkzw"}
+                     "branch_id": "br-fake-production-000001"}
                 ],
                 "source": "test fixture",
             },
@@ -62,10 +64,10 @@ KEY_2 = f"workspaces/{WORKSPACE}/quote/{QUOTE_B}/render/render-02.png"
 PAYLOAD_1 = b"booth render bytes one"
 PAYLOAD_2 = b"booth render bytes two"
 DB_URL = (
-    "postgresql://runtime-user:planted-db-password@ep-fake-rehearsal-000001.c-3.ap-southeast-1.aws.neon.tech"
+    "postgresql://runtime-user:planted-db-password@ep-fake-rehearsal-000001.c-0.fake-region-1.aws.neon.tech"
     "/neondb?sslmode=require"
 )
-REHEARSAL_GUARD_LINE = "target host ep-fake-rehearsal-000001.c-3.ap-southeast-1.aws.neon.tech branch not checked\n"
+REHEARSAL_GUARD_LINE = "target host ep-fake-rehearsal-000001.c-0.fake-region-1.aws.neon.tech branch not checked\n"
 LIVE_ENDPOINT = "https://live-r2.example.test"
 REHEARSAL_ENDPOINT = "https://rehearsal-r2.example.test"
 LIVE_KEY_ID = "live-key-id-planted"

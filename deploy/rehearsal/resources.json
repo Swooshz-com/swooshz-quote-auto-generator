@@ -232,7 +232,7 @@
   "image_retention": "Keep the current live image, the previous live image and the candidate. Removing any other image or old container is a separate owner-approved server action.",
   "workspace_id": "sqag-rehearsal",
   "production_guard": {
-    "purpose": "Every step that writes to the copy's database (role password reset, migrations, the live object copy, seed and verify on the copy) runs scripts/neon_branch_guard.py first. It refuses a database host whose endpoint is listed here, a branch that is Neon's default or does not start with branch_prefix, or a host it cannot place. Names and ids only.",
+    "purpose": "Every step that writes to a rehearsal database runs scripts/neon_branch_guard.py first. It refuses a database host whose endpoint is listed here, a branch that is Neon's default or does not start with branch_prefix, or a host it cannot place. After it passes, scripts/rehearsal_database_url.py runs it again on the exact URL each step uses: set-service writes a rehearsal service's SQAG_DATABASE_URL through Coolify's API, and run-migrator guards the migrator URL before the role password reset and each migration step. The live object copy runs it on its own database URL. Names and ids only.",
     "script": "scripts/neon_branch_guard.py",
     "neon_project": "swooshz-sqag",
     "branch_prefix": "rehearsal-",

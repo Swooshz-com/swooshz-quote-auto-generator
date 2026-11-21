@@ -25,13 +25,15 @@ const credentials = {
 const env = { ...process.env, ...credentials };
 const id = (digit) => `quote-${String(digit).repeat(24)}`;
 
-// A passing production-branch guard result (scripts/neon_branch_guard.py) for a rehearsal branch.
+// A passing set-service record (scripts/rehearsal_database_url.py): the copy service's
+// database URL was written from a URL the production-branch guard passed.
 async function guardFile(overrides = {}) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sqag-db-guard-"));
   const file = path.join(dir, "guard.json");
   await fs.writeFile(file, JSON.stringify({
-    schema: "sqag-db-guard/v1", status: "pass", host: "ep-quiet-copy-a1b2c3.example.test", endpoint_id: "ep-quiet-copy-a1b2c3",
-    branch_name: "rehearsal-copy-abc1234", branch_default: false, neon_api: "checked", checked_at: new Date().toISOString(), reason: null, ...overrides,
+    schema: "sqag-db-url-set/v1", status: "pass", service_name: "quote-rehearsal-copy", service_uuid: "fakeserviceuuid000001", key: "SQAG_DATABASE_URL",
+    host: "ep-quiet-copy-a1b2c3.example.test", endpoint_id: "ep-quiet-copy-a1b2c3", branch_id: "br-quiet-copy-a1b2c3",
+    branch_name: "rehearsal-copy-abc1234", neon_api: "checked", checked_at: new Date().toISOString(), reason: null, ...overrides,
   }));
   return file;
 }
@@ -260,20 +262,30 @@ test("writing to a hosted database, or anything on the copy of live, needs a fre
   const live = "https://quote-internal.example.test";
   // Refused before any request: the database behind the app may be live's.
   for (const argv of [seed(rehearsal), seed(copy), args("reopen", rehearsal, "--seed-file", "s.json"), args("verify", copy, "--seed-file", "s.json", "--no-ai"), args("live-readonly", copy)]) {
-    assert.throws(() => parseArgs(argv, env), /neon_branch_guard\.py/, argv.join(" "));
+    assert.throws(() => parseArgs(argv, env), /rehearsal_database_url\.py set-service/, argv.join(" "));
   }
   // Live itself and the loopback CI server take no guard: live is read-only and has no rehearsal database.
   assert.equal(needsDbGuard(parseArgs(args("live-readonly", live), env)), false);
   assert.equal(needsDbGuard(parseArgs(args("seed", "http://127.0.0.1:8000", "--allow-loopback-http", "--ai-ok", "--ai-ledger", "l.json"), env)), false);
-  // A passing, recent guard is read and its host and branch name are kept for the result.
+  // A passing, recent set-service record for this service is read; its service, host and branch name are kept for the result.
   const options = await loadRunInputs(parseArgs(seed(copy, "--db-guard", await guardFile()), env));
-  assert.deepEqual(Object.keys(options.dbGuardResult), ["host", "branch_name", "neon_api", "checked_at"]);
+  assert.deepEqual(Object.keys(options.dbGuardResult), ["service_name", "host", "branch_name", "neon_api", "checked_at"]);
   assert.equal(options.dbGuardResult.branch_name, "rehearsal-copy-abc1234");
   const now = Date.now();
-  for (const bad of [{ status: "refused", reason: "target is a recorded production endpoint" }, { schema: "other/v1" }, { checked_at: new Date(now - DB_GUARD_MAX_AGE_MS - 60000).toISOString() }, { checked_at: null }]) {
-    await assert.rejects(readDbGuard(await guardFile(bad), now), UsageError, JSON.stringify(bad));
+  const refusals = [
+    [{ status: "refused", reason: "target is a recorded production endpoint" }, /not a passing set-service record/],
+    // A bare guard result proves nothing about what the service was given.
+    [{ schema: "sqag-db-guard/v1" }, /not a passing set-service record/],
+    [{ checked_at: new Date(now - DB_GUARD_MAX_AGE_MS - 60000).toISOString() }, /older than 12 hours/],
+    [{ checked_at: null }, /older than 12 hours/],
+    // The record of the other rehearsal service does not cover this app.
+    [{ service_name: "quote-rehearsal" }, /another service/],
+    [{ service_name: null }, /another service/],
+  ];
+  for (const [bad, message] of refusals) {
+    await assert.rejects(readDbGuard(await guardFile(bad), copy, now), message, JSON.stringify(bad));
   }
-  await assert.rejects(readDbGuard(path.join(os.tmpdir(), "no-such-guard.json")), /unreadable/);
+  await assert.rejects(readDbGuard(path.join(os.tmpdir(), "no-such-guard.json"), copy), /unreadable/);
 });
 
 const hex = (digit) => String(digit).repeat(64);

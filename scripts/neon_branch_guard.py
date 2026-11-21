@@ -9,12 +9,17 @@ branch facts.
 Every rule fails closed:
 - the rehearsal map must record the production endpoints (production_guard);
 - the URL must name exactly one Neon endpoint host (ep-<id>, optionally ep-<id>-pooler,
-  under .neon.tech), with no second host and no host override in its query;
+  under .neon.tech), with no second host and no host override in its query (host,
+  hostaddr, service, or options and sslsni, which can name another endpoint);
 - that endpoint id must not be a recorded production endpoint;
 - when NEON_API_KEY is set (even blank, which then fails), the Neon API must answer: the
   endpoint's branch must not be the default, must not be a recorded production branch,
-  and must start with the rehearsal prefix. Without the key only the endpoint rule
-  applies and the result says neon_api not_checked.
+  and must start with the rehearsal prefix; the result then records the branch id for
+  the role password reset. Without the key only the endpoint rule applies and the result
+  says neon_api not_checked.
+
+scripts/rehearsal_database_url.py re-runs this check on every URL it writes to a rehearsal
+service or hands to a migration step, and refuses one that is not on the guarded endpoint.
 
 Before the verdict one line goes to stderr: "target host <host> branch <name or not checked>".
 Exit codes (CLI): 0 pass, 2 refused, 1 unexpected error. The result file is written in every case.
@@ -51,7 +56,9 @@ POOLER_SUFFIX = "-pooler"
 HOST_PORT_RE = re.compile(r"([a-z0-9.-]+)(?::[0-9]{1,5})?")
 ENDPOINT_ID_RE = re.compile(r"ep-[a-z0-9]+(?:-[a-z0-9]+)*")
 ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-HOST_OVERRIDE_KEYS = frozenset({"host", "hostaddr", "service"})
+# libpq keys that can send the connection somewhere other than the URL's host: Neon reads
+# its endpoint from `options` (endpoint=...) when SNI is off (`sslsni=0`).
+HOST_OVERRIDE_KEYS = frozenset({"host", "hostaddr", "service", "options", "sslsni"})
 UNEXPECTED_NEON_RESPONSE = "unexpected Neon API response"
 
 
@@ -230,7 +237,7 @@ def _check_neon(
     if facts is None:
         raise GuardRefusal("the map's Neon project name does not match exactly one project")
     branch_id, branch_name, branch_default = facts
-    result.update(neon_api="checked", branch_name=branch_name, branch_default=branch_default)
+    result.update(neon_api="checked", branch_id=branch_id, branch_name=branch_name, branch_default=branch_default)
     if branch_default:
         raise GuardRefusal("target branch is Neon's default (production) branch")
     if branch_id.lower() in {record["branch_id"] for record in production}:
@@ -259,6 +266,7 @@ def _new_result() -> dict[str, Any]:
         "status": "refused",
         "host": None,
         "endpoint_id": None,
+        "branch_id": None,
         "branch_name": None,
         "branch_default": None,
         "neon_api": "not_checked",
