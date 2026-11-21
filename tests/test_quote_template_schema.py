@@ -375,9 +375,11 @@ class PageFitTest(unittest.TestCase):
         )
         for font, size, rows in limits:
             def with_font(first_page_rows, page_rows):
+                # A 35 mm logo fits column I at every font here (the logo rule is tested in test_quote_template_render).
                 return mutated(lambda d: (
                     d["theme"].update({"font": font, "size_pt": size}),
                     d["page"].update({"first_page_rows": first_page_rows, "page_rows": page_rows}),
+                    d["blocks"][0]["logo"].update({"width_mm": 35}),
                 ))
             first = min(rows, 55)
             with self.subTest(font=font, size=size):

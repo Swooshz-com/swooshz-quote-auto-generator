@@ -3073,7 +3073,7 @@ def quantity_character_width(
     elif character in "ilI.,:;'!|":
         advance = 0.4
     elif character.isdigit():
-        advance = 0.55
+        advance = quote_template.QUANTITY_DIGIT_EM
     elif character.isupper():
         advance = 0.9
     else:
@@ -3203,14 +3203,17 @@ QUOTE_ENTRY_TOO_TALL_MESSAGE = "A quotation line item exceeds the available page
 def prepare_quantity_lines(
     entries: list[dict[str, Any]], root: ET.Element, parts: dict[str, bytes] | None,
     *, columns: tuple[int, int] | None = (2, 2), font_size: float | None = None,
-    page: PageModel = LEGACY_PAGE,
+    page: PageModel = LEGACY_PAGE, width: float | None = None,
 ) -> None:
     """Give quantity and description one shared row budget before page admission.
 
-    `columns` is the quantity column range; None means the layout shows no quantity.
+    `columns` is the quantity column range; None means the layout shows no quantity. `width` is the
+    quantity text width in points when the caller measures it (quote templates); otherwise it is read
+    from the worksheet's columns.
     """
     if columns is not None:
-        width = visible_column_width_points(root, *columns)
+        if width is None:
+            width = visible_column_width_points(root, *columns)
         if font_size is None:
             selected_font = ooxml_style_text_font(parts, "13")
             if not selected_font["font_size"]:
@@ -4383,6 +4386,9 @@ class TemplateQuoteRenderer:
                 entries, self.root, None,
                 columns=(quantity["col"], quantity["col"] + quantity["span"] - 1) if quantity else None,
                 font_size=self._block_size(block), page=self.page,
+                width=quote_template.cell_text_width_points(
+                    self.template["grid"], quantity["col"], quantity["span"],
+                ) if quantity else None,
             )
         except ValueError as exc:
             if str(exc) != QUOTE_ENTRY_TOO_TALL_MESSAGE:
@@ -4533,8 +4539,7 @@ class TemplateQuoteRenderer:
     # Drawing, package -----------------------------------------------------------------------
 
     def _column_emu(self, col: int) -> int:
-        column = self.grid[col - 1]
-        return 0 if column["hidden"] else quote_template.grid_column_pixels(column["width"]) * EMU_PER_PIXEL
+        return quote_template.drawing_column_pixels(self.grid[col - 1], self.template["theme"]) * EMU_PER_PIXEL
 
     def _row_emu(self) -> int:
         return round(float(self.row_height) * EMU_PER_POINT)

@@ -736,9 +736,13 @@ the owner-approved CI lane.
   live formula; and the `--quote-template` option of `scripts/generate_quote.py`.
   Page-fit tests at 100 % scale (a compact grid, small fonts and tall rows)
   check the row each page keeps spare for Excel's printed row height, and
-  columns that would print below 13 % are refused. Its LibreOffice PDF smoke prints Standard, the changed
-  template and Standard at Calibri 9 at its largest accepted row count on the
-  expected number of A4 pages with all text inside the page; it skips locally
+  columns that would print below 13 % are refused (pinned on both sides of 13 %).
+  Logo and quantity-column tests check that a logo wider than its block and a
+  quantity column too narrow for three digits are refused, that hidden columns
+  give a company box no room, and that every accepted quantity column renders.
+  Its LibreOffice PDF smoke prints Standard, the changed template, Standard at
+  Calibri 9 and Standard at Arial 16 (an exact-width limit) at their largest
+  accepted row counts on the expected number of A4 pages with all text inside the page; it skips locally
   without LibreOffice and fails in CI if LibreOffice is missing. Changes to the
   legacy layout path also run `tests.test_generate_quote`,
   `tests.test_profile_layout_safety` and `tests.test_quote_exclusions`.
@@ -747,16 +751,26 @@ the owner-approved CI lane.
   tests.test_quote_template_generation tests.test_profile_quote_template_fields`.
   Storage runs on SQLite and, where `SQAG_TEST_POSTGRES_*` is set (CI), on a
   disposable PostgreSQL 17 database as the runtime role: the template limit
-  checked inside the save transaction, concurrent saves at the last free slot,
-  stale save numbers, one default per workspace, permanent deletes, workspace
-  isolation and the app before migration 013. Permissions use real loopback
-  HTTP: staff list templates, only admins read, check, save, delete or set the
-  default, signed-out and CSRF-less calls change nothing, and template links
-  never open another member's personal profile. Generation runs the real
-  generator through the job path: which template a profile gets (including the
-  note when its template was deleted), the run record, old quotes unchanged
-  after the template is edited or deleted, and a profile with no template
-  choice producing the same workbook as before. Migration changes also run
+  checked inside the save transaction, two saves forced to meet at the last
+  free slot (both are saved if the workspace lock is removed), stale save
+  numbers, one default per workspace, permanent deletes, workspace isolation and
+  the app before migration 013. Permissions use real loopback HTTP: staff list
+  templates, only admins read, check, save, delete or set the default,
+  platform viewers are refused on every route, signed-out and CSRF-less calls
+  change nothing, template links never open another member's personal profile,
+  staff linking a shared profile get 404 with nothing changed, and refused
+  saves (limit, old save number, missing or built-in template, a profile naming
+  a missing template) return their own reason and message, not the generic
+  storage error. Generation
+  runs the real generator through the job path: which template a profile gets
+  (including the note when its template was deleted), the run record, old
+  quotes downloaded byte-identical over HTTP after the template is edited or
+  deleted, and a profile with no template choice producing the same workbook as
+  before. Database profiles are read through the job path too: a linked
+  profile, a save without the template field keeping the link, new profiles
+  without their own workbook following the workspace default, and an oversized
+  run record compacting the template definition first. Profile logos must start
+  with the PNG or JPEG file signature they declare. Migration changes also run
   `tests.test_admission_schema_compatibility`,
   `tests.test_postgres_migration_ledger` and
   `tests.test_runtime_privilege_contract`.

@@ -82,27 +82,37 @@ class QuoteTemplateStoreContract:
                 self.assert_storage_error(503, "quote_template_limit_invalid", lambda: store.create(definition("X")))
 
     def test_concurrent_creates_at_the_last_free_slot_store_exactly_one(self):
+        # Force the race: each create waits, after counting and before comparing with the limit, until
+        # the other one has counted too. Without the workspace lock both see a free slot and both save;
+        # with it the second create cannot count until the first has finished, so the meeting times out.
         limit = 3
         store = self.store(limit=limit)
         for index in range(limit - 1):
             store.create(definition(f"Kept {index}"))
-        barrier = threading.Barrier(5)
+        meeting = threading.Barrier(2, timeout=2)
+
+        class MeetingStore(s.QuoteTemplateStore):
+            @property
+            def limit(self):
+                with contextlib.suppress(threading.BrokenBarrierError):
+                    meeting.wait()
+                return s.QuoteTemplateStore.limit.fget(self)
+
         outcomes = []
 
         def create(index):
-            barrier.wait()
             try:
-                self.store(limit=limit).create(definition(f"Racer {index}"))
+                MeetingStore(self.storage(), limit).create(definition(f"Racer {index}"))
                 outcomes.append("saved")
             except s.SqagStorageAccessError as exc:
                 outcomes.append(exc.reason)
 
-        threads = [threading.Thread(target=create, args=(index,)) for index in range(5)]
+        threads = [threading.Thread(target=create, args=(index,)) for index in range(2)]
         for thread in threads:
             thread.start()
         for thread in threads:
             thread.join(30)
-        self.assertEqual(sorted(outcomes), ["saved"] + ["template_limit_reached"] * 4)
+        self.assertEqual(sorted(outcomes), ["saved", "template_limit_reached"])
         self.assertEqual(len(store.list()), limit)
 
     def test_stale_save_number_never_overwrites_and_concurrent_updates_keep_one(self):

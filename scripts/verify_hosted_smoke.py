@@ -43,6 +43,11 @@ SYNTHETIC_SESSION_ID = "quote-hosted-smoke"
 SYNTHETIC_WORKSPACE_ID = "workspace-hosted-smoke"
 SYNTHETIC_PROFILE_ID = "workspace-hosted-smoke-profile"
 SYNTHETIC_PRICING_ID = "workspace-hosted-smoke-pricing"
+# A real 1x1 PNG: profile saves check the logo's file signature, so fake bytes are refused.
+SYNTHETIC_LOGO_DATA_URL = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+)
 SENSITIVE_SYNTHETIC_VALUES = (
     "sqlite:///",
     "C:/Users/Private",
@@ -263,7 +268,7 @@ def synthetic_payload() -> dict[str, Any]:
         "company": {
             "name": "Synthetic Quotation Co",
             "header_details": "Synthetic Quotation Co",
-            "logo_data_url": "data:image/jpeg;base64,ZmFrZS1sb2dv",
+            "logo_data_url": SYNTHETIC_LOGO_DATA_URL,
         },
         "tax": {"label": "GST", "rate": 0.09},
         "quote_text": {

@@ -53,7 +53,7 @@ only and writes all text as inline strings.
 | `page` | object | below |
 | `header` | object | `rows` 1 to 40: rows reserved at the top of page 1 for header blocks; must be fewer than `page.first_page_rows` |
 | `grid` | object | `columns`: 4 to 12 Excel columns, each `{width: 4 to 60, hidden?: bool}`; at least one visible |
-| `theme` | object | `font` (`Calibri` or `Arial`, the fonts installed for PDF rendering), `size_pt` 7 to 20, `color` and `heading_color` as `#RRGGBB` |
+| `theme` | object | `font` (`Calibri` or `Arial`, the fonts installed for PDF rendering), `size_pt` 7 to 20 in half-point steps (such as 11 or 11.5), `color` and `heading_color` as `#RRGGBB` |
 | `labels` | object | `total` (1 to 40), `attention` (0 to 40), `project_number` (0 to 40). Tax and currency labels come from the quote itself. |
 | `blocks` | list | 2 to 30 blocks, below |
 
@@ -68,15 +68,19 @@ above the repeated item-table header on later pages.
 
 The reader refuses a layout whose A4 pages cannot hold their rows in Excel or
 LibreOffice (paths `page.first_page_rows`, `page.page_rows`). This is a model
-with a measured margin, not an exact copy of Excel, and the margin was measured
-in Excel for Windows at 96 and 192 dpi printing to Microsoft Print to PDF. The
-sheet prints fit to one page wide: the scale is the printable width over the
-visible columns' width (at most 1). Excel prints rows taller than their set
-height, in proportion to it and by an amount that depends on the theme font and
-the display dpi (at 192 dpi up to 4.8 %: Calibri 7.5; 28.2 pt Calibri 8 rows land
-29.06 pt apart), so each row is counted at `row_height_pt` plus 0.75 pt, times
-that scale, and every page keeps one row spare. Together these allow rows at
-least 6.4 % taller than set at any allowed row height and margin.
+with a measured margin, not an exact copy of Excel. The margin was measured in
+Excel for Windows at 192 dpi (200 % display scaling) printing to Microsoft Print
+to PDF; 96 dpi was measured only under the earlier rule (one row more a page),
+on 15 to 20 pt rows. The sheet prints fit to one page wide: the scale is the
+printable width over the visible columns' width (at most 1). Excel prints rows
+taller than their set height, in proportion to it and by an amount that depends
+on the theme font and the display dpi (at 192 dpi up to 4.8 %: Calibri 7.5;
+28.2 pt Calibri 8 rows land 29.06 pt apart), so each row is counted at
+`row_height_pt` plus 0.75 pt, times that scale, and every page keeps one row
+spare. At 100 % print scale these allow rows at least 6.4 % taller than set at
+any allowed row height and margin. Below 100 % one spare row is a smaller share
+of the page (2.5 % at the 13 % floor); there Excel's print zoom comes out below
+the modelled scale, and every layout measured at 192 dpi kept 1 to 18 rows spare.
 Printable height is A4 height less the top and bottom margins, and the paper is
 landscape-swapped when `orientation` is `landscape`. Excel rounds its zoom down
 to a whole percent, which only shortens rows. It cannot print below 10 %, and its
@@ -91,13 +95,18 @@ its display, which the reader approximates by the smallest of the exact width
 and its whole-pixel width at each Windows display scaling from 96 to 336 dpi.
 Standard (Calibri 13: 6.59 pt exact, 15 px at 168 dpi = 6.43 pt) holds 61 rows
 of 18.7 pt, its own page length; at Calibri 11 (7 px at 96 dpi, 5.25 pt) it
-would hold 49. The CI PDF smoke prints Standard, a custom layout and Standard at
-Calibri 9 at its 42-row limit, and checks the pages are A4. A printer that maps
+would hold 49. The CI PDF smoke prints Standard, a custom layout, Standard at
+Calibri 9 at its 42-row limit and Standard at Arial 16 at its 85-row limit (the
+one whole size whose unit is the exact width LibreOffice prints with), and checks
+the pages are A4. A printer that maps
 A4 sheets onto Letter paper, Excel for Mac and other Windows printer drivers are
 not covered. Rows left for items: at least 20 on the first page after the header
 and table header (`header.rows`), and at least 20 on a later page after the
 continuation rows and table header (`page.continuation_top_rows`). The
 description column must span at least 30 visible width units (`blocks[i].columns[j]`).
+A quantity column must hold three digits at the item table's font size
+(`blocks[i].columns[j]`); the renderer measures each quote's quantities the same
+way (`cell_text_width_points`) and refuses a longer one when the quote is made.
 A line item taller than a later page is refused at render time with a
 `QuoteTemplateError` at `page.page_rows`.
 
@@ -110,14 +119,29 @@ A `company_details` block may take an optional `box`: `left_mm`, `top_mm` and
 `right_mm` (0 to 20, default 0) move the company details text box in from the
 block's top-left corner and stop it short of the block's right edge. The reader
 refuses a box whose left and right margins fill the block's visible width, or
-whose top margin reaches its last row (`blocks[i].box`); the width is the smaller
-of the renderer's placement width and the theme font's printed width.
+whose top margin reaches its last row (`blocks[i].box`).
+
+Pictures and text boxes are placed by `drawing_width_emu`, which the reader and
+the renderer share: each visible column counts the smaller of its Arial 10
+placement width (7 pixels a unit plus 5) and 0.92 of its width in the theme
+font's unit, in whole 96-dpi pixels. Excel's hinted digit is at least 0.926 of the
+unit for both fonts at every half-point size from 7 to 20 and every Windows
+display scaling, so a drawing placed inside that width stays inside its columns
+in Excel. That margin is measured at half-point sizes only; between them the
+hinted digit can be narrower (0.907 of the unit at Calibri 11.6 at 96 dpi, where
+a logo would run 1.5 pt past its column), which is why font sizes must be whole
+or half points. A logo's `width_mm` must fit its block's width
+(`blocks[i].logo.width_mm`), or Excel would cut it at the print area; its
+`height_mm` may run below the block's rows. Standard's 47.8 mm logo fits column I
+at Calibri 13 (193 px, 51.1 mm) and needs a narrower logo or column at smaller
+theme fonts (at most 39.1 mm at Calibri 9).
 
 ## Blocks
 
 Every block has `type`, `area` (`header` or `body`), `col` and `span` (grid
-columns, inside the grid) and an optional `style` (`font`, `size_pt`, `bold`,
-`italic`, `color`, `align`: `left`, `center` or `right`).
+columns, inside the grid) and an optional `style` (`font`, `size_pt` 7 to 20
+in half-point steps, `bold`, `italic`, `color`, `align`: `left`, `center` or
+`right`).
 
 - **Header blocks** also have `row` and `rows` inside `header.rows`. Header
   blocks must not overlap.
@@ -131,7 +155,7 @@ columns, inside the grid) and an optional `style` (`font`, `size_pt`, `bold`,
 
 | Type | Area | Extra keys | Count |
 | --- | --- | --- | --- |
-| `logo` | header | `logo`: `width_mm` 5 to 120, `height_mm` 5 to 80 (the picture's box, which may extend past the block's cells), `align`, `valign` (`top`, `middle`, `bottom`: place the box inside the block's cells), `keep_aspect`, `repeat` (also show it at the same place on every later page) | at most 1 |
+| `logo` | header | `logo`: `width_mm` 5 to 120 and no wider than the block, `height_mm` 5 to 80 (the picture's box, which may extend below the block's rows), `align`, `valign` (`top`, `middle`, `bottom`: place the box inside the block's cells), `keep_aspect`, `repeat` (also show it at the same place on every later page) | at most 1 |
 | `company_details` | header | `fields` from `header_lines`, `project_number`, `blank` | at most 1 |
 | `client_details` | header | `fields` from `client_name`, `client_address`, `attention`, `client_title`, `blank`; `address_rows` 1 to 6; `indent_cols` 0 to span-1 | at most 1 |
 | `quote_details` | header | `fields` from `quote_date`, `project_title`, `project_number`, `blank` | at most 1 |

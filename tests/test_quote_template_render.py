@@ -8,10 +8,12 @@ import copy
 import json
 import os
 import re
+import struct
 import sys
 import tempfile
 import unittest
 import zipfile
+import zlib
 from pathlib import Path
 from unittest import mock
 from xml.etree import ElementTree as ET
@@ -247,12 +249,35 @@ def custom_template():
     }
 
 
-def small_font_template():
-    """Standard at Calibri 9 with both page lengths at the largest the reader accepts for that font."""
+def standard_with_theme(font, size, rows, logo_width_mm):
+    """Standard in another theme font with both page lengths at `rows` and the logo `logo_width_mm` wide."""
     definition = copy.deepcopy(STANDARD_RAW)
-    definition["theme"]["size_pt"] = 9
-    definition["page"].update({"first_page_rows": 42, "page_rows": 42})
+    definition["theme"].update({"font": font, "size_pt": size})
+    definition["page"].update({"first_page_rows": rows, "page_rows": rows})
+    next(block for block in definition["blocks"] if block["type"] == "logo")["logo"]["width_mm"] = logo_width_mm
     return definition
+
+
+def small_font_template():
+    """Standard at Calibri 9 at the most rows the reader accepts for that font (42 of 18.7 pt). Column I
+    holds a logo of at most 39.1 mm at Calibri 9, so the logo is 35 mm."""
+    return standard_with_theme("Calibri", 9, 42, 35)
+
+
+def exact_width_template():
+    """Standard at Arial 16 at its 85-row limit. Arial 16's unit is the exact digit width (8.90 pt; every
+    whole-pixel width is wider), so this limit is set by the width LibreOffice prints with."""
+    return standard_with_theme("Arial", 16, 85, 47.8)
+
+
+def wide_png(width, height):
+    """A solid-colour PNG built with the standard library."""
+    raw = b"".join(b"\x00" + bytes([200, 30, 30]) * width for _ in range(height))
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
 
 
 def full_summary(path, grid_columns):
@@ -551,7 +576,8 @@ class TemplateRenderTest(unittest.TestCase):
         (anchor,) = drawing.findall(f"{XDR}oneCellAnchor")
         self.assertEqual(anchor.find(f"{XDR}ext").attrib, {"cx": str(30 * 36000), "cy": str(10 * 36000)})
         marker = anchor.find(f"{XDR}from")
-        column_emu = round(40 * 7 + 5) * 9525
+        # 40 Arial 10 units: 0.92 of a 5.25 pt digit is 257 whole 96-dpi pixels, narrower than the 285 px placement width.
+        column_emu = 257 * 9525
         self.assertEqual(marker.findtext(f"{XDR}col"), "0")
         self.assertEqual(marker.findtext(f"{XDR}colOff"), str(column_emu - 30 * 36000))
         self.assertEqual(marker.findtext(f"{XDR}row"), "4")
@@ -761,9 +787,25 @@ class CompanyBoxRoomTest(unittest.TestCase):
         self.assert_reader_refuses(narrow_company_column({"left_mm": 10, "top_mm": 0, "right_mm": 10}))
 
     def test_reader_uses_the_printed_width_of_a_small_font(self):
-        # At Calibri 11 the same 8 units print as 8 x 5.25 pt = 14.8 mm, narrower than the 16.1 mm placement width.
-        self.assert_reader_refuses(narrow_company_column({"left_mm": 7.5, "top_mm": 0, "right_mm": 7.5}, size_pt=11))
-        qt.read_quote_template(narrow_company_column({"left_mm": 7, "top_mm": 0, "right_mm": 7}, size_pt=11))
+        # At Calibri 11 the same 8 units count as 8 x 0.92 x 5.25 pt: 51 whole pixels (13.5 mm), narrower than the 16.1 mm placement width.
+        self.assert_reader_refuses(narrow_company_column({"left_mm": 7, "top_mm": 0, "right_mm": 7}, size_pt=11))
+        qt.read_quote_template(narrow_company_column({"left_mm": 6.5, "top_mm": 0, "right_mm": 6.5}, size_pt=11))
+
+    def test_hidden_columns_give_the_box_no_room(self):
+        # The company block spans hidden column H (16.375 units) and column I (8 units). Only I is drawn, so
+        # 20 mm of margins leave no room, though the two columns' widths together would hold them.
+        def spanning_hidden(box):
+            definition = narrow_company_column(box)
+            definition["blocks"][self.index].update({"col": 8, "span": 2})
+            return definition
+        qt.read_quote_template(spanning_hidden({"left_mm": 7.5, "top_mm": 0, "right_mm": 7.5}))
+        self.assert_reader_refuses(spanning_hidden({"left_mm": 10, "top_mm": 0, "right_mm": 10}))
+        # The renderer measures the block the same way.
+        read = qt.read_quote_template(spanning_hidden({"left_mm": 0, "top_mm": 0, "right_mm": 0}))
+        read["blocks"][self.index]["box"] = {"left_mm": 10, "top_mm": 0, "right_mm": 10}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(quote.quote_template, "read_quote_template", return_value=read):
+            with self.assertRaisesRegex(qt.QuoteTemplateError, rf"blocks\[{self.index}\]\.box"):
+                quote.write_template_quote_xlsx(read, Path(tmp) / "quotation.xlsx", self.brief, self.lines)
 
     def test_reader_refuses_a_top_margin_below_the_block(self):
         def one_row(top):
@@ -781,6 +823,125 @@ class CompanyBoxRoomTest(unittest.TestCase):
             with self.assertRaisesRegex(qt.QuoteTemplateError, rf"blocks\[{self.index}\]\.box"):
                 quote.write_template_quote_xlsx(read, Path(tmp) / "quotation.xlsx", self.brief, self.lines)
             self.assertFalse((Path(tmp) / "quotation.xlsx").exists())
+
+
+class LogoFitTest(unittest.TestCase):
+    """A logo's box must fit its block's width as Excel draws it, or Excel cuts it at the print area.
+
+    At Calibri 9 Excel draws column I (26.875 units) narrowest at 120 dpi, with 7 px digits: 188 px,
+    112.8 pt. Standard's 47.8 mm (135.5 pt) logo runs past the print area there and is cut."""
+
+    COLUMN_I_AT_120_DPI_EMU = round(188 * 72 / 120 * 12_700)
+
+    def test_a_logo_wider_than_its_block_is_refused(self):
+        with self.assertRaises(qt.QuoteTemplateError) as caught:
+            qt.read_quote_template(standard_with_theme("Calibri", 9, 42, 47.8))
+        self.assertEqual(caught.exception.path, "blocks[0].logo.width_mm")
+        self.assertIn("(at most 39.1 mm)", caught.exception.message)
+        qt.read_quote_template(standard_with_theme("Calibri", 9, 42, 39.1))
+        # Standard itself keeps its logo: at Calibri 13 column I is placed at 193 px (51.1 mm).
+        qt.load_standard_quote_template()
+
+    def test_a_right_aligned_wide_logo_stays_inside_column_i(self):
+        definition = standard_with_theme("Calibri", 9, 42, 39)
+        next(block for block in definition["blocks"] if block["type"] == "logo")["logo"]["align"] = "right"
+        brief = synthetic_brief()
+        brief["company"]["logo_data_url"] = "data:image/png;base64," + base64.b64encode(wide_png(600, 100)).decode()
+        tmp, path = render(definition, brief, synthetic_lines(3))
+        with tmp, zipfile.ZipFile(path) as archive:
+            drawing = ET.fromstring(archive.read("xl/drawings/drawing1.xml"))
+        anchors = drawing.findall(f"{XDR}oneCellAnchor")  # one a page: Standard repeats its logo
+        self.assertTrue(anchors)
+        for anchor in anchors:
+            self.assertEqual(anchor.findtext(f"{XDR}from/{XDR}col"), "8")
+            right_edge = int(anchor.findtext(f"{XDR}from/{XDR}colOff")) + int(anchor.find(f"{XDR}ext").get("cx"))
+            self.assertLessEqual(right_edge, self.COLUMN_I_AT_120_DPI_EMU)
+
+    # At Calibri 11.5 and 11.6 Excel at 96 dpi builds the font at 15 px, whose widest digit is 7 px, and
+    # draws column I (26.875 units) at trunc(((256 * 26.875 + trunc(128 / 7)) / 256) * 7) = 188 px, 141 pt.
+    COLUMN_I_AT_96_DPI_EMU = 188 * 9525
+
+    def right_edges(self, definition):
+        next(block for block in definition["blocks"] if block["type"] == "logo")["logo"]["align"] = "right"
+        brief = synthetic_brief()
+        brief["company"]["logo_data_url"] = "data:image/png;base64," + base64.b64encode(wide_png(600, 100)).decode()
+        tmp, path = render(definition, brief, synthetic_lines(3))
+        with tmp, zipfile.ZipFile(path) as archive:
+            drawing = ET.fromstring(archive.read("xl/drawings/drawing1.xml"))
+        anchors = drawing.findall(f"{XDR}oneCellAnchor")
+        self.assertTrue(anchors)
+        for anchor in anchors:
+            self.assertEqual(anchor.findtext(f"{XDR}from/{XDR}col"), "8")
+        return [int(a.findtext(f"{XDR}from/{XDR}colOff")) + int(a.find(f"{XDR}ext").get("cx")) for a in anchors]
+
+    def test_a_font_size_between_half_points_is_refused(self):
+        # The 0.92 margin holds at half-point sizes only. At Calibri 11.6 Excel's 7 px digit is 0.907 of the
+        # reader's unit, and the reader used to accept Standard there with 54 rows and a 50.2 mm logo whose
+        # right edge, right aligned, sat at 142.5 pt: past column I as Excel draws it at 96 dpi.
+        with self.assertRaises(qt.QuoteTemplateError) as caught:
+            qt.read_quote_template(standard_with_theme("Calibri", 11.6, 54, 50.2))
+        self.assertEqual(caught.exception.path, "theme.size_pt")
+        self.assertEqual(caught.exception.message, "must be a whole or half point size, such as 11 or 11.5")
+        definition = standard_with_theme("Calibri", 11.5, 53, 35)
+        definition["blocks"][-1]["style"]["size_pt"] = 9.75
+        with self.assertRaises(qt.QuoteTemplateError) as caught:
+            qt.read_quote_template(definition)
+        self.assertEqual(caught.exception.path, f"blocks[{len(definition['blocks']) - 1}].style.size_pt")
+
+    def test_the_half_point_neighbour_keeps_its_widest_logo_inside_column_i(self):
+        # Calibri 11.5 holds 53 rows and a logo of at most 49.2 mm; right aligned it ends at 139.5 pt.
+        with self.assertRaises(qt.QuoteTemplateError):
+            qt.read_quote_template(standard_with_theme("Calibri", 11.5, 53, 49.3))
+        for right_edge in self.right_edges(standard_with_theme("Calibri", 11.5, 53, 49.2)):
+            self.assertLessEqual(right_edge, self.COLUMN_I_AT_96_DPI_EMU)
+
+
+class QuantityColumnTest(unittest.TestCase):
+    """The reader refuses a quantity column the renderer would refuse ordinary quantities in. Both measure
+    the column with quote_template.cell_text_width_points and a quantity digit by digit."""
+
+    def test_r4_case_is_refused_where_it_used_to_fail_at_render_time(self):
+        # The compact grid's quantity column is 6 units (25.5 pt of text); at Calibri 17 "2.5" needs 25.5 pt and a hair.
+        with self.assertRaises(qt.QuoteTemplateError) as caught:
+            qt.read_quote_template(with_rows(compact_template("Calibri", 17), 30))
+        self.assertEqual(caught.exception.path, "blocks[3].columns[1]")
+        self.assertEqual(caught.exception.message, "the quantity column is too narrow for 3 digits at 17 pt")
+
+    def test_a_hidden_column_gives_the_quantity_no_room(self):
+        # The quantity spans grid column B (6 units) and hidden column C (6 units). Only B is drawn, so at
+        # 16 pt three digits (26.4 pt) do not fit its 25.5 pt.
+        definition = with_rows(compact_template("Calibri", 16), 30)
+        table = definition["blocks"][3]
+        table["columns"] = [column for column in table["columns"] if column["key"] != "unit"]
+        next(column for column in table["columns"] if column["key"] == "quantity")["span"] = 2
+        definition["grid"]["columns"][2]["hidden"] = True
+        with self.assertRaises(qt.QuoteTemplateError) as caught:
+            qt.read_quote_template(definition)
+        self.assertEqual(caught.exception.path, "blocks[3].columns[1]")
+        definition["grid"]["columns"][2]["hidden"] = False
+        qt.read_quote_template(definition)
+
+    def test_every_accepted_quantity_column_renders_three_digits(self):
+        lines = synthetic_lines(3)
+        for line in lines:
+            line.quantity = 999
+        accepted = refused = 0
+        for font in qt.ALLOWED_FONTS:
+            for size in [half / 2 for half in range(14, 41)]:
+                definition = with_rows(compact_template(font, size), 30)
+                try:
+                    qt.read_quote_template(definition)
+                except qt.QuoteTemplateError as exc:
+                    self.assertEqual(exc.path, "blocks[3].columns[1]", (font, size))
+                    refused += 1
+                    continue
+                accepted += 1
+                with self.subTest(font=font, size=size):
+                    tmp, path = render(definition, synthetic_brief(), lines)
+                    with tmp:
+                        self.assertTrue(path.exists())
+        # Both fonts hold 3 digits up to 15 pt in 6 units, and refuse them from 15.5 pt.
+        self.assertEqual((accepted, refused), (34, 20))
 
 
 def compact_template(font, size):
@@ -852,9 +1013,8 @@ class PrintedRowFitTest(unittest.TestCase):
 
     def test_columns_too_wide_to_print_above_13_percent_are_refused(self):
         # Excel prints at 10 % or more, and its digit can be a fifth wider than the reader's unit, so a
-        # sheet needing under 13 % is refused. 9 columns of 60 units on a 130 mm wide page: Arial 20
-        # (11 pt a unit) needs 6 %; Calibri 14 (6.75 pt) needs 10.1 %, where Excel prints at 10 % and
-        # breaks the page across; Calibri 7 (3.4 pt) needs 20 %.
+        # sheet needing under 13 % is refused. Standard's 7 visible columns at 60 units on a 130 mm wide
+        # page: Arial 20 (11 pt a unit) needs 8 %; Calibri 7 (3.4 pt) needs 26 %.
         def wide(font, size):
             definition = copy.deepcopy(STANDARD_RAW)
             definition["theme"].update({"font": font, "size_pt": size})
@@ -862,11 +1022,14 @@ class PrintedRowFitTest(unittest.TestCase):
             for column in definition["grid"]["columns"]:
                 column["width"] = 60
             return definition
+        # The floor sits at 13 % between neighbouring half-point sizes: Calibri 14 (6.75 pt) needs
+        # 12.998 % and is refused, Calibri 13.5 (6.6 pt) needs 13.29 % and is accepted.
         for font, size in (("Arial", 20), ("Calibri", 14)):
             with self.subTest(font=font, size=size):
                 with self.assertRaises(qt.QuoteTemplateError) as caught:
                     qt.read_quote_template(wide(font, size))
                 self.assertEqual(caught.exception.path, "grid.columns")
+        qt.read_quote_template(wide("Calibri", 13.5))
         qt.read_quote_template(wide("Calibri", 7))
 
 
@@ -887,11 +1050,14 @@ class TemplatePdfSmokeTest(unittest.TestCase):
             "custom": (custom_template(), ["Rate", "Subtotal", "We accept the quotation"]),
             # A small font at the most rows the reader accepts for it (Calibri 9: 42 rows of 18.7 pt).
             "small font": (small_font_template(), ["Estimate", "Total including GST", "We accept the quotation"]),
+            # A limit set by the exact digit width LibreOffice prints with (Arial 16: 85 rows of 18.7 pt).
+            "exact width": (exact_width_template(), ["Estimate", "Total including GST", "We accept the quotation"]),
         }
         for name, (definition, phrases) in layouts.items():
             with self.subTest(layout=name), tempfile.TemporaryDirectory() as tmp:
                 xlsx_path, pdf_path = Path(tmp) / "quotation.xlsx", Path(tmp) / "quotation.pdf"
-                quote.write_template_quote_xlsx(definition, xlsx_path, synthetic_brief(), synthetic_lines(45, sections=9))
+                count = 120 if name == "exact width" else 45
+                quote.write_template_quote_xlsx(definition, xlsx_path, synthetic_brief(), synthetic_lines(count, sections=9))
                 expected_pages = len(workbook_summary(xlsx_path)["row_breaks"]) + 1
                 self.assertGreater(expected_pages, 1)
                 self.assertEqual(quote.libreoffice_pdf_export(xlsx_path, pdf_path), "libreoffice_exported")
