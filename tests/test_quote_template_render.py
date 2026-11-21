@@ -1013,9 +1013,8 @@ class PrintedRowFitTest(unittest.TestCase):
 
     def test_columns_too_wide_to_print_above_13_percent_are_refused(self):
         # Excel prints at 10 % or more, and its digit can be a fifth wider than the reader's unit, so a
-        # sheet needing under 13 % is refused. 9 columns of 60 units on a 130 mm wide page: Arial 20
-        # (11 pt a unit) needs 6 %; Calibri 14 (6.75 pt) needs 10.1 %, where Excel prints at 10 % and
-        # breaks the page across; Calibri 7 (3.4 pt) needs 20 %.
+        # sheet needing under 13 % is refused. Standard's 7 visible columns at 60 units on a 130 mm wide
+        # page: Arial 20 (11 pt a unit) needs 8 %; Calibri 7 (3.4 pt) needs 26 %.
         def wide(font, size):
             definition = copy.deepcopy(STANDARD_RAW)
             definition["theme"].update({"font": font, "size_pt": size})
@@ -1023,9 +1022,9 @@ class PrintedRowFitTest(unittest.TestCase):
             for column in definition["grid"]["columns"]:
                 column["width"] = 60
             return definition
-        # The floor sits at 13 %: Calibri 13.75 (6.75 pt) needs 12.998 % and is refused, Calibri 13.5
-        # (6.6 pt) needs 13.29 % and is accepted.
-        for font, size in (("Arial", 20), ("Calibri", 14), ("Calibri", 13.75)):
+        # The floor sits at 13 % between neighbouring half-point sizes: Calibri 14 (6.75 pt) needs
+        # 12.998 % and is refused, Calibri 13.5 (6.6 pt) needs 13.29 % and is accepted.
+        for font, size in (("Arial", 20), ("Calibri", 14)):
             with self.subTest(font=font, size=size):
                 with self.assertRaises(qt.QuoteTemplateError) as caught:
                     qt.read_quote_template(wide(font, size))
