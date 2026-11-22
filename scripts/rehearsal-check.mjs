@@ -1171,6 +1171,9 @@ export function saveStub(run, readback, stubbed) {
   };
 }
 
+// Quote saves the probe browser's stub answered so far.
+const stubbedQuoteSaves = (stubbed) => stubbed.filter((entry) => entry.method === "POST" && entry.path === "/api/quote-sessions").length;
+
 // The app's own reason for a Quote Basis lock that only Next in Customer clears.
 const CUSTOMER_NEXT_LOCK = "Click Next in Customer to save this step before continuing.";
 
@@ -1213,21 +1216,27 @@ function basisLockFacts(page) {
 // Opens Quote Basis on the reopened quote as a user would, and returns why it was locked.
 // The copy of live runs with its own session secret, so the browser recovery scope in every
 // saved Customer checkpoint differs there and Quote Basis opens locked: a user then presses
-// Next in Customer, whose save the probe's stub answers. The lock is recorded, never skipped;
-// any other lock fails the probe with its facts.
-async function openQuoteBasis(page) {
+// Next in Customer, whose save the probe's stub answers. The lock is recorded, never skipped.
+// Any other lock (a Customer field that also differs, a missing checkpoint, a pending pricing
+// reference) would lock the quote on live too, so it fails the probe with its facts.
+async function openQuoteBasis(page, stubbed) {
   const facts = await basisLockFacts(page);
   // Only the recovery scope differs: what the copy's own secret causes, not the quote.
-  const lock = { ...facts, copy_only: facts.saved_checkpoint && facts.differs.length === 1 && facts.differs[0] === "recoveryScope", unlocked_by: null };
+  const copyOnly = facts.customer_next && facts.saved_checkpoint && !facts.save_busy && !facts.pricing_reference_change_pending
+    && facts.current_unavailable.length === 0 && facts.differs.length === 1 && facts.differs[0] === "recoveryScope";
+  const lock = { ...facts, copy_only: copyOnly, unlocked_by: null, next_saves: 0 };
   if (lock.locked) {
-    assert(lock.customer_next && !lock.save_busy, `Quote Basis is locked for a reason Next in Customer does not clear: ${JSON.stringify(lock)}`);
+    assert(lock.copy_only, `Quote Basis is locked for more than the copy's own session secret: ${JSON.stringify(lock)}`);
     await page.locator("#customerDetailsButton").click();
     await page.waitForFunction(() => state.activeSidePanel === "customer", null, { timeout: 30000 });
     // Next would ask to confirm changed inputs and clear the quote's results: not what this measures.
     const changes = await page.evaluate(() => quoteDependencyChangesForNext());
     assert(changes.length === 0, `Next in Customer would ask to confirm changed ${changes.join(", ")}: ${JSON.stringify(lock)}`);
+    // The quote saves the Next press itself caused, answered by the stub.
+    const savesBefore = stubbedQuoteSaves(stubbed);
     await page.locator("#sideNextButton").click();
     const moved = await page.waitForFunction(() => state.activeSidePanel === "quote_company" && !state.customerStepCheckpointSaveBusy, null, { timeout: 30000 }).then(() => true, () => false);
+    lock.next_saves = stubbedQuoteSaves(stubbed) - savesBefore;
     const after = await basisLockFacts(page);
     assert(moved && !after.locked, `Next in Customer did not unlock Quote Basis: ${JSON.stringify({ before: lock, after })}`);
     lock.unlocked_by = "customer_next";
@@ -1258,7 +1267,7 @@ async function clickBudgetOnQuote(run, sessionId) {
     assert(await page.evaluate((id) => modifyDashboardQuote(id), sessionId) === true, "The quote did not reopen for the click probe.");
     // A reopened quote may open on another panel: open Quote Basis as a user would, then let
     // any save the switch armed finish before the first measured click.
-    const basisLock = await openQuoteBasis(page);
+    const basisLock = await openQuoteBasis(page, stubbed);
     await page.locator("#basisReviewSurface li[data-basis-key]").first().waitFor({ state: "visible", timeout: 30000 });
     await page.waitForTimeout(CLICK_WINDOW_MS);
     // The quote's own size sets the byte budgets (a click copies it once, a save about three times).
@@ -1299,8 +1308,8 @@ async function clickBudgetOnQuote(run, sessionId) {
     const detail = {
       id: sessionId, lines: derivedReasons(readback).lines, quote_bytes: quoteBytes, groups, basis_lock: basisLock,
       samples: samples.map(counts), burst: burst && counts(burst),
-      stubbed_saves: stubbed.filter((entry) => entry.method === "POST" && entry.path === "/api/quote-sessions").length,
-      stubbed_other: stubbed.length - stubbed.filter((entry) => entry.method === "POST" && entry.path === "/api/quote-sessions").length,
+      stubbed_saves: stubbedQuoteSaves(stubbed),
+      stubbed_other: stubbed.length - stubbedQuoteSaves(stubbed),
     };
     assert(failures.length === 0, `Click budget: ${failures.join("; ")}`);
     return detail;
