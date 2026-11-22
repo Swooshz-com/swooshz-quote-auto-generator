@@ -184,8 +184,11 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      guard checks the branch with Neon's API when `NEONDB_SWOOSHZ_SQAG_API_KEY`
      is set (through `toolkit env run`, under that credential-store name);
      without it, it checks the endpoint only and records
-     `neon_api: not_checked`, which every writing step below refuses. Require
-     exit 0 and the printed branch name `rehearsal-<short>`:
+     `neon_api: not_checked`, which every writing step below refuses. Hold
+     the branch's plain endpoint host, `ep-<id>` or `ep-<id>-pooler` as Neon's
+     console shows it, never a per-compute host (`ep-<id>-<suffix>`): Neon's
+     API does not know those, so the guard refuses them as unreachable.
+     Require exit 0 and the printed branch name `rehearsal-<short>`:
 
      ```powershell
      $out = "_tmp\deploy-$short-out"
@@ -247,10 +250,12 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
    - Derive `SQAG_TRUSTED_PROXY_CIDRS` from the rehearsal service's own
      network, never a fixed value. The proxy joins that network, so a
      request reaches the app from there and not from the shared `coolify`
-     network. Deploy once so the network exists (the app reports not ready
-     until the value is set), list the container's networks, read the subnet
-     of the service's own network, set it as the value and redeploy. It must
-     be one exact subnet, never a trust-all range.
+     network. Set every other value first, then deploy once so the network
+     exists: with the value empty the app exits at start ("auth boundary",
+     exit 2) and restarts in a loop, which is expected here and never a pass.
+     List the container's networks, read the subnet of the service's own
+     network, set it as the value and redeploy at once. It must be one exact
+     subnet, never a trust-all range.
 
      ```powershell
      ssh.exe swooshz-vps 'docker inspect --format ''{{range $k, $v := .NetworkSettings.Networks}}{{println $k}}{{end}}'' <rehearsal app container>'
@@ -338,9 +343,9 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
    - Create the Neon branch `rehearsal-copy-<short>` of live's default branch
      with data, as the map's `neon-data-branch` says, and record the time.
      Before anything writes to it, run the production-branch guard (step 3)
-     on its URL with the result `"$out\db-guard-copy.json"`. Require exit 0
-     and the branch name `rehearsal-copy-<short>`. Run the guard again if the
-     URL changes.
+     on its URL, with the branch's plain endpoint host as in step 3, and the
+     result `"$out\db-guard-copy.json"`. Require exit 0 and the branch name
+     `rehearsal-copy-<short>`. Run the guard again if the URL changes.
    - As in step 3, with `--guard-result "$out\db-guard-copy.json"` and
      result files named `copy-migrator-<step>.json`: run `run-migrator --step
      check` on the migrator URL you hold, reset the roles' passwords on the
@@ -363,8 +368,14 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      step 3, from the copy branch's runtime URL, with
      `--guard-result "$out\db-guard-copy.json"`, the copy service's uuid and
      `--result "$out\db-url-set-copy.json"`. Derive the proxy subnet as in
-     step 3 and wait for health.
-   - List the walk targets. On a host that says rehearsal the walk signs in
+     step 3 (the first deploy restarts in a loop until it is set) and wait
+     for health.
+   - Then six parts, in this order: list the copy ids, plan the copy, copy,
+     list the candidates, the owner approves the manifest, walk (Pass A).
+     Opening a quote loads its uploaded files, and on the fresh copy those
+     are only in live's bucket until the copy runs, so the candidates come
+     after the copy.
+   - **List the copy ids.** On a host that says rehearsal the walk signs in
      with the rehearsal names, so live's password never reaches the copy:
 
      ```powershell
@@ -372,18 +383,24 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      $copyGuard = "$out\db-url-set-copy.json"
      $env:SQAG_REHEARSAL_LOGIN_EMAIL = "<the owner's own sign-in email>"
      $env:SQAG_REHEARSAL_LOGIN_PASSWORD = <SWOOSHZ_SQAG_REHEARSAL_UAT_LOGIN_PASSWORD from the credential store>
-     node scripts\rehearsal-check.mjs --profile live-readonly --base-url $copy --manifest deploy\rehearsal\live-cases.json --targets-out "$out\walk-targets.json" --targets-only --result "$out\copy-targets.json" --db-guard $copyGuard
+     node scripts\rehearsal-check.mjs --profile live-readonly --base-url $copy --manifest deploy\rehearsal\live-cases.json --targets-out "$out\walk-targets.json" --targets-only --result "$out\copy-ids.json" --db-guard $copyGuard
      ```
 
-     `walk-targets.json` holds quote ids and counts only. Its `candidates`
-     list (reason codes, section and line counts) is what the owner picks
-     manifest cases from.
-   - Copy those quotes' files from live's bucket into the rehearsal bucket,
-     plan first. The copy branch's URL is a per-run value set in this session
-     only; the bucket tokens come from the credential store. The script runs
-     the production-branch guard on that URL before any call, reads live with
-     the read-only token, writes only to `sqag-rehearsal` and reports counts
-     only:
+     From the quote list alone, before it opens any quote, it writes
+     `walk-targets.json`: the `quote_ids` of the manifest quotes and every
+     other quote the login owns, newest first, at most 50 (the step `copy ids
+     file` counts any owned quotes past that). Then it opens the listed
+     quotes for their candidate reasons, which fails on this first run
+     (`Quote readback returned HTTP 503`: the files are not copied yet). The
+     result says so and the ids file stays: that is this part's expected
+     outcome. A failure of any other kind, or in a step before `targets file`,
+     holds the run.
+   - **Plan the copy, then copy** those quotes' files from live's bucket into
+     the rehearsal bucket. The copy branch's URL is a per-run value set in
+     this session only; the bucket tokens come from the credential store.
+     The script runs the production-branch guard on that URL before any
+     call, reads live with the read-only token, writes only to
+     `sqag-rehearsal` and reports counts only:
 
      ```powershell
      $env:SQAG_LIVE_COPY_DATABASE_URL = <the copy branch's runtime URL>
@@ -393,8 +410,18 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      Remove-Item Env:SQAG_LIVE_COPY_DATABASE_URL
      ```
 
-   - Walk the copy before anything writes to it, then run the writing
-     checks on it under the same ledger:
+   - **List the candidates.** Run the same listing command again, with the
+     result `"$out\copy-targets.json"`. It must pass. It writes the same
+     `quote_ids` and now the `candidates` list (reason codes, section and
+     line counts of at most 30 listed quotes), which is what the owner picks
+     manifest cases from. `walk-targets.json` holds quote ids and counts only.
+   - **The owner approves the manifest**: the cases they pick from the
+     candidates go into `deploy/rehearsal/live-cases.json` with its
+     `approval` (prerequisite 9). Every manifest quote must be in
+     `walk-targets.json`'s `quote_ids`, so its files were copied; if one is
+     not, list the copy ids again and copy again before the walk.
+   - **Walk the copy (Pass A)** before anything writes to it, then run the
+     writing checks on it under the same ledger:
 
      ```powershell
      node scripts\rehearsal-check.mjs --profile live-readonly --base-url $copy --manifest deploy\rehearsal\live-cases.json --targets-out "$out\pass-a-targets.json" --download-files --click-budget --result "$out\pass-a.json" --asset-out "$out\copy-app.js" --db-guard $copyGuard

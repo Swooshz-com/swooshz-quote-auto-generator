@@ -30,8 +30,13 @@
 // live-readonly with --manifest is the live-data walk (Pass A on the copy of
 // live, Pass B on live): it reopens the manifest quotes and the newest quotes
 // the login owns, checks their files, blocks, booth box and quantity boxes,
-// and fails if anything tried to write. --targets-only stops after writing the
-// target ids (for the bucket copy) and the manifest candidates.
+// and fails if anything tried to write. --targets-out writes the targets file:
+// first the copy ids (the manifest quotes and every other quote the login owns,
+// at most 50, from the quote list alone), then the manifest candidates, which
+// open each listed quote. On a fresh copy of live that opening fails until the
+// bucket copy has run on the ids file, so the run order is: --targets-only,
+// copy, --targets-only again (docs/internal-uat-coolify-deploy.md, step 8.1).
+// --targets-only stops after the targets file.
 // Downloads write a telemetry row on the server, so only Pass A (a rehearsal
 // host) may pass --download-files: it fetches each available export and checks
 // its bytes against the recorded hash. Pass B on live downloads nothing: it
@@ -66,7 +71,7 @@
 import { signIn } from "./internal-password-browser-test.mjs";
 import { pdfFontNames, unexpectedPdfFonts, validatePdf, validateXlsx } from "./lib/artifact-checks.mjs";
 import { AI_CAP_MAX_USD, AI_PRICING_ENRICHMENT_USD, AiCapError, loadBudget, reportedUsd, saveBudget } from "./lib/ai-budget.mjs";
-import { derivedReasons, ManifestError, targetsDocument, validateManifest, walkTargets } from "./lib/live-cases.mjs";
+import { copyTargets, derivedReasons, ManifestError, MAX_CANDIDATES, targetsDocument, validateManifest, walkTargets } from "./lib/live-cases.mjs";
 import { byteBudget, CLICK_COUNT_BUDGET, CLICK_WINDOW_MS, groupActions, installClickProbe, judgeClickCounts, lineButton, linesIn, measureClicks } from "./lib/basis-click-probe.mjs";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -239,6 +244,9 @@ export async function readDbGuard(file, baseUrl, now = Date.now()) {
   const service = new URL(baseUrl).hostname.toLowerCase().split(".")[0];
   if (!record.service_name || record.service_name !== service) {
     throw new UsageError("--db-guard is for another service than --base-url");
+  }
+  if (record.neon_api !== "checked") {
+    throw new UsageError("--db-guard does not say neon_api checked (Neon's API did not confirm the branch): run the guard with the Neon key and set-service again");
   }
   return { service_name: record.service_name, host: String(record.host || ""), branch_name: record.branch_name ?? null, neon_api: String(record.neon_api || ""), checked_at: record.checked_at };
 }
@@ -1052,6 +1060,36 @@ async function walkQuote(run, sessionId) {
   return { ...detail, ...page };
 }
 
+// The targets file (--targets-out, the copy of live only): the copy ids first,
+// from the quote list alone, then the manifest candidates. Opening a quote loads
+// its uploaded files, and on a fresh copy of live those are still only in live's
+// bucket until the bucket copy runs on this very file (#390 run 2: HTTP 503
+// object_artifact_storage_unavailable). So a failed opening keeps the ids file
+// and says to run the copy. readQuote is a read through the run's read-only
+// request context; the only other effect is writing the local targets file.
+export async function writeWalkTargets(run, manifestIds, own, readQuote) {
+  const quoteIds = copyTargets(manifestIds, own);
+  const save = (candidates) => fs.writeFile(run.options.targetsOut, JSON.stringify(targetsDocument(quoteIds, candidates), null, 2) + "\n", "utf8");
+  await run.step("copy ids file", async () => {
+    await save([]);
+    return { quote_ids: quoteIds.length, own_not_listed: own.filter((session) => !quoteIds.includes(session.session_id)).length };
+  });
+  await run.step("targets file", async () => {
+    const candidates = [];
+    for (const id of quoteIds.slice(0, MAX_CANDIDATES)) {
+      let detail;
+      try {
+        detail = await readQuote(id);
+      } catch (error) {
+        throw new Error(`${scrub(error)} The targets file keeps the ${quoteIds.length} copy ids: if their files are not in the rehearsal bucket yet, run copy_live_objects_to_rehearsal.py on it (plan, then copy) and list again with --targets-only.`);
+      }
+      candidates.push({ id, ...derivedReasons(detail) });
+    }
+    await save(candidates);
+    return { candidates: candidates.length };
+  });
+}
+
 async function liveWalk(run, manifest) {
   const { ids, newest } = manifest;
   let list = [];
@@ -1084,17 +1122,7 @@ async function liveWalk(run, manifest) {
     run.result.targets = value;
     return { manifest: ids.length, newest: value.length - ids.length };
   });
-  if (run.options.targetsOut) {
-    await run.step("targets file", async () => {
-      const candidates = [];
-      for (const session of own.slice(0, 30)) {
-        const detail = await quoteSession(run, session.session_id);
-        candidates.push({ id: session.session_id, ...derivedReasons(detail) });
-      }
-      await fs.writeFile(run.options.targetsOut, JSON.stringify(targetsDocument(run.result.targets, candidates), null, 2) + "\n", "utf8");
-      return { candidates: candidates.length };
-    });
-  }
+  if (run.options.targetsOut) await writeWalkTargets(run, ids, own, (id) => quoteSession(run, id));
   if (run.options.targetsOnly) return;
   const walked = [];
   for (const [index, id] of run.result.targets.entries()) {

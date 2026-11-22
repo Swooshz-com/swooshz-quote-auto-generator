@@ -11,6 +11,8 @@ export const REASON_CODES = Object.freeze([
 export const MAX_CASES = 20;
 export const MAX_NEWEST = 5;
 export const MAX_CANDIDATES = 30;
+// The bucket copy (scripts/copy_live_objects_to_rehearsal.py MAX_QUOTES) takes at most this many quote ids.
+export const MAX_COPY_QUOTES = 50;
 const MANIFEST_KEYS = ["schema", "purpose", "approval", "newest_own_quotes", "reason_codes", "cases"];
 const APPROVAL_KEYS = ["approved", "approved_at", "record"];
 const CASE_KEYS = ["id", "reasons"];
@@ -94,7 +96,17 @@ export function walkTargets(manifestIds, ownSessions, newest) {
   return targets;
 }
 
+// The quotes whose files the bucket copy brings: the manifest quotes, then every
+// other quote the login owns, newest first, up to the copy's cap. It needs only
+// the quote list, so it is known before any quote is opened, and it holds every
+// walk target (the newest few owned quotes come first after the manifest's).
+export function copyTargets(manifestIds, ownSessions) {
+  return walkTargets(manifestIds, ownSessions, Math.max(0, MAX_COPY_QUOTES - manifestIds.length));
+}
+
+// quote_ids: the copy ids (copyTargets). candidates: what the owner picks manifest cases from.
 export function targetsDocument(targets, candidates) {
+  if (targets.length > MAX_COPY_QUOTES) throw new ManifestError(`the targets file holds at most ${MAX_COPY_QUOTES} quote ids`);
   for (const id of targets) if (!QUOTE_ID_RE.test(id)) throw new ManifestError("a target is not an opaque quote id");
   return {
     schema: TARGETS_SCHEMA,
