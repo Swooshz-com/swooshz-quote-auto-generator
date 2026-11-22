@@ -8020,7 +8020,7 @@ def generated_pricing_reference_template_xlsx_bytes() -> bytes:
         ["Currency", DEFAULT_CURRENCY_LABEL],
         ["Tax label", DEFAULT_TAX_LABEL],
         ["Tax rate", f"{DEFAULT_TAX_RATE:g}"],
-        ["Import note", "Edit these values, then upload this workbook through Pricing Reference Settings > Import."],
+        ["Import note", "Edit these values, then upload this workbook through Settings > Pricing Reference > Import."],
     ]
     instruction_rows = [
         ["Pricing Reference Import Template"],
@@ -8185,7 +8185,7 @@ def pricing_reference_export_reference_rows(detail: dict[str, Any]) -> list[list
         ["Tax rate", f"{normalize_tax_rate(tax.get('rate'), DEFAULT_TAX_RATE):g}"],
         ["Item count", str(int(parse_pricing_number(detail.get("item_count")) or 0))],
         ["Exported at", utc_timestamp()],
-        ["Import note", "Upload this workbook through Pricing Reference Settings > Import to recreate the pricing rows."],
+        ["Import note", "Upload this workbook through Settings > Pricing Reference > Import to recreate the pricing rows."],
     ]
 
 

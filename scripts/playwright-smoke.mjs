@@ -4994,7 +4994,7 @@ async function main() {
     const customerPricingShot = await screenshot(page, "customer-pricing.png");
     await page.locator("#settingsButton").click();
     await page.locator("#pricingReferenceModal").waitFor({ state: "visible" });
-    await page.getByRole("heading", { name: "Pricing Reference Settings" }).waitFor();
+    await page.locator("#pricingReferenceModal").getByRole("heading", { name: "Settings", exact: true }).waitFor();
     await page.locator("#pricingReferenceImportTab").click();
     await page.locator("#pricingReferenceImportPanel").waitFor({ state: "visible" });
     await page.reload({ waitUntil: "domcontentloaded" });
