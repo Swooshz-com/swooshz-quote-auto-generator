@@ -440,7 +440,17 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      box, and fails if anything tried to write. `--click-budget` then runs
      the Quote Basis click probe (the CI click-budget job's) on the two
      largest manifest quotes, in a separate browser that answers every save
-     itself and counts it, so nothing reaches the copy. Its exact counts
+     itself and counts it, so nothing reaches the copy. The copy runs with
+     its own generated `SESSION_SECRET`, so the browser recovery scope saved
+     in every quote's Customer checkpoint differs there and Quote Basis opens
+     locked ("Click Next in Customer..."), as it would for a user of the
+     copy. The probe then does what that user does: it presses Next in
+     Customer (that save is answered in the probe browser too) and records
+     the lock in the step's `basis_lock`: which checkpoint fields differed
+     (names only; `copy_only` is true when only `recoveryScope` did) and how
+     it was unlocked. A lock that Next in Customer does not clear, or a Next
+     that would ask to confirm changed inputs, fails the probe with those
+     facts. Its exact counts
      (browser storage writes, IndexedDB puts, renders, rebuilt rows, bytes
      copied, saves per burst) fail the walk; its timings are recorded only,
      because the laptop's speed varies. Pass A passes only if all three

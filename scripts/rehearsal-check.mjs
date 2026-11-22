@@ -1171,6 +1171,71 @@ export function saveStub(run, readback, stubbed) {
   };
 }
 
+// The app's own reason for a Quote Basis lock that only Next in Customer clears.
+const CUSTOMER_NEXT_LOCK = "Click Next in Customer to save this step before continuing.";
+
+// Why Quote Basis is locked on the reopened quote, read from the app's own checkpoint
+// functions: reason codes and checkpoint field names only, never their values.
+function basisLockFacts(page) {
+  return page.evaluate((customerNextLock) => {
+    const button = document.querySelector("#quoteBasisButton");
+    const saved = state.customerStepCheckpoint;
+    const upgraded = customerStepCheckpointWithAddedFieldDefaults(saved);
+    const current = customerStepCheckpointForCurrent();
+    // Paths of the checkpoint fields whose saved and current values differ.
+    const differs = [];
+    const compare = (left, right, prefix, depth) => {
+      if (quoteCommercialStrictDataEqual(left, right)) return;
+      if (depth < 3 && isPlainObject(left) && isPlainObject(right)) {
+        for (const key of [...new Set([...Object.keys(left), ...Object.keys(right)])].sort()) compare(left[key], right[key], prefix ? `${prefix}.${key}` : key, depth + 1);
+      } else differs.push(prefix);
+    };
+    if (isPlainObject(upgraded) && current) compare(upgraded, current, "", 0);
+    const unavailable = current ? [] : [
+      !safeQuoteSessionId(state.quoteSessionId) && "session_id",
+      !currentBrowserRecoveryScope() && "recovery_scope",
+      !currentPricingReference() && "pricing_reference",
+      Boolean(customerDetailsBlockReason()) && "customer_details",
+      quoteCommercialReviewRequired() && "commercial_review",
+    ].filter(Boolean);
+    return {
+      locked: Boolean(button?.disabled || button?.classList.contains("is-locked")),
+      customer_next: sidePanelBlockReason("basis") === customerNextLock,
+      saved_checkpoint: isPlainObject(saved),
+      differs,
+      current_unavailable: unavailable,
+      pricing_reference_change_pending: pendingPricingReferenceSelectionChanged(),
+      save_busy: Boolean(state.customerStepCheckpointSaveBusy),
+    };
+  }, CUSTOMER_NEXT_LOCK);
+}
+
+// Opens Quote Basis on the reopened quote as a user would, and returns why it was locked.
+// The copy of live runs with its own session secret, so the browser recovery scope in every
+// saved Customer checkpoint differs there and Quote Basis opens locked: a user then presses
+// Next in Customer, whose save the probe's stub answers. The lock is recorded, never skipped;
+// any other lock fails the probe with its facts.
+async function openQuoteBasis(page) {
+  const facts = await basisLockFacts(page);
+  // Only the recovery scope differs: what the copy's own secret causes, not the quote.
+  const lock = { ...facts, copy_only: facts.saved_checkpoint && facts.differs.length === 1 && facts.differs[0] === "recoveryScope", unlocked_by: null };
+  if (lock.locked) {
+    assert(lock.customer_next && !lock.save_busy, `Quote Basis is locked for a reason Next in Customer does not clear: ${JSON.stringify(lock)}`);
+    await page.locator("#customerDetailsButton").click();
+    await page.waitForFunction(() => state.activeSidePanel === "customer", null, { timeout: 30000 });
+    // Next would ask to confirm changed inputs and clear the quote's results: not what this measures.
+    const changes = await page.evaluate(() => quoteDependencyChangesForNext());
+    assert(changes.length === 0, `Next in Customer would ask to confirm changed ${changes.join(", ")}: ${JSON.stringify(lock)}`);
+    await page.locator("#sideNextButton").click();
+    const moved = await page.waitForFunction(() => state.activeSidePanel === "quote_company" && !state.customerStepCheckpointSaveBusy, null, { timeout: 30000 }).then(() => true, () => false);
+    const after = await basisLockFacts(page);
+    assert(moved && !after.locked, `Next in Customer did not unlock Quote Basis: ${JSON.stringify({ before: lock, after })}`);
+    lock.unlocked_by = "customer_next";
+  }
+  await page.locator("#quoteBasisButton").click();
+  return lock;
+}
+
 async function clickBudgetOnQuote(run, sessionId) {
   const readback = await quoteSession(run, sessionId);
   const { cookies } = await run.context.storageState();
@@ -1193,7 +1258,7 @@ async function clickBudgetOnQuote(run, sessionId) {
     assert(await page.evaluate((id) => modifyDashboardQuote(id), sessionId) === true, "The quote did not reopen for the click probe.");
     // A reopened quote may open on another panel: open Quote Basis as a user would, then let
     // any save the switch armed finish before the first measured click.
-    await page.locator("#quoteBasisButton").click();
+    const basisLock = await openQuoteBasis(page);
     await page.locator("#basisReviewSurface li[data-basis-key]").first().waitFor({ state: "visible", timeout: 30000 });
     await page.waitForTimeout(CLICK_WINDOW_MS);
     // The quote's own size sets the byte budgets (a click copies it once, a save about three times).
@@ -1232,7 +1297,7 @@ async function clickBudgetOnQuote(run, sessionId) {
       input_to_paint_ms: Math.round(sample.inputToPaintMs), longest_frame_ms: Math.max(0, ...sample.clickFrames, ...sample.laterFrames),
     });
     const detail = {
-      id: sessionId, lines: derivedReasons(readback).lines, quote_bytes: quoteBytes, groups,
+      id: sessionId, lines: derivedReasons(readback).lines, quote_bytes: quoteBytes, groups, basis_lock: basisLock,
       samples: samples.map(counts), burst: burst && counts(burst),
       stubbed_saves: stubbed.filter((entry) => entry.method === "POST" && entry.path === "/api/quote-sessions").length,
       stubbed_other: stubbed.length - stubbed.filter((entry) => entry.method === "POST" && entry.path === "/api/quote-sessions").length,
