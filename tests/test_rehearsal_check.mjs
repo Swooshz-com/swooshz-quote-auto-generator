@@ -462,7 +462,7 @@ async function runAllProfiles(t, storage) {
     }));
     front.log.length = 0;
     await harnessSessionSecret(harness.origin, true);
-    const lockedA = await result("live-readonly", ["--manifest", manifestFile, "--click-budget"], "pass-a-changed-customer", { code: 1 });
+    const lockedA = await result("live-readonly", ["--manifest", manifestFile, "--download-files", "--click-budget"], "pass-a-changed-customer", { code: 1 });
     await harnessSessionSecret(harness.origin, false);
     assert.deepEqual(front.log.filter((line) => !/^(GET|HEAD) /.test(line)), ["POST /login"], "the failed probe sent a write to the server");
     const lockedStep = step(lockedA.parsed, "click budget on quote 1");
