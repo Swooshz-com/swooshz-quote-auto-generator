@@ -12,6 +12,10 @@ import { fileURLToPath } from "node:url";
 import { AI_CAP_MAX_USD, AiBudget, AiCapError, loadBudget, reportedUsd, saveBudget } from "../scripts/lib/ai-budget.mjs";
 import { derivedReasons, ManifestError, REASON_CODES, targetsDocument, validateManifest, walkTargets } from "../scripts/lib/live-cases.mjs";
 import { assertNoWriteAttempted, basisPageChecks, browserGuard, compareWithPassA, DB_GUARD_MAX_AGE_MS, exportFacts, loadRunInputs, needsDbGuard, parseArgs, readDbGuard, quoteSaveWaitMs, readPassAFiles, savedAck, saveStub, showAllSessions, UsageError } from "../scripts/rehearsal-check.mjs";
+// The ids-first listing (#390 run 2, hold 3) through namespaces, so the rest of
+// this file still loads where those exports do not exist.
+import * as liveCases from "../scripts/lib/live-cases.mjs";
+import * as rehearsalCheck from "../scripts/rehearsal-check.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const script = path.join(root, "scripts", "rehearsal-check.mjs");
@@ -87,6 +91,106 @@ test("walk targets: manifest quotes first, then the newest owned quotes, ids onl
   const doc = targetsDocument([id(1)], [{ id: id(1), reasons: ["generated", "made-up"], sections: 2, lines: 5 }]);
   assert.deepEqual(doc, { schema: "sqag-live-walk-targets/v1", quote_ids: [id(1)], candidates: [{ id: id(1), reasons: ["generated"], sections: 2, lines: 5 }] });
   assert.throws(() => targetsDocument(["quote-name"], []), ManifestError);
+});
+
+test("copy ids: the manifest quotes, then every owned quote newest first, up to the bucket copy's cap", async () => {
+  const { copyTargets, MAX_COPY_QUOTES } = liveCases;
+  assert.equal(typeof copyTargets, "function", "live-cases.mjs has no copyTargets");
+  // The copy script takes at most this many ids; the two caps must stay equal.
+  const copyScript = await fs.readFile(path.join(root, "scripts", "copy_live_objects_to_rehearsal.py"), "utf8");
+  assert.equal(MAX_COPY_QUOTES, Number(/^MAX_QUOTES = ([0-9]+)$/m.exec(copyScript)[1]));
+  const own = [
+    { session_id: id(2), updated_at: "2026-11-01" },
+    { session_id: id(3), updated_at: "2026-11-19" },
+    { session_id: id(1), updated_at: "2026-11-20" },
+    { session_id: "quote-Planted Name", updated_at: "2026-11-21" },
+  ];
+  assert.deepEqual(copyTargets([id(2)], own), [id(2), id(1), id(3)]);
+  assert.deepEqual(copyTargets([], own), [id(1), id(3), id(2)]);
+  const many = Array.from({ length: 60 }, (_, index) => ({ session_id: `quote-${index.toString(16).padStart(24, "0")}`, updated_at: `2026-11-${String(index % 28 + 1).padStart(2, "0")}T${String(index).padStart(2, "0")}` }));
+  const capped = copyTargets([many[0].session_id], many);
+  assert.equal(capped.length, MAX_COPY_QUOTES);
+  assert.equal(capped[0], many[0].session_id);
+  assert.equal(new Set(capped).size, MAX_COPY_QUOTES);
+  // Every walk target is among the copied quotes, so Pass A finds each one's files.
+  assert.ok(walkTargets([many[0].session_id], many, 5).every((target) => capped.includes(target)));
+  assert.throws(() => targetsDocument(many.map((session) => session.session_id), []), ManifestError);
+});
+
+// A run with only what writeWalkTargets uses: its options and a step recorder.
+function listingRun(file) {
+  const steps = [];
+  return {
+    steps,
+    options: { targetsOut: file },
+    async step(name, action) {
+      const entry = { name, status: "running" };
+      steps.push(entry);
+      try {
+        entry.detail = await action();
+        entry.status = "pass";
+        return entry.detail;
+      } catch (error) {
+        entry.status = "fail";
+        entry.error = error.message;
+        throw error;
+      }
+    },
+  };
+}
+
+test("on a fresh copy of live the ids go to the targets file before any quote is opened, and stay there when the readback fails", async () => {
+  const { writeWalkTargets } = rehearsalCheck;
+  assert.equal(typeof writeWalkTargets, "function", "rehearsal-check.mjs has no writeWalkTargets");
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sqag-walk-targets-"));
+  const file = path.join(dir, "walk-targets.json");
+  const own = [1, 2, 3, 4, 5].map((digit) => ({ session_id: id(digit), updated_at: `2026-11-0${digit}` }));
+  const opened = [];
+  // The copy's answer before its files are copied (run 2: object_artifact_storage_unavailable).
+  const missingFiles = async (quoteId) => {
+    opened.push(quoteId);
+    const onDisk = JSON.parse(await fs.readFile(file, "utf8"));
+    assert.deepEqual(onDisk, { schema: "sqag-live-walk-targets/v1", quote_ids: [id(2), id(5), id(4), id(3), id(1)], candidates: [] }, "the ids were not written before the first readback");
+    throw new Error("Quote readback returned HTTP 503.");
+  };
+  const first = listingRun(file);
+  await assert.rejects(writeWalkTargets(first, [id(2)], own, missingFiles), /HTTP 503\. .*copy_live_objects_to_rehearsal\.py.*--targets-only/);
+  assert.deepEqual(opened, [id(2)]);
+  assert.deepEqual(first.steps.map((entry) => [entry.name, entry.status]), [["copy ids file", "pass"], ["targets file", "fail"]]);
+  assert.deepEqual(first.steps[0].detail, { quote_ids: 5, own_not_listed: 0 });
+  assert.deepEqual(JSON.parse(await fs.readFile(file, "utf8")).quote_ids, [id(2), id(5), id(4), id(3), id(1)]);
+  // After the copy, the same listing opens each quote and writes the candidates with their reasons.
+  const copied = async (quoteId) => ({ session_id: quoteId, status: { quote_generated: quoteId === id(2) }, draft_state: { quoteBasisSections: [{ lines: [{}, {}] }] }, draft_files: [] });
+  const second = listingRun(file);
+  await writeWalkTargets(second, [id(2)], own, copied);
+  assert.deepEqual(second.steps.map((entry) => [entry.name, entry.status]), [["copy ids file", "pass"], ["targets file", "pass"]]);
+  assert.deepEqual(second.steps[1].detail, { candidates: 5 });
+  const listed = JSON.parse(await fs.readFile(file, "utf8"));
+  assert.deepEqual(listed.quote_ids, [id(2), id(5), id(4), id(3), id(1)]);
+  assert.deepEqual(listed.candidates.map((entry) => [entry.id, entry.reasons, entry.sections, entry.lines]), [
+    [id(2), ["generated"], 1, 2], [id(5), ["draft"], 1, 2], [id(4), ["draft"], 1, 2], [id(3), ["draft"], 1, 2], [id(1), ["draft"], 1, 2],
+  ]);
+  // The listing writes nothing on disk but the targets file.
+  assert.deepEqual(await fs.readdir(dir), ["walk-targets.json"]);
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("the candidate list opens at most 30 quotes and reports the owned quotes past the copy's cap", async () => {
+  const { writeWalkTargets, MAX_COPY_QUOTES } = { ...rehearsalCheck, ...liveCases };
+  assert.equal(typeof writeWalkTargets, "function", "rehearsal-check.mjs has no writeWalkTargets");
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sqag-walk-targets-"));
+  const file = path.join(dir, "walk-targets.json");
+  const own = Array.from({ length: 55 }, (_, index) => ({ session_id: `quote-${index.toString(16).padStart(24, "0")}`, updated_at: `2026-11-20T${String(index).padStart(4, "0")}` }));
+  const opened = [];
+  const run = listingRun(file);
+  await writeWalkTargets(run, [], own, async (quoteId) => { opened.push(quoteId); return { status: {} }; });
+  assert.deepEqual(run.steps[0].detail, { quote_ids: MAX_COPY_QUOTES, own_not_listed: 55 - MAX_COPY_QUOTES });
+  assert.equal(opened.length, 30);
+  const listed = JSON.parse(await fs.readFile(file, "utf8"));
+  assert.equal(listed.quote_ids.length, MAX_COPY_QUOTES);
+  assert.deepEqual(opened, listed.quote_ids.slice(0, 30));
+  assert.equal(listed.candidates.length, 30);
+  await fs.rm(dir, { recursive: true, force: true });
 });
 
 test("candidate reasons are derived from counts and types, never text", () => {
@@ -199,6 +303,9 @@ test("live gets no download and no candidate list: those are for the copy of liv
   const copy = "https://quote-rehearsal-copy.example.test";
   assert.throws(on(live, "--download-files"), /copy of live only/);
   assert.throws(on(live, "--targets-out", "t.json"), /copy of live only/);
+  // The ids listing runs only with --targets-out, so Pass B on live never opens quotes for it or writes a targets file.
+  assert.throws(on(live, "--targets-out", "t.json", "--targets-only"), /copy of live only/);
+  assert.throws(on(live, "--expect-files", "a.json", "--targets-only"), /needs --targets-out/);
   assert.equal(on(copy, "--download-files")().downloadFiles, true);
   assert.equal(on(live, "--expect-files", "a.json")().expectFiles, "a.json");
   assert.throws(on(copy, "--download-files", "--expect-files", "a.json"), /not both/);
@@ -281,6 +388,10 @@ test("writing to a hosted database, or anything on the copy of live, needs a fre
     // The record of the other rehearsal service does not cover this app.
     [{ service_name: "quote-rehearsal" }, /another service/],
     [{ service_name: null }, /another service/],
+    // A branch Neon's API did not confirm proves nothing about which database the URL names.
+    [{ neon_api: "not_checked" }, /neon_api checked/],
+    [{ neon_api: undefined }, /neon_api checked/],
+    [{ neon_api: "CHECKED" }, /neon_api checked/],
   ];
   for (const [bad, message] of refusals) {
     await assert.rejects(readDbGuard(await guardFile(bad), copy, now), message, JSON.stringify(bad));
