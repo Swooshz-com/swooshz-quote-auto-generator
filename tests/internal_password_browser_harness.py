@@ -89,8 +89,9 @@ class HarnessHandler(webapp.QuoteRunnerHandler):
             self.send_json({"error": "copy must be true or false"}, status=400)
             return
         os.environ["SESSION_SECRET"] = HARNESS_COPY_SESSION_SECRET if body["copy"] else HARNESS_SESSION_SECRET
-        # A different service: no sign-in carries over.
+        # A different service: no sign-in carries over, and its sign-in policy is built from its own secret.
         self.server.internal_auth = webapp.InternalAuthState(clock=clock)
+        self.server.internal_policy = webapp.internal_auth_policy()
         self.send_json({"status": "ok", "copy": body["copy"]})
 
     def handle_harness_clock(self, clock):
