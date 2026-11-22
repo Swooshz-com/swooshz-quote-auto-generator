@@ -400,6 +400,19 @@ class CopyLiveObjectsTests(unittest.TestCase):
         self.assertEqual(self.dest.calls, [])
         self.assertEqual(self.db.params, [([QUOTE_A, QUOTE_B],)])
 
+    def test_the_ids_file_the_listing_writes_first_is_copied_whole(self) -> None:
+        # rehearsal-check.mjs --targets-only writes the copy ids, up to 50, with no candidates yet,
+        # before it opens any quote; the copy reads every listed id from that file.
+        ids = [QUOTE_A, QUOTE_B] + [f"quote-{i:024x}" for i in range(48)]
+        listing = write_json(self.dir, {"schema": SCHEMA, "quote_ids": ids, "candidates": []})
+        for mode in ("plan", "copy"):
+            with self.subTest(mode):
+                code, report = self.run_script(argv_for(listing, mode))
+                self.assertEqual((code, report["status"]), (0, "planned" if mode == "plan" else "copied"), report)
+                self.assertEqual(report["quote_ids"], 50)
+                self.assertEqual(self.db.params, [(ids,)])
+                self.assertEqual(report["write_attempts_refused"], 0)
+
     def test_database_is_opened_read_only_before_the_query(self) -> None:
         self.run_script(argv_for(self.targets, "plan"))
         self.assertEqual(len(self.db.statements), 3)

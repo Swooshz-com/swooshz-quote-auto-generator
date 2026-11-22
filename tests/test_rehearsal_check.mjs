@@ -133,11 +133,21 @@ test("live-readonly API contexts refuse every write before it is sent", async ()
 });
 
 // A logging reverse proxy in front of the harness: what the server actually received.
+// With failReadbacks set it answers each quote readback as a fresh copy of live
+// did before its files were copied (#390 run 2, hold 3), without reaching the app.
+const QUOTE_READBACK = /^\/api\/quote-sessions\/quote-[0-9a-f]{24}$/;
 async function loggingProxy(upstream) {
   const target = new URL(upstream);
   const log = [];
+  const state = { failReadbacks: false };
   const proxy = http.createServer((request, response) => {
-    log.push(`${request.method} ${request.url.split("?")[0]}`);
+    const route = request.url.split("?")[0];
+    log.push(`${request.method} ${route}`);
+    if (state.failReadbacks && request.method === "GET" && QUOTE_READBACK.test(route)) {
+      response.writeHead(503, { "content-type": "application/json" });
+      response.end(JSON.stringify({ status: "error", errors: ["object_artifact_storage_unavailable"] }));
+      return;
+    }
     const forward = http.request({ host: target.hostname, port: target.port, method: request.method, path: request.url, headers: request.headers }, (reply) => {
       response.writeHead(reply.statusCode, reply.headers);
       reply.pipe(response);
@@ -146,7 +156,7 @@ async function loggingProxy(upstream) {
     request.pipe(forward);
   });
   await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
-  return { proxy, log, origin: `http://127.0.0.1:${proxy.address().port}` };
+  return { proxy, log, state, origin: `http://127.0.0.1:${proxy.address().port}` };
 }
 
 // The test databases and app roles on the disposable PostgreSQL service, so a
@@ -228,7 +238,7 @@ async function runAllProfiles(t, storage) {
   const storageFlags = storage === "file" ? ["--file-storage"] : [];
   let stopped = false;
   try {
-    const result = async (profile, extra = [], name = profile) => {
+    const result = async (profile, extra = [], name = profile, { code = 0 } = {}) => {
       const file = path.join(dirs.results, `${name}.json`);
       const outcome = await run(["--profile", profile, "--base-url", front.origin, "--allow-loopback-http", ...storageFlags, "--result", file, ...extra]);
       const text = await fs.readFile(file, "utf8");
@@ -237,8 +247,8 @@ async function runAllProfiles(t, storage) {
       assert.ok(!/https?:\/\//.test(text), `${profile} result holds a URL`);
       const parsed = JSON.parse(text);
       const failed = parsed.steps.filter((step) => step.status === "fail").map((step) => `${step.name}: ${step.error}`);
-      assert.equal(outcome.code, 0, `${storage} ${profile} failed: ${failed.join(" | ") || parsed.error || outcome.stderr}`);
-      assert.equal(parsed.result, "pass");
+      assert.equal(outcome.code, code, `${storage} ${profile} exit ${outcome.code}: ${failed.join(" | ") || parsed.error || outcome.stderr}`);
+      assert.equal(parsed.result, code === 0 ? "pass" : "fail");
       const scan = spawnSync(python, [path.join(root, "scripts", "scan_sensitive_fixtures.py"), "--root", root, "--path", file, "--fail-on-review"], { cwd: root, encoding: "utf8" });
       assert.equal(scan.status, 0, `${profile} result has sensitive-fixture findings: ${scan.stdout}`);
       return { parsed, file };
@@ -285,6 +295,39 @@ async function runAllProfiles(t, storage) {
         { id: seed.parsed.seed.draft_session_id, reasons: ["draft"] },
       ],
     }));
+    const manifestIds = [seed.parsed.seed.published_session_id, seed.parsed.seed.excel_only_session_id, seed.parsed.seed.draft_session_id];
+    // Listing on a fresh copy of live: the quote ids go to the targets file from
+    // the quote list alone, before any quote is opened, because opening one loads
+    // its files and those reach the copy's bucket only when the copy runs on that
+    // file. Every readback fails here, as on the copy in run 2; the ids stay.
+    const listFile = path.join(dirs.results, "walk-targets.json");
+    const listing = ["--manifest", manifestFile, "--targets-out", listFile, "--targets-only"];
+    front.log.length = 0;
+    front.state.failReadbacks = true;
+    const idsOnly = await result("live-readonly", listing, "list-ids", { code: 1 });
+    front.state.failReadbacks = false;
+    assert.deepEqual(front.log.filter((line) => !/^(GET|HEAD) /.test(line)), ["POST /login"], "the ids listing sent a write to the server");
+    const readbackFailed = step(idsOnly.parsed, "targets file");
+    assert.equal(readbackFailed?.status, "fail", "the listing did not reach the quote readbacks");
+    const idsText = await fs.readFile(listFile, "utf8").catch(() => assert.fail(`no ids file after the failed readback (${readbackFailed.error})`));
+    assert.match(readbackFailed.error, /HTTP 503\. .*copy_live_objects_to_rehearsal\.py/);
+    const own = step(idsOnly.parsed, "quote list matches the dashboard").detail.own;
+    assert.ok(own >= 3, `the harness lists ${own} owned quotes`);
+    assert.deepEqual(step(idsOnly.parsed, "copy ids file")?.detail, { quote_ids: Math.min(own, 50), own_not_listed: Math.max(0, own - 50) });
+    const ids = JSON.parse(idsText);
+    assert.deepEqual(ids.quote_ids.slice(0, 3), manifestIds);
+    assert.equal(ids.quote_ids.length, Math.min(own, 50));
+    assert.deepEqual(ids.candidates, []);
+    // After the copy, the same command opens the listed quotes and writes the candidates with their reasons.
+    front.log.length = 0;
+    const listed = await result("live-readonly", listing, "list-candidates");
+    assert.deepEqual(front.log.filter((line) => !/^(GET|HEAD) /.test(line)), ["POST /login"], "the candidate listing sent a write to the server");
+    const candidates = JSON.parse(await fs.readFile(listFile, "utf8"));
+    assert.deepEqual(candidates.quote_ids, ids.quote_ids);
+    assert.equal(step(listed.parsed, "targets file").detail.candidates, Math.min(ids.quote_ids.length, 30));
+    assert.deepEqual(candidates.candidates.map((entry) => entry.id), ids.quote_ids.slice(0, 30));
+    assert.deepEqual(candidates.candidates.slice(0, 3).map((entry) => entry.reasons[0]), ["generated", "generated", "draft"]);
+    assert.ok(!JSON.stringify(candidates).includes("Rehearsal Synthetic"), "the targets file holds quote text");
     // Pass A (the copy of live): downloads each available file and checks it against its record.
     front.log.length = 0;
     const targetsFile = path.join(dirs.results, "targets.json");
@@ -319,7 +362,8 @@ async function runAllProfiles(t, storage) {
     // Whatever the clicks saved was answered in the browser: the proxy check above saw only the sign-in.
     assert.ok(Number.isInteger(probed.stubbed_saves) && Number.isInteger(probed.stubbed_other), JSON.stringify(probed));
     const targets = JSON.parse(await fs.readFile(targetsFile, "utf8"));
-    assert.deepEqual(targets.quote_ids.slice(0, 3), [seed.parsed.seed.published_session_id, seed.parsed.seed.excel_only_session_id, seed.parsed.seed.draft_session_id]);
+    // Pass A lists the same copy ids as the listing whose files were copied.
+    assert.deepEqual(targets.quote_ids, ids.quote_ids);
     assert.ok(targets.quote_ids.every((id) => /^quote-[0-9a-f]{24}$/.test(id)));
     assert.ok(!JSON.stringify(targets).includes("Rehearsal Synthetic"), "the targets file holds quote text");
     if (countsBeforeA) {
