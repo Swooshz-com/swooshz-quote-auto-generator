@@ -9,8 +9,10 @@ guard's branch check, come from the credential store through toolkit env run (na
     node "<toolkit>/repo/scripts/toolkit-env.cjs" run --names NEONDB_SWOOSHZ_SQAG_API_KEY,SWOOSHZ_SQAG_LIVE_R2_READONLY_ENDPOINT_URL,SWOOSHZ_SQAG_LIVE_R2_READONLY_ACCESS_KEY_ID,SWOOSHZ_SQAG_LIVE_R2_READONLY_SECRET_ACCESS_KEY,SWOOSHZ_SQAG_REHEARSAL_R2_ENDPOINT_URL,SWOOSHZ_SQAG_REHEARSAL_R2_ACCESS_KEY_ID,SWOOSHZ_SQAG_REHEARSAL_R2_SECRET_ACCESS_KEY -- python scripts/copy_live_objects_to_rehearsal.py --targets <targets.json> --source-bucket <live bucket> --expect-dest-bucket sqag-rehearsal --mode plan --confirm-live-read
 
 --targets is JSON: {"schema": "sqag-live-walk-targets/v1", "quote_ids": ["quote-<24 hex>"]}.
-Run --mode plan first (reads rows and source heads, writes nothing), then --mode copy;
-copy is safe to repeat. Output is counts only. Exit: 0 ok, 1 mismatch or storage error,
+It copies the files a walk of those quotes reads: their uploaded files, their published
+quote files and the layout of the company profile each quote names (ROWS_SQL says how each
+links to a quote). Run --mode plan first (reads rows and source heads, writes nothing), then
+--mode copy; copy is safe to repeat. Output is counts only. Exit: 0 ok, 1 mismatch or storage error,
 2 refused before any call.
 
 Before any database or bucket call, the run checks SQAG_LIVE_COPY_DATABASE_URL with
@@ -54,11 +56,31 @@ DEST_NAMES = (DST_ENDPOINT, DST_KEY_ID, DST_SECRET)
 REQUIRED_ENV = (DB_URL_ENV, *SOURCE_NAMES, *DEST_NAMES)
 READ_METHODS = frozenset({"head_object", "get_object"})
 NOT_FOUND_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
+# The object rows a walk of the listed quotes reads (webapp/server.py). The app leaves
+# sqag_object_artifacts.session_id empty and finds a quote's files by owner instead:
+# - uploaded_reference and legacy generated_quote rows: owner_id is the quote id
+#   (_hydrate_object_draft_files, _object_quote_artifact_row);
+# - generated_quote_version rows: owner_id is a run id of the quote's publication
+#   versions (_publication_version_artifact; same links as _active_object_quote_rows_for_session);
+# - the quotation_layout of the company profile the quote names: a file download can
+#   rebuild the quote's publication check from it (profile_layout_artifact).
+# Pricing reference objects are not read on these paths, so they are not copied.
+# Only rows the app would read: active, not deleted, in the object store.
 ROWS_SQL = (
-    "select workspace_id, owner_type, session_id, artifact_kind, size_bytes, checksum_sha256, object_key_ref "
-    "from sqag_object_artifacts where session_id = any(%s) "
-    "and status = 'active' and object_provider_type = 's3_compatible'"
+    "select o.workspace_id, o.owner_type, o.owner_id, o.artifact_kind, o.size_bytes, o.checksum_sha256, "
+    "o.object_key_ref from sqag_object_artifacts o "
+    "where o.status = 'active' and o.retention_status = 'active' and o.deleted_at is null "
+    "and o.object_provider_type = 's3_compatible' and ("
+    "(o.owner_type in ('uploaded_reference', 'generated_quote') and o.owner_id = any(%(ids)s)) "
+    "or (o.owner_type = 'generated_quote_version' and o.owner_id in ("
+    "select v.run_id from sqag_quote_publication_versions v "
+    "where v.workspace_id = o.workspace_id and v.session_id = any(%(ids)s))) "
+    "or (o.owner_type = 'profile' and o.artifact_kind = 'quotation_layout' and o.owner_id in ("
+    "select regexp_replace(q.metadata_json::jsonb -> 'quote_company_profile' ->> 'id', "
+    "'^(company|profile):', '', 'i') from sqag_quote_sessions q "
+    "where q.workspace_id = o.workspace_id and q.session_id = any(%(ids)s))))"
 )
+OWNER_TYPES = ("uploaded_reference", "generated_quote", "generated_quote_version", "profile")
 # Same retry policy as webapp.object_storage.S3_CLIENT_RETRIES (botocore 1.44 changed
 # the SDK default). Kept inline because this script runs from a laptop checkout; a
 # test keeps the two equal.
@@ -145,7 +167,7 @@ def read_rows(conn: Any, quote_ids: list[str]) -> list[tuple]:
     # Session-level read-only guard; with autocommit, SET TRANSACTION would do nothing.
     conn.execute("SET default_transaction_read_only = on")
     conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
-    return list(conn.execute(ROWS_SQL, (quote_ids,)).fetchall())
+    return list(conn.execute(ROWS_SQL, {"ids": quote_ids}).fetchall())
 
 
 def plan_objects(rows: list[tuple]) -> list[StoredObject]:
@@ -154,7 +176,9 @@ def plan_objects(rows: list[tuple]) -> list[StoredObject]:
     if len({row[0] for row in rows}) != 1:
         raise Refusal("rows span more than one workspace")
     by_key: dict[str, StoredObject] = {}
-    for _workspace, _owner_type, _session, _kind, size, checksum, key in rows:
+    for _workspace, owner_type, _owner, _kind, size, checksum, key in rows:
+        if owner_type not in OWNER_TYPES:
+            raise Refusal("an object row has an owner type the walk does not read")
         if not isinstance(key, str) or not key.startswith("workspaces/") or ".." in key:
             raise Refusal("an object key is outside workspaces/ or unsafe")
         if not isinstance(size, int) or size < 0 or not isinstance(checksum, str):
@@ -168,6 +192,11 @@ def plan_objects(rows: list[tuple]) -> list[StoredObject]:
     if sum(obj.size for obj in objects) > MAX_BYTES:
         raise Refusal("objects total more than 1 GiB")
     return objects
+
+
+def owner_type_counts(rows: list[tuple]) -> dict[str, int]:
+    """Rows per owner type (names only), so a run shows which kinds of file it found."""
+    return {kind: sum(1 for row in rows if row[1] == kind) for kind in OWNER_TYPES}
 
 
 def keys_digest(objects: list[StoredObject]) -> str:
@@ -300,6 +329,7 @@ def run(
     report: dict[str, Any] = {
         "mode": args.mode, "status": "fail", "objects": 0, "bytes": 0, "copied": 0, "already_present": 0,
         "mismatches": 0, "errors": 0, "write_attempts_refused": 0, "keys_sha256": "", "quote_ids": 0,
+        "rows_by_owner_type": {},
     }
     code = 1
     source: ReadOnlySource | None = None
@@ -315,7 +345,9 @@ def run(
         check_buckets(source_bucket, dest_bucket, args.map)
         check_production_guard(env, args.map)
         conn = (db_factory or make_db)(env)
-        objects = plan_objects(read_rows(conn, quote_ids))
+        rows = read_rows(conn, quote_ids)
+        report["rows_by_owner_type"] = owner_type_counts(rows)
+        objects = plan_objects(rows)
         report.update(objects=len(objects), bytes=sum(o.size for o in objects), keys_sha256=keys_digest(objects))
         source = ReadOnlySource((source_factory or make_source_client)(env))
         if args.mode == "plan":
