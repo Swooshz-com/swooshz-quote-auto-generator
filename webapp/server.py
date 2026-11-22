@@ -13281,6 +13281,21 @@ class DatabaseSqagStorage:
             return self._public_access_profile(existing)
         return self._run_storage_transaction(change)
 
+    def change_profile_quote_template(self, profile_id, choice, *, revision):
+        """Set only the profile's quote template; who may change the profile is the same as for a save."""
+        if type(revision) is not int:
+            raise SqagStorageAccessError("Profile revision is required.", status=409, reason="profile_revision_required")
+        if not quote_template_choice_valid(choice):
+            raise ValueError("Quote template choice is invalid.")
+        def change(connection):
+            existing = self._profile_change_row(connection, profile_id)
+            self._authorize_profile_change(existing, revision=revision)
+            existing["quote_template_id"] = choice
+            existing["_revision"] = existing.get("_revision", 0) + 1
+            self._execute_upsert_payload(connection, "sqag_profiles", "profile_id", profile_id, existing)
+            return self._public_access_profile(existing)
+        return self._run_storage_transaction(change)
+
     def list_profiles(self) -> list[dict[str, Any]]:
         profiles = [
             public_database_profile_summary(profile)
@@ -18762,6 +18777,20 @@ class QuoteTemplateStore:
     def default(self) -> dict[str, Any] | None:
         return next((record for record in self.list() if record["is_default"]), None)
 
+    def usage(self, default_id: str) -> dict[str, int]:
+        """How many company profiles in the workspace each template lays out (counts only, no names).
+
+        A profile set to the workspace default counts for the current default template.
+        """
+        counts: dict[str, int] = {}
+        for payload in self.storage._read_payloads("sqag_profiles", "profile_id"):
+            choice = payload.get("quote_template_id")
+            if self.storage._is_deleted_profile_payload(payload) or not isinstance(choice, str):
+                continue
+            template_id = default_id if choice == DEFAULT_QUOTE_TEMPLATE_CHOICE else choice
+            counts[template_id] = counts.get(template_id, 0) + 1
+        return counts
+
     @staticmethod
     def _checked(definition: Any) -> tuple[dict[str, Any], str, str]:
         checked = quote_template.read_quote_template(definition)
@@ -18930,6 +18959,74 @@ def check_profile_quote_template_choice(profile: dict[str, Any], storage: Any) -
         raise SqagStorageAccessError(
             "The chosen quote template does not exist. Pick another template.", status=400, reason="template_not_found",
         )
+
+
+def quote_template_choices(storage: Any) -> dict[str, Any]:
+    """Template names for the Company Profile "Quote template" dropdown, sent with /api/profiles.
+
+    Rides on the profile list the page already loads, so the dropdown adds no request of its own.
+    `available` is False where profiles cannot pick a template (local file storage, or migration 013
+    not applied yet); the page then shows the dropdown locked with a note, never a guessed choice.
+    """
+    standard = standard_quote_template_record()
+    unavailable = {
+        "available": False,
+        "default_template_id": STANDARD_QUOTE_TEMPLATE_ID,
+        "templates": [{"id": standard["id"], "name": standard["name"], "builtin": True}],
+    }
+    store = quote_template_store_for_storage(storage)
+    if store is None or not store.ready():
+        return unavailable
+    saved = store.list()
+    default_id = next((record["id"] for record in saved if record["is_default"]), STANDARD_QUOTE_TEMPLATE_ID)
+    return {
+        "available": True,
+        "default_template_id": default_id,
+        "templates": [
+            {"id": record["id"], "name": record["name"], "builtin": record.get("builtin", False)}
+            for record in [standard, *saved]
+        ],
+    }
+
+
+QUOTE_TEMPLATE_PREVIEW_PATH = PROJECT_ROOT / "scripts" / "quote_template_preview.py"
+QUOTE_TEMPLATE_PREVIEW_TIMEOUT_SECONDS = 60
+QUOTE_TEMPLATE_PREVIEW_PDF_UNAVAILABLE_EXIT = 3
+QUOTE_TEMPLATE_PREVIEW_TYPES = {
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "pdf": "application/pdf",
+}
+
+
+class QuoteTemplatePreviewUnavailable(Exception):
+    """No PDF converter on this server; the admin can still preview the Excel file."""
+
+
+def render_quote_template_preview(definition: dict[str, Any], preview_format: str) -> bytes:
+    """Render the fixed synthetic sample quote with a checked draft definition; returns the file bytes.
+
+    Runs scripts/quote_template_preview.py as a child process (like quote generation), in a
+    throwaway folder under the app's temp root. No customer data is read or kept.
+    """
+    if preview_format not in QUOTE_TEMPLATE_PREVIEW_TYPES:
+        raise ValueError("Preview format must be xlsx or pdf.")
+    tmp_root = configured_tmp_root()
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="template-preview-", dir=tmp_root) as folder:
+        work = Path(folder)
+        definition_path = work / "quote-template.json"
+        atomic_write_text(definition_path, quote_template.canonical_quote_template_json(definition))
+        completed = subprocess.run(
+            [sys.executable, str(QUOTE_TEMPLATE_PREVIEW_PATH), "--quote-template", str(definition_path),
+             "--out", str(work / "out"), "--format", preview_format],
+            cwd=str(PROJECT_ROOT), text=True, capture_output=True, timeout=QUOTE_TEMPLATE_PREVIEW_TIMEOUT_SECONDS,
+        )
+        if completed.returncode == QUOTE_TEMPLATE_PREVIEW_PDF_UNAVAILABLE_EXIT and preview_format == "pdf":
+            raise QuoteTemplatePreviewUnavailable()
+        output = work / "out" / f"quote-template-preview.{preview_format}"
+        if completed.returncode != 0 or not output.is_file():
+            raise RuntimeError(f"quote template preview exited with code {completed.returncode}")
+        return output.read_bytes()
 
 
 def database_profile_detail_for_payload(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any] | None:
@@ -35260,7 +35357,9 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             try:
                 workspace = storage.workspace()
                 company_profiles = []
+                quote_templates = None
                 if self.current_permissions().get("canGenerateQuote"):
+                    quote_templates = quote_template_choices(storage)
                     company_profiles = [
                         public_database_profile_summary(profile)
                         for profile in storage.list_company_profiles()
@@ -35288,6 +35387,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             self.send_json({
                 "profiles": available_profiles,
                 "company_profiles": company_profiles,
+                **({"quote_templates": quote_templates} if quote_templates is not None else {}),
                 "pricing_references": pricing_references,
                 "pricing_reference_order_digit_limit": integer_digit_limit(),
                 "default_profile_id": default_profile_id,
@@ -35616,12 +35716,20 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 return
             try:
                 operation = payload.get("operation", "create")
-                if operation not in {"create", "update", "access"}:
+                if operation not in {"create", "update", "access", "template"}:
                     raise ValueError("Invalid profile operation.")
                 revision = payload.get("revision")
-                if operation in {"update", "access"} and type(revision) is not int:
+                if operation in {"update", "access", "template"} and type(revision) is not int:
                     raise ValueError("Profile revision is required.")
-                profile = normalize_profile_payload(payload)
+                if operation == "template":
+                    # Only the quote template changes, so the rest of the profile is not resubmitted.
+                    profile = {"id": safe_resource_id(payload.get("id"), ""), "quote_template_id": payload.get("quote_template_id")}
+                    if not profile["id"]:
+                        raise ValueError("Profile id is required and may only contain letters, numbers, dashes, or underscores.")
+                    if not quote_template_choice_valid(profile["quote_template_id"]):
+                        raise ValueError("Quote template choice is invalid.")
+                else:
+                    profile = normalize_profile_payload(payload)
                 if profile_payload_has_layout_artifact(profile):
                     try:
                         ensure_quote_artifact_storage_available_for_auth_session(self.current_auth_session())
@@ -35636,6 +35744,11 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                     if not isinstance(storage, DatabaseSqagStorage):
                         raise ValueError("Access changes require user-scoped storage.")
                     saved = storage.change_profile_access(profile["id"], payload.get("access"), revision=revision)
+                elif operation == "template":
+                    if not isinstance(storage, DatabaseSqagStorage):
+                        raise ValueError("Quote templates need database storage.")
+                    check_profile_quote_template_choice(profile, storage)
+                    saved = storage.change_profile_quote_template(profile["id"], profile["quote_template_id"], revision=revision)
                 else:
                     check_profile_quote_template_choice(profile, storage)
                     saved = storage.save_profile(profile, operation=operation, revision=revision)
@@ -36367,11 +36480,15 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         try:
             if method == "POST" and target == "preview":
                 checked = quote_template.read_quote_template(payload.get("definition"))
-                self.send_json({
-                    "status": "valid",
-                    "definition": checked,
-                    "fingerprint": quote_template.quote_template_fingerprint(checked),
-                })
+                preview_format = payload.get("format", "check")
+                if preview_format == "check":
+                    self.send_json({
+                        "status": "valid",
+                        "definition": checked,
+                        "fingerprint": quote_template.quote_template_fingerprint(checked),
+                    })
+                    return True
+                self.send_quote_template_preview(checked, preview_format)
                 return True
             storage = self.current_app_storage()
             if storage is None:
@@ -36384,11 +36501,18 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             if listing:
                 saved = store.list()
                 default_id = next((record["id"] for record in saved if record["is_default"]), STANDARD_QUOTE_TEMPLATE_ID)
+                records = [standard_quote_template_record(), *saved]
+                summaries = [quote_template_summary(record, default_id) for record in records]
+                if self.current_permissions().get("canManageSettings"):
+                    # Admins also get each layout (for the list's page thumbnail and the editor)
+                    # and how many profiles use it (for the delete warning). Staff get names only.
+                    usage = store.usage(default_id)
+                    summaries = [
+                        {**summary, "definition": record["definition"], "usage": usage.get(record["id"], 0)}
+                        for summary, record in zip(summaries, records)
+                    ]
                 self.send_json({
-                    "templates": [
-                        quote_template_summary(record, default_id)
-                        for record in [standard_quote_template_record(), *saved]
-                    ],
+                    "templates": summaries,
                     "default_template_id": default_id,
                     "limit": store.limit,
                     "saved_count": len(saved),
@@ -37382,6 +37506,33 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         self.send_header("Content-Disposition", f'attachment; filename="{safe_filename}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.send_security_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_quote_template_preview(self, definition: dict[str, Any], preview_format: Any) -> None:
+        """Send the sample quote in a draft template's layout (Excel download or PDF to view)."""
+        if preview_format not in QUOTE_TEMPLATE_PREVIEW_TYPES:
+            raise ValueError("Preview format must be xlsx or pdf.")
+        try:
+            body = render_quote_template_preview(definition, preview_format)
+        except QuoteTemplatePreviewUnavailable:
+            self.send_json({"status": "blocked", "errors": [
+                "PDF preview is not available on this server right now. Use Preview Excel instead.",
+            ]}, status=503)
+            return
+        except Exception as exc:
+            error_reference = new_error_reference()
+            write_local_log("quote_template_preview_failed", unexpected_error_log_details(
+                error_reference, exc, preview_format=preview_format,
+            ))
+            self.send_json(failed_result_payload(error_reference), status=500)
+            return
+        disposition = "inline" if preview_format == "pdf" else "attachment"
+        self.send_response(200)
+        self.send_header("Content-Type", QUOTE_TEMPLATE_PREVIEW_TYPES[preview_format])
+        self.send_header("Content-Disposition", f'{disposition}; filename="quote-template-preview.{preview_format}"')
         self.send_header("Content-Length", str(len(body)))
         self.send_security_headers()
         self.end_headers()
