@@ -400,7 +400,10 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      this session only; the bucket tokens come from the credential store.
      The script runs the production-branch guard on that URL before any
      call, reads live with the read-only token, writes only to
-     `sqag-rehearsal` and reports counts only:
+     `sqag-rehearsal` and reports counts only. It copies what the walk reads
+     for each listed quote: its uploaded files, its published quote files and
+     the layout of the company profile it names (`rows_by_owner_type` counts
+     each kind); pricing reference files are not needed:
 
      ```powershell
      $env:SQAG_LIVE_COPY_DATABASE_URL = <the copy branch's runtime URL>
@@ -442,7 +445,7 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      copied, saves per burst) fail the walk; its timings are recorded only,
      because the laptop's speed varies. Pass A passes only if all three
      checks pass, `pass-a-targets.json` lists the same ids as
-     `walk-targets.json` and `copy-app.js` has the same hash as
+     `walk-targets.json`, in any order, and `copy-app.js` has the same hash as
      `rehearsal-app.js`. Any failure holds promotion. Keep the copy up for
      8.2.
 
