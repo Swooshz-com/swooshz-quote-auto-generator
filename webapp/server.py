@@ -37512,7 +37512,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_quote_template_preview(self, definition: dict[str, Any], preview_format: Any) -> None:
-        """Send the sample quote in a draft template's layout (Excel download or PDF to view)."""
+        """Send the sample quote in a draft template's layout as a file download (Excel or PDF)."""
         if preview_format not in QUOTE_TEMPLATE_PREVIEW_TYPES:
             raise ValueError("Preview format must be xlsx or pdf.")
         try:
@@ -37529,10 +37529,9 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             ))
             self.send_json(failed_result_payload(error_reference), status=500)
             return
-        disposition = "inline" if preview_format == "pdf" else "attachment"
         self.send_response(200)
         self.send_header("Content-Type", QUOTE_TEMPLATE_PREVIEW_TYPES[preview_format])
-        self.send_header("Content-Disposition", f'{disposition}; filename="quote-template-preview.{preview_format}"')
+        self.send_header("Content-Disposition", f'attachment; filename="quote-template-preview.{preview_format}"')
         self.send_header("Content-Length", str(len(body)))
         self.send_security_headers()
         self.end_headers()

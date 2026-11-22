@@ -53,7 +53,7 @@ Colour never carries meaning alone: a warning or error also has a word or icon.
 
 ### Spacing and layout
 
-- Gaps in use: mostly 8, 10, 12 and 14 px; 4 and 6 px for tight pairs; 16-24 px between blocks; 2, 3 and 5 px a few times.
+- Gaps in use: mostly 8, 10, 12 and 14 px; 4 and 6 px for tight pairs; 16-24 px between blocks; 7 px (12 uses); 2, 3 and 5 px a few times.
 - New work uses 4 / 8 / 12 / 16 / 24 px, with 4 px for tight pairs (an icon and its label, a title and its meta line). A new part inside an existing screen matches its neighbours' spacing instead.
 - Working pane: 28 px side padding, header `22px 28px 20px`, footer `16px 28px`.
 - Cards inside a pane: 14-17 px padding, `--line` border, `--radius-md`.
@@ -125,7 +125,8 @@ Existing screens have a few mixed values. New work uses the standard choice in t
 | Four red border colours for danger | `--red-border` |
 | Close X red on Settings and the revision assistant, grey on the dashboard session panel | follow the window it sits in |
 | Four eyebrow specs (11-12 px, 820-900, 0-0.08em) | 12 px / 850 / 0.03em |
-| Card titles 17-20 px (the dashboard cards change size with width) | 18 px / 850 |
+| Delete dialog eyebrow and title dark red `#8f1f1a` (`#quoteSessionDeleteModal`, `#profileDeleteModal`) | `--green-dark` eyebrow and `--ink` title, as the approved Quote Templates delete dialog (`#qtDeleteModal`) |
+| Card titles 17-20 px (the dashboard cards change size with width; the selected-session title is 22-26 px while the session is empty) | 18 px / 850 |
 | Window titles 18 px, 19 px (revision assistant) and 20 px (Excel and workspace loading) | 18 px / 700 |
 | Literal hex, shadows and radii next to tokens | tokens only |
 | Focus: none, blue, or teal | 2 px teal outline on buttons, blue glow on inputs |

@@ -15612,6 +15612,36 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
 
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
 
+    def test_static_quote_templates_settings_contract(self):
+        static_dir = ROOT / "webapp" / "static"
+        html = (static_dir / "index.html").read_text(encoding="utf-8")
+        css = (static_dir / "styles.css").read_text(encoding="utf-8")
+        js = (static_dir / "app.js").read_text(encoding="utf-8")
+
+        # Settings has two sections as tabs, and the templates editor sits in its own section.
+        self.assertIn('id="settingsPricingTab" role="tab" aria-selected="true" aria-controls="settingsPricingSection"', html)
+        self.assertIn('id="settingsTemplatesTab" role="tab" aria-selected="false" aria-controls="settingsTemplatesSection"', html)
+        templates_section = html.split('id="settingsTemplatesSection"', 1)[1].split('id="settingsPricingFooter"', 1)[0]
+        for element in ("qtListView", "qtEditorView", "qtLimitMessage", "qtNewButton"):
+            self.assertIn(f'id="{element}"', templates_section)
+        # The delete confirm reuses the existing dialog pattern and starts hidden.
+        self.assertIn('class="modal-overlay profile-delete-modal" id="qtDeleteModal" role="dialog" aria-modal="true"', html)
+        self.assertRegex(html, r'id="qtDeleteModal"[^>]*\bhidden>')
+        # The Company Profile panel gets the template dropdown but no link to manage templates.
+        company_panel = html.split('id="quoteCompanyPanel"', 1)[1].split("</section>", 1)[0]
+        self.assertIn('id="quoteTemplateSelect"', company_panel)
+        self.assertNotIn("Manage templates", html + js)
+        # The page's content security policy forbids style attributes; layout goes through the CSSOM.
+        self.assertNotIn('style="', html)
+        model = js.split("// --- quote template model: start ---", 1)[1]
+        self.assertNotRegex(model, r"style=\$\{|setAttribute\(\s*[\"']style")
+        # Only the fixed icon set is written as markup; template text always goes in as text.
+        self.assertEqual(re.findall(r"\.innerHTML\s*=\s*([^;]+);", model), ['`<svg viewBox="0 0 24 24">${QT_ICONS[name]}</svg>`'])
+        self.assertNotIn("window.open(", model)
+        # Owner-approved focus outline on the Settings close X and the section and Manage/Import tabs.
+        self.assertIn("#pricingReferenceCloseButton:focus-visible, .pricing-reference-settings-tab:focus-visible "
+                      "{ outline: 2px solid var(--green); outline-offset: 2px; }", css)
+
     def test_static_webapp_offers_on_demand_pdf_view(self):
         static_dir = ROOT / "webapp" / "static"
         html = (static_dir / "index.html").read_text(encoding="utf-8")
