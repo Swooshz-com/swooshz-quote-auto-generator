@@ -1,7 +1,9 @@
 """Live-to-rehearsal object copy tests with fake DB and storage clients.
 
-No network, no boto3 calls, no psycopg, no real database or bucket. Fixture values are
-synthetic (example.test hosts, made-up keys and secrets).
+No network, no boto3 calls, no real bucket. The copy query itself runs against CI's
+disposable PostgreSQL service (CopyQueryOnAppRowsTests), on rows the app's own writer
+builds; every other test uses a fake database. Fixture values are synthetic
+(example.test hosts, made-up keys and secrets).
 """
 
 from __future__ import annotations
@@ -110,6 +112,7 @@ REPORT_KEYS = {
     "write_attempts_refused",
     "keys_sha256",
     "quote_ids",
+    "rows_by_owner_type",
 }
 
 
@@ -136,9 +139,11 @@ def db_row(
     workspace: str = WORKSPACE,
     size: int | None = None,
     checksum: str | None = None,
+    owner_type: str = "uploaded_reference",
 ) -> tuple:
-    """A row in the column order of copy_script.ROWS_SQL."""
-    return (workspace, "quote", session, "booth", len(data) if size is None else size, checksum or sha(data), key)
+    """A row in the column order of copy_script.ROWS_SQL: an uploaded file owned by its quote."""
+    size = len(data) if size is None else size
+    return (workspace, owner_type, session, "uploaded_reference_1", size, checksum or sha(data), key)
 
 
 def live_objects() -> dict[str, tuple[bytes, str, dict[str, str]]]:
@@ -398,7 +403,9 @@ class CopyLiveObjectsTests(unittest.TestCase):
         self.assertEqual(self.opened, ["db", "source"])
         self.assertEqual(set(self.source.calls), {"head_object"})
         self.assertEqual(self.dest.calls, [])
-        self.assertEqual(self.db.params, [([QUOTE_A, QUOTE_B],)])
+        self.assertEqual(self.db.params, [{"ids": [QUOTE_A, QUOTE_B]}])
+        self.assertEqual(report["rows_by_owner_type"],
+                         {"uploaded_reference": 2, "generated_quote": 0, "generated_quote_version": 0, "profile": 0})
 
     def test_the_ids_file_the_listing_writes_first_is_copied_whole(self) -> None:
         # rehearsal-check.mjs --targets-only writes the copy ids, up to 50, with no candidates yet,
@@ -410,7 +417,7 @@ class CopyLiveObjectsTests(unittest.TestCase):
                 code, report = self.run_script(argv_for(listing, mode))
                 self.assertEqual((code, report["status"]), (0, "planned" if mode == "plan" else "copied"), report)
                 self.assertEqual(report["quote_ids"], 50)
-                self.assertEqual(self.db.params, [(ids,)])
+                self.assertEqual(self.db.params, [{"ids": ids}])
                 self.assertEqual(report["write_attempts_refused"], 0)
 
     def test_database_is_opened_read_only_before_the_query(self) -> None:
@@ -418,8 +425,7 @@ class CopyLiveObjectsTests(unittest.TestCase):
         self.assertEqual(len(self.db.statements), 3)
         self.assertEqual(self.db.statements[0], "SET default_transaction_read_only = on")
         self.assertEqual(self.db.statements[1], "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
-        self.assertIn("from sqag_object_artifacts where session_id = any(%s)", self.db.statements[2])
-        self.assertIn("status = 'active' and object_provider_type = 's3_compatible'", self.db.statements[2])
+        self.assertEqual(self.db.statements[2], copy_script.ROWS_SQL)
 
     def test_make_db_connects_with_autocommit_through_the_lazy_driver(self) -> None:
         fake_driver = mock.MagicMock()
@@ -501,6 +507,7 @@ class CopyLiveObjectsTests(unittest.TestCase):
             "key outside workspaces": [db_row("live/objects/" + PLANTED_NAME, PAYLOAD_1)],
             "key with dot dot": [db_row(f"workspaces/{WORKSPACE}/../escape.pdf", PAYLOAD_1)],
             "one key, two contents": [db_row(KEY_1, PAYLOAD_1), db_row(KEY_1, PAYLOAD_2)],
+            "owner type the walk does not read": [db_row(KEY_1, PAYLOAD_1, owner_type="pricing_reference")],
             "more than 2000 objects": many,
             "more than 1 GiB": [
                 db_row(KEY_1, b"", size=big, checksum="c" * 64),
@@ -569,6 +576,189 @@ class CopyLiveObjectsTests(unittest.TestCase):
 
     def test_retry_policy_matches_the_webapp(self) -> None:
         self.assertEqual(dict(copy_script.S3_CLIENT_RETRIES), dict(object_storage.S3_CLIENT_RETRIES))
+
+
+POSTGRES_SERVICE_NAMES = ("SQAG_TEST_POSTGRES_HOST", "SQAG_TEST_POSTGRES_PORT", "SQAG_TEST_POSTGRES_USER")
+APP_WORKSPACE = "ws-copy-query-fixture"
+LISTED_A = "quote-" + "1" * 24
+LISTED_B = "quote-" + "2" * 24
+NOT_LISTED = "quote-" + "3" * 24
+RUN_CURRENT = "run-" + "4" * 24
+RUN_SUPERSEDED = "run-" + "5" * 24
+RUN_NOT_LISTED = "run-" + "6" * 24
+XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+APP_TIME = "2026-11-22T00:00:00Z"
+
+
+class AppRows:
+    """Writes rows the way the app does: object rows through DatabaseSqagStorage's own upsert
+    and soft delete, object keys and bytes from webapp.object_storage, and the quote's profile
+    summary from the app's own builder. stored maps each object key to its fake bucket entry."""
+
+    def __init__(self, storage: Any) -> None:
+        from webapp import server as webapp
+
+        self.webapp = webapp
+        self.storage = storage
+        self.backend = object_storage.InMemoryObjectStorageBackend()
+        self.stored: dict[str, tuple[bytes, str, dict[str, str]]] = {}
+
+    def sql(self, statement: str, params: tuple) -> None:
+        with self.storage.connection() as connection:
+            connection.execute(statement, params)
+            connection.commit()
+
+    def quote(self, session_id: str, profile_id: str, source: str) -> None:
+        profile = self.webapp.quote_session_profile_summary({}, {"quote_company_profile": {"id": profile_id, "source": source}})
+        metadata = {"session_id": session_id, "quote_company_profile": profile}
+        self.sql(
+            "insert into sqag_quote_sessions (workspace_id, session_id, metadata_json, draft_files_json, created_at, updated_at) "
+            "values (?, ?, ?, ?, ?, ?)",
+            (APP_WORKSPACE, session_id, json.dumps(metadata), "[]", APP_TIME, APP_TIME),
+        )
+
+    def version(self, session_id: str, run_id: str, state: str) -> None:
+        self.sql(
+            "insert into sqag_quote_publication_versions (workspace_id, session_id, run_id, job_id, state, "
+            "artifact_storage_mode, artifact_source, metadata_json, created_at, updated_at, retention_expires_at, "
+            "original_retention_expires_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (APP_WORKSPACE, session_id, run_id, "job-" + run_id[4:], state, "object", "version", "{}",
+             APP_TIME, APP_TIME, "2027-11-22T00:00:00Z", "2027-11-22T00:00:00Z"),
+        )
+
+    def file(self, owner_type: str, owner_id: str, kind: str, filename: str, content_type: str, *, deleted: bool = False) -> str:
+        content = f"{owner_type} {owner_id} {kind} synthetic bytes".encode("utf-8")
+        metadata = self.backend.store_artifact(
+            workspace_id=APP_WORKSPACE, owner_type=owner_type, owner_id=owner_id, artifact_kind=kind,
+            filename=filename, content_type=content_type, content=content,
+        )
+        with self.storage.connection() as connection:
+            self.storage._execute_upsert_object_file_artifact(
+                connection, owner_type, owner_id, kind, filename, content_type, metadata
+            )
+            if deleted:
+                row = connection.execute(
+                    "select artifact_id from sqag_object_artifacts "
+                    "where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+                    (APP_WORKSPACE, owner_type, owner_id, kind),
+                ).fetchone()
+                self.storage._execute_mark_object_artifact_deleted(connection, row["artifact_id"])
+            connection.commit()
+        self.stored[metadata.storage_key] = (content, content_type, {"sqag-checksum-sha256": metadata.checksum_sha256})
+        return metadata.storage_key
+
+    def seed(self) -> tuple[set[str], set[str]]:
+        """Two listed quotes and one that is not, with every kind of object row the app keeps.
+        Returns (keys a walk of the listed quotes reads, keys it does not)."""
+        self.quote(LISTED_A, "profile-a", "company")
+        self.quote(LISTED_B, "profile-b", "profile")
+        self.quote(NOT_LISTED, "profile-c", "company")
+        self.version(LISTED_A, RUN_CURRENT, "published")
+        self.version(LISTED_A, RUN_SUPERSEDED, "superseded")
+        self.version(NOT_LISTED, RUN_NOT_LISTED, "published")
+        walked = {
+            self.file("uploaded_reference", LISTED_A, "uploaded_reference_1", "booth.pdf", "application/pdf"),
+            self.file("uploaded_reference", LISTED_A, "uploaded_reference_2", "render.png", "image/png"),
+            self.file("uploaded_reference", LISTED_B, "uploaded_reference_1", "booth.png", "image/png"),
+            self.file("generated_quote", LISTED_A, "xlsx", "quotation.xlsx", XLSX_TYPE),
+            self.file("generated_quote_version", RUN_CURRENT, "xlsx", "quotation.xlsx", XLSX_TYPE),
+            self.file("generated_quote_version", RUN_CURRENT, "pdf", "quotation.pdf", "application/pdf"),
+            self.file("profile", "profile-a", "quotation_layout", "quotation-layout.xlsx", XLSX_TYPE),
+            self.file("profile", "profile-b", "quotation_layout", "quotation-layout.xlsx", XLSX_TYPE),
+        }
+        not_walked = {
+            self.file("uploaded_reference", LISTED_B, "uploaded_reference_2", "old.png", "image/png", deleted=True),
+            self.file("generated_quote_version", RUN_SUPERSEDED, "xlsx", "quotation.xlsx", XLSX_TYPE, deleted=True),
+            self.file("uploaded_reference", NOT_LISTED, "uploaded_reference_1", "other.png", "image/png"),
+            self.file("generated_quote_version", RUN_NOT_LISTED, "xlsx", "quotation.xlsx", XLSX_TYPE),
+            self.file("profile", "profile-c", "quotation_layout", "quotation-layout.xlsx", XLSX_TYPE),
+            self.file("pricing_reference", "pricing-a", "visual_1_1", "visual.png", "image/png"),
+        }
+        return walked, not_walked
+
+
+class CopyQueryOnAppRowsTests(unittest.TestCase):
+    """The copy's real query, run read-only on CI's disposable PostgreSQL 17 (the migrations live
+    has) against rows the app's own writer built. The app leaves session_id empty, so a query
+    that matches session_id finds nothing here (#390 run 2, hold 4)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not all(os.getenv(name, "").strip() for name in POSTGRES_SERVICE_NAMES):
+            if os.getenv("CI", "").strip().lower() == "true":
+                raise AssertionError("CI must provide the disposable PostgreSQL service for the copy query test")
+            raise unittest.SkipTest("the disposable PostgreSQL service is not configured here; CI runs this test")
+        import psycopg
+
+        from tests import disposable_database_mode as disposable
+        from webapp import server as webapp
+
+        cls.psycopg = psycopg
+        cls.database = disposable.DisposableDatabase(disposable.bootstrap_settings()).create()
+        try:
+            storage = webapp.DatabaseSqagStorage(
+                cls.database.runtime_url, APP_WORKSPACE, user_id="user-copy-fixture",
+                expected_session_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
+            )
+            cls.app = AppRows(storage)
+            cls.walked, cls.not_walked = cls.app.seed()
+        except BaseException:
+            cls.database.drop()
+            raise
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.database.drop()
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.targets = write_json(tmp.name, ids_doc([LISTED_A, LISTED_B]))
+        patcher = mock.patch.object(neon_branch_guard, "neon_client_from_env", fake_client_from_env(FakeNeon()))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def connect(self, _env: Mapping[str, str] | None = None) -> Any:
+        return self.psycopg.connect(self.database.runtime_url, autocommit=True)
+
+    def test_the_query_finds_exactly_the_files_a_walk_of_the_listed_quotes_reads(self) -> None:
+        with self.connect() as conn:
+            rows = copy_script.read_rows(conn, [LISTED_A, LISTED_B])
+        self.assertEqual({row[6] for row in rows}, self.walked)
+        self.assertEqual({row[0] for row in rows}, {APP_WORKSPACE})
+        self.assertEqual(
+            copy_script.owner_type_counts(rows),
+            {"uploaded_reference": 3, "generated_quote": 1, "generated_quote_version": 2, "profile": 2},
+        )
+        self.assertFalse(self.walked & self.not_walked)
+
+    def test_plan_then_copy_take_only_those_files_and_never_write_the_source(self) -> None:
+        source = FakeS3(self.app.stored)
+        dest = FakeS3()
+        for mode in ("plan", "copy"):
+            with self.subTest(mode), contextlib.redirect_stderr(io.StringIO()):
+                code, report = copy_script.run(
+                    argv_for(self.targets, mode), base_env(),
+                    db_factory=self.connect, source_factory=lambda _env: source, dest_factory=lambda _env: dest,
+                )
+                self.assertEqual((code, report["status"]), (0, "planned" if mode == "plan" else "copied"), report)
+                self.assertEqual(report["objects"], len(self.walked))
+                self.assertEqual(report["write_attempts_refused"], 0)
+        self.assertEqual(set(dest.put_keys), self.walked)
+        self.assertEqual(len(dest.put_keys), len(self.walked))
+        self.assertEqual(set(source.calls), {"head_object", "get_object"})
+        self.assertEqual(source.put_keys, [])
+
+    def test_the_copy_session_cannot_write_the_database(self) -> None:
+        with self.connect() as conn:
+            copy_script.read_rows(conn, [LISTED_A, LISTED_B])
+            for statement in (
+                "update sqag_object_artifacts set updated_at = updated_at",
+                "insert into sqag_quote_sessions (workspace_id, session_id, metadata_json, created_at, updated_at) "
+                "values ('ws-x', 'quote-x', '{}', 'x', 'x')",
+            ):
+                with self.subTest(statement), self.assertRaises(self.psycopg.errors.ReadOnlySqlTransaction):
+                    conn.execute(statement)
 
 
 if __name__ == "__main__":
