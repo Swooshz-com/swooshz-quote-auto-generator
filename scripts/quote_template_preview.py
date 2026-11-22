@@ -76,10 +76,10 @@ def sample_brief() -> dict:
 
 SAMPLE_ROWS = (
     # section, quantity, unit, description, unit price
-    ("Booth structure", 12, "sqm", "Sample booth wall panels with printed graphics", 120.0),
-    ("Booth structure", 1, "set", "Sample reception counter with storage", 840.0),
-    ("Flooring", 18, "sqm", "Sample carpet with underlay", 22.5),
-    ("Lighting", 6, "pc", "Sample LED spotlight", 45.0),
+    ("Sample structure", 12, "sqm", "Sample booth wall panels with printed graphics", 120.0),
+    ("Sample structure", 1, "set", "Sample reception counter with storage", 840.0),
+    ("Sample flooring", 18, "sqm", "Sample carpet with underlay", 22.5),
+    ("Sample lighting", 6, "pc", "Sample LED spotlight", 45.0),
 )
 
 

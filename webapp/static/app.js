@@ -19319,6 +19319,7 @@ function handleBeforeUnload(event) {
 }
 
 function wireEvents() {
+  quoteTemplatesSettings.bind();
   if (elements.topbarLogoutLink) {
     elements.topbarLogoutLink.addEventListener("click", async (event) => {
       event.preventDefault();
@@ -21841,6 +21842,5 @@ const quoteTemplatesSettings = new QuoteTemplatesSettings({
   permissions: () => state.permissions,
   onChoicesChanged: (choices) => QuoteTemplatesSettings.applyChoices(choices),
 });
-quoteTemplatesSettings.bind();
 
 boot();
