@@ -469,6 +469,10 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      would (the owner's email and `SWOOSHZ_SQAG_REHEARSAL_UAT_LOGIN_PASSWORD`)
      and runs the owner's UAT steps for this release on the copy. Every step
      must pass before the owner is asked; a failure goes back to the builder.
+     Expect every quote saved on live to reopen with Quote Basis locked
+     until Next in Customer is pressed: the copy's `SESSION_SECRET` differs
+     from live's (see the Pass A walk above). That alone is not a failure;
+     a lock that stays after Next in Customer is.
    - **Hand-off message**, from the acting thread to the owner:
 
      > The test app is ready for your UAT: https://quote-rehearsal-copy.<server-ip>.sslip.io.
