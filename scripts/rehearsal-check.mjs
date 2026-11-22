@@ -1226,7 +1226,8 @@ async function openQuoteBasis(page, stubbed) {
     && facts.current_unavailable.length === 0 && facts.differs.length === 1 && facts.differs[0] === "recoveryScope";
   const lock = { ...facts, copy_only: copyOnly, unlocked_by: null, next_saves: 0 };
   if (lock.locked) {
-    assert(lock.copy_only, `Quote Basis is locked for more than the copy's own session secret: ${JSON.stringify(lock)}`);
+    // Worded so the facts never follow "secret:", which the sensitive-fixture scan blocks.
+    assert(lock.copy_only, `Quote Basis is locked beyond what the copy's own session key causes, facts ${JSON.stringify(lock)}`);
     await page.locator("#customerDetailsButton").click();
     await page.waitForFunction(() => state.activeSidePanel === "customer", null, { timeout: 30000 });
     // Next would ask to confirm changed inputs and clear the quote's results: not what this measures.

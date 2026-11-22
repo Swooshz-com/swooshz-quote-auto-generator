@@ -467,7 +467,7 @@ async function runAllProfiles(t, storage) {
     assert.deepEqual(front.log.filter((line) => !/^(GET|HEAD) /.test(line)), ["POST /login"], "the failed probe sent a write to the server");
     const lockedStep = step(lockedA.parsed, "click budget on quote 1");
     assert.equal(lockedStep?.status, "fail", JSON.stringify(lockedStep));
-    assert.match(lockedStep.error, /locked for more than the copy's own session secret/);
+    assert.match(lockedStep.error, /locked beyond what the copy's own session key causes/);
     assert.match(lockedStep.error, /"differs":\["customer\.project\.show_name","recoveryScope"\]/);
     assert.match(lockedStep.error, /"copy_only":false/);
     assert.ok(!lockedStep.error.includes("Changed by the test"), "the failure holds the changed value");
