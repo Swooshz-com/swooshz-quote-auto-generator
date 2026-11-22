@@ -17,7 +17,8 @@ const ignored = new Proxy(function () {}, {
 });
 // A failed step rejects the run, which exits non-zero with the error.
 const finish = (value) => console.log(JSON.stringify(value));
-const ctx = { inputText, TextEncoder, console, finish, elements: new Proxy({}, { get: () => ignored }), document: ignored, window: {} };
+const ctx = { inputText, TextEncoder, console, finish, elements: new Proxy({}, { get: () => ignored }), document: ignored, window: {},
+  quoteTemplatesSettings: ignored };
 vm.createContext(ctx);
 vm.runInContext(constants + "\n" + funcs.join("\n"), ctx);
 const pageState = source.match(/^const state = (\{[^]*?^\});/m)[1];

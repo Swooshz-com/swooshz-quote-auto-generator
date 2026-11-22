@@ -20303,7 +20303,9 @@ eval(extractAsyncFunction("confirmQuoteDependencyChange"));
         self.assertNotIn(".active-workspace-summary", css)
         self.assertNotIn("renderWorkspaceStatus", js)
 
-        self.assertIn("Pricing Reference Settings", settings_panel)
+        # Owner-approved S4 mockup v3 (#167): the window holds two sections, so it is "Workspace / Settings".
+        self.assertIn('<span class="basis-chat-eyebrow">Workspace</span>', settings_panel)
+        self.assertIn('<h3 id="pricingReferenceModalTitle">Settings</h3>', settings_panel)
         self.assertNotIn("Workspace Settings", settings_panel)
         self.assertNotIn("settings-status-section", html)
         self.assertNotIn("settings-status-grid", html)
@@ -23088,6 +23090,8 @@ const statuses = [];
 function appIsBusy() { return false; }
 function renderPresetStatus(message = "") { statuses.push(message); }
 
+// The Quote template dropdown is drawn by its own component; this test covers the profile buttons.
+const quoteTemplatesSettings = { renderProfileField() {} };
 eval([
   "safeId",
   "neutralizeFormulaText",
@@ -30000,6 +30004,8 @@ function normalizePricingReferenceSettingsMode(value = "") {
 }
 function syncPricingReferenceSettingsMode() {}
 function pricingReferenceHasPendingChanges() { return true; }
+// No quote template is open in this test, so it never holds the page open.
+const quoteTemplatesSettings = { isDirty: () => false };
 function pricingReferenceOperationBusy() { return Boolean(state.pricingReferenceImportBusy || state.pricingReferenceSaveBusy); }
 
 eval([
