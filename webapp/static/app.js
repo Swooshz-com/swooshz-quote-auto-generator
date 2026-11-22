@@ -21045,7 +21045,6 @@ class QuoteTemplatesSettings {
       return;
     }
     const name = this.el("qtNameInput").value.trim() || "Preview";
-    const pdfWindow = format === "pdf" ? window.open("", "_blank") : null;
     this.previewBusy = true;
     this.el("qtPreviewExcel").disabled = true;
     this.el("qtPreviewPdf").disabled = true;
@@ -21059,22 +21058,15 @@ class QuoteTemplatesSettings {
       this.el("qtPreviewPdf").disabled = false;
     }
     if (!result.ok) {
-      if (pdfWindow) pdfWindow.close();
       this.flashNote(result.status === 503 && format === "pdf"
         ? "PDF preview is not available on this server right now. Use Preview Excel instead."
         : result.status === 429 ? "Too many previews in a minute. Wait a moment and try again." : "The preview could not be made. Try again.");
       return;
     }
-    const filename = `quote-template-preview.${format}`;
-    if (pdfWindow) {
-      const url = URL.createObjectURL(result.blob);
-      pdfWindow.location.href = url;
-      window.setTimeout(() => URL.revokeObjectURL(url), 60000);
-      this.flashNote("The sample PDF opened in a new tab.");
-    } else {
-      downloadBlobFile(filename, result.blob);
-      this.flashNote(format === "pdf" ? "The sample PDF was downloaded." : "The sample Excel file was downloaded.");
-    }
+    // Both files download: a PDF opened from page memory would inherit this page's content security
+    // policy, which stops the browser's PDF viewer from showing it.
+    downloadBlobFile(`quote-template-preview.${format}`, result.blob);
+    this.flashNote(format === "pdf" ? "The sample PDF was downloaded." : "The sample Excel file was downloaded.");
   }
 
   /* ---------- Page preview ---------- */

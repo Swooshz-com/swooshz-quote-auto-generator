@@ -6,7 +6,7 @@
 // QT_SCREENSHOT_DIR (default _tmp/quote-templates-shots) receives screenshots at 1440/1024/880/375 px.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { chromium } from "playwright";
 import { signIn } from "./internal-password-browser-test.mjs";
@@ -39,6 +39,7 @@ async function shot(page, name, target = null) {
 async function focusRing(page, selector) {
   await page.keyboard.press("Shift");
   await page.locator(selector).focus();
+  await page.waitForTimeout(300); // the Settings tabs fade their ring in (transition: all 0.2s)
   return page.locator(selector).evaluate((node) => {
     const style = getComputedStyle(node);
     return { style: style.outlineStyle, width: style.outlineWidth, color: style.outlineColor, offset: style.outlineOffset };
@@ -147,18 +148,20 @@ try {
 
   step("preview the PDF and the Excel file");
   const pdfResponse = page.waitForResponse((response) => response.url().endsWith("/api/settings/quote-templates/preview"));
-  const popup = context.waitForEvent("page", { timeout: 10000 }).catch(() => null);
+  const pdfDownload = page.waitForEvent("download", { timeout: 60000 }).catch(() => null);
   await page.locator("#qtPreviewPdf").click();
   const pdf = await pdfResponse;
   if (process.env.CI) assert.equal(pdf.status(), 200, "PDF preview needs LibreOffice in CI");
   if (pdf.status() === 200) {
-    assert.equal(pdf.headers()["content-type"], "application/pdf");
-    assert.ok((await pdf.body()).subarray(0, 5).toString() === "%PDF-");
+    const file = await pdfDownload;
+    assert.equal(file?.suggestedFilename(), "quote-template-preview.pdf");
+    const saved = path.join(SHOTS, "quote-template-preview.pdf");
+    await file.saveAs(saved);
+    assert.equal(readFileSync(saved).subarray(0, 5).toString("latin1"), "%PDF-");
   } else {
     assert.equal(pdf.status(), 503);
     await page.locator("#qtFooterNote").getByText("PDF preview is not available", { exact: false }).waitFor();
   }
-  (await popup)?.close();
   const download = page.waitForEvent("download");
   await page.locator("#qtPreviewExcel").click();
   assert.equal((await download).suggestedFilename(), "quote-template-preview.xlsx");
@@ -180,12 +183,14 @@ try {
     data: { operation: "create", id: "synthetic-template-profile", label: "Synthetic Template Profile", defaults: {} },
   });
   assert.equal(created.status(), 200);
+  const profileId = (await created.json()).profile.id; // database storage names new profiles itself
   await page.locator("#pricingReferenceCloseButton").click();
   await page.evaluate(async () => { await loadProfiles(); renderPresetOptions(); });
   await page.locator("#newQuoteButton").click();
-  await page.evaluate(() => setSidePanel("quote_company"));
+  // The step bar keeps Quote Company locked until images are uploaded; the profile card does not need them.
+  await page.evaluate(() => setSidePanel("quote_company", { force: true }));
   await page.locator("#quoteCompanyPanel").waitFor({ state: "visible" });
-  await page.locator("#presetSelect").selectOption("company:synthetic-template-profile");
+  await page.locator("#presetSelect").selectOption(`company:${profileId}`);
   await page.locator("#quoteTemplateField").scrollIntoViewIfNeeded();
   assert.equal(await page.locator("#quoteTemplateNote").innerText(), "Workspace default: Standard copy");
   const templateId = await page.locator("#quoteTemplateSelect option", { hasText: "Standard copy" }).getAttribute("value");
