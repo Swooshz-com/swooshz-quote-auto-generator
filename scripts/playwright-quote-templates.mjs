@@ -36,14 +36,28 @@ async function shot(page, name, target = null) {
   await page.setViewportSize({ width: 1440, height: 900 });
 }
 
+// The outline a keyboard user sees once the control has focus and its ring has finished fading in
+// (the Settings tabs and close X have `transition: all 0.2s`). Focus is set again on each try because
+// the opening window may still be placing its own focus; the ring is read only when this control has
+// keyboard focus and no transition is running, so a slow runner never reads a half-drawn ring.
 async function focusRing(page, selector) {
-  await page.keyboard.press("Shift");
-  await page.locator(selector).focus();
-  await page.waitForTimeout(300); // the Settings tabs fade their ring in (transition: all 0.2s)
-  return page.locator(selector).evaluate((node) => {
-    const style = getComputedStyle(node);
-    return { style: style.outlineStyle, width: style.outlineWidth, color: style.outlineColor, offset: style.outlineOffset };
-  });
+  const target = page.locator(selector);
+  let ring = null;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    await page.keyboard.press("Shift");
+    await target.focus();
+    await page.waitForTimeout(250);
+    ring = await target.evaluate((node) => {
+      const style = getComputedStyle(node);
+      return {
+        settled: document.activeElement === node && node.matches(":focus-visible") && node.getAnimations().length === 0,
+        ring: { style: style.outlineStyle, width: style.outlineWidth, color: style.outlineColor, offset: style.outlineOffset },
+      };
+    });
+    if (ring.settled) break;
+  }
+  assert.ok(ring.settled, `${selector} never held keyboard focus with its ring drawn`);
+  return ring.ring;
 }
 
 async function draftState(page) {
