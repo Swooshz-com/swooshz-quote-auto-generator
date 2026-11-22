@@ -198,6 +198,13 @@ function tableRowCounts() {
   return JSON.parse(probe.stdout.trim());
 }
 
+// Serves the harness's rows as a copy service would (its own session secret) or as itself.
+// Sent to the harness directly, not through the logging proxy.
+async function harnessSessionSecret(origin, copy) {
+  const response = await fetch(`${origin}/__harness/session-secret`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ copy }) });
+  assert.equal(response.status, 200, `harness session-secret switch failed: ${response.status}`);
+}
+
 async function startHarness(dirs, storage) {
   // The harness takes the repository root first, then its data folders.
   const child = spawn(python, [path.join(root, "tests", "internal_password_browser_harness.py"), root, dirs.data, dirs.output, dirs.tmp, dirs.logs, dirs.pricing, "--storage", storage], {
@@ -332,7 +339,11 @@ async function runAllProfiles(t, storage) {
     front.log.length = 0;
     const targetsFile = path.join(dirs.results, "targets.json");
     const countsBeforeA = storage === "database" ? tableRowCounts() : null;
+    // Pass A runs on the copy service, which has its own generated session secret over
+    // the same rows (#390 run 2, hold 5), so no saved Customer checkpoint matches there.
+    await harnessSessionSecret(harness.origin, true);
     const passA = await result("live-readonly", ["--manifest", manifestFile, "--targets-out", targetsFile, "--download-files", "--click-budget"], "pass-a");
+    await harnessSessionSecret(harness.origin, false);
     assert.deepEqual(front.log.filter((line) => !/^(GET|HEAD) /.test(line)), ["POST /login"], "Pass A sent a write to the server");
     assert.equal(step(passA.parsed, "no write attempted").status, "pass");
     assert.equal(passA.parsed.downloaded_files, true);
@@ -359,6 +370,15 @@ async function runAllProfiles(t, storage) {
     const probed = clickSteps[0].detail;
     assert.ok([seed.parsed.seed.published_session_id, seed.parsed.seed.excel_only_session_id].includes(probed.id));
     assert.ok(probed.samples.length >= 4 && probed.samples.every((sample) => sample.clicks === 1 && sample.indexed_db_puts === 0 && sample.rebuilt_rows === 0), JSON.stringify(probed.samples));
+    // On the copy Quote Basis opens locked: the probe records why (field names only) and
+    // presses Next in Customer as a user there would, its save answered in the browser.
+    for (const entry of clickSteps) {
+      assert.deepEqual(entry.detail.basis_lock, {
+        locked: true, customer_next: true, saved_checkpoint: true, differs: ["recoveryScope"], current_unavailable: [],
+        pricing_reference_change_pending: false, save_busy: false, copy_only: true, unlocked_by: "customer_next",
+      }, JSON.stringify(entry.detail.basis_lock));
+      assert.ok(entry.detail.stubbed_saves >= 1, "Next in Customer did not reach the probe's save stub");
+    }
     // Whatever the clicks saved was answered in the browser: the proxy check above saw only the sign-in.
     assert.ok(Number.isInteger(probed.stubbed_saves) && Number.isInteger(probed.stubbed_other), JSON.stringify(probed));
     const targets = JSON.parse(await fs.readFile(targetsFile, "utf8"));
