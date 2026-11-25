@@ -12,8 +12,8 @@ and checks it; nothing else may accept a definition without going through
 (`templates/quote-layout/quotation-layout.xlsx`) and is the final fallback.
 
 Profiles without a template keep using their own layout workbook exactly as
-today. Storage, permissions, the editor and choosing a template for a profile
-come in later slices.
+today. Admins build templates in Settings > Quote Templates, and the Company
+Profile "Quote template" dropdown picks one for a profile.
 
 `scripts/generate_quote.py` renders a quote with a template through
 `write_template_quote_xlsx`, or from the command line with

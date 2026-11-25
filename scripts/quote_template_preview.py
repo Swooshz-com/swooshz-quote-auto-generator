@@ -8,8 +8,8 @@ placeholder so the admin can see where the logo sits and how big it prints.
 Usage: quote_template_preview.py --quote-template <definition.json> --out <folder> --format xlsx|pdf
 
 Writes <folder>/quote-template-preview.xlsx, plus quote-template-preview.pdf for --format pdf.
-Exit codes: 0 written; 1 the definition was refused or rendering failed; 3 no PDF converter
-(LibreOffice or Excel) is available on this server.
+Exit codes: 0 written; 1 the definition was refused, or rendering or the PDF conversion failed;
+3 no PDF converter (LibreOffice or Excel) is available on this server.
 """
 from __future__ import annotations
 
@@ -115,9 +115,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if args.format == "pdf":
         pdf_path = args.out / f"{PREVIEW_STEM}.pdf"
-        if not quote.export_layout_pdf(xlsx_path, pdf_path) or not pdf_path.is_file():
+        exported = quote.export_layout_pdf(xlsx_path, pdf_path)
+        if not exported and not quote.libreoffice_candidates():
             print("No PDF converter is available.", file=sys.stderr)
             return PDF_UNAVAILABLE_EXIT
+        if not exported or not pdf_path.is_file():
+            print("The PDF converter failed.", file=sys.stderr)
+            return 1
     return 0
 
 

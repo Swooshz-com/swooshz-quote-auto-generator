@@ -20475,6 +20475,8 @@ function qtPlacements(t, keyOf) {
   return out;
 }
 
+const QT_DISCARD_NOTE = "Your unsaved changes will be lost.";
+
 class QuoteTemplatesSettings {
   constructor({ api, permissions, onChoicesChanged }) {
     this.api = api;
@@ -20488,7 +20490,7 @@ class QuoteTemplatesSettings {
     this.gridNote = "";
     this.tableNote = "";
     this.menuOpen = null;
-    this.deleteId = null;
+    this.deleteTarget = null;
     this.deleteBusy = false;
     this.zoom = "auto";
     this.zoomLock = null;
@@ -20499,6 +20501,8 @@ class QuoteTemplatesSettings {
     this.saveBusy = false;
     this.logoAspect = 18.1 / 47.8;
     this.profileSaveBusy = false;
+    this.profilePick = null;
+    this.profileKeyPick = false;
   }
 
   el(id) { return document.getElementById(id); }
@@ -20509,8 +20513,10 @@ class QuoteTemplatesSettings {
       button.addEventListener("keydown", (event) => this.sectionTabKey(event));
     });
     this.el("qtNewButton")?.addEventListener("click", () => this.openEditor("new", null));
-    this.el("qtBackButton")?.addEventListener("click", () => this.cancelEditor());
-    this.el("qtCancelButton")?.addEventListener("click", () => this.cancelEditor());
+    this.el("qtBackButton")?.addEventListener("click", () => { if (this.mayLeaveEditor()) this.closeEditor(); });
+    this.el("qtCancelButton")?.addEventListener("click", (event) => this.cancelEditor(event));
+    // Holding Enter repeats the click; only a new press may discard.
+    this.el("qtCancelButton")?.addEventListener("keydown", (event) => { if (event.repeat && event.key === "Enter") event.preventDefault(); });
     this.el("qtSaveButton")?.addEventListener("click", () => this.saveEditor());
     this.el("qtStatus")?.addEventListener("click", () => this.goToProblem());
     this.el("qtPreviewExcel")?.addEventListener("click", () => this.preview("xlsx"));
@@ -20524,7 +20530,18 @@ class QuoteTemplatesSettings {
     this.el("qtDeleteCancel")?.addEventListener("click", () => this.closeDelete());
     this.el("qtDeleteConfirm")?.addEventListener("click", () => this.confirmDelete());
     document.querySelectorAll("[data-qt-delete-close]").forEach((node) => node.addEventListener("click", () => this.closeDelete()));
-    this.el("quoteTemplateSelect")?.addEventListener("change", () => this.saveProfileChoice());
+    const profileField = this.el("quoteTemplateSelect");
+    profileField?.addEventListener("change", () => this.profileFieldChanged());
+    profileField?.addEventListener("keydown", (event) => this.profileFieldKey(event));
+    profileField?.addEventListener("keyup", () => { this.profileKeyPick = false; });
+    profileField?.addEventListener("mousedown", (event) => {
+      this.profileKeyPick = false;
+      if (this.profileSaveBusy) event.preventDefault();
+    });
+    profileField?.addEventListener("blur", () => {
+      // When the whole window loses focus the field is still the active element, so nothing is saved yet.
+      if (document.activeElement !== profileField) this.commitProfilePick();
+    });
     if (window.ResizeObserver && this.el("qtStage")) new ResizeObserver(() => this.applyZoom()).observe(this.el("qtStage"));
     document.addEventListener("click", (event) => {
       if (this.menuOpen && !event.target.closest(".qt-more")) this.closeRowMenu(false);
@@ -20550,11 +20567,12 @@ class QuoteTemplatesSettings {
     this.setSection("pricing", { focusTab: false });
   }
 
-  // Closing Settings with unsaved template changes asks first, like Cancel; closing again discards them.
+  // Closing Settings (X, outside the window, Escape) with unsaved template changes only asks: the changes
+  // are discarded by the "Discard changes" button alone. While a save runs, Settings stays open.
   beforeSettingsClose() {
-    if (this.editor && this.isDirty() && !this.editor.confirmDiscard) {
-      this.setSection("templates", { focusTab: false });
-      this.askDiscard();
+    if (!this.mayLeaveEditor()) {
+      const reachable = this.sectionActive() && document.activeElement !== document.body;
+      this.setSection("templates", { focusTab: !reachable });
       return false;
     }
     this.closeDeleteModal();
@@ -20642,10 +20660,29 @@ class QuoteTemplatesSettings {
   }
 
   flashNote(text) {
+    this.holdNote(text);
+    this.noteTimer = setTimeout(() => { this.noteTimer = null; this.renderStatus(); }, 4000);
+  }
+
+  // A note that stays until the next change, for text people may need to copy (a support code).
+  holdNote(text) {
     const note = this.el("qtFooterNote");
     if (note) note.textContent = text;
     if (this.noteTimer) clearTimeout(this.noteTimer);
-    this.noteTimer = setTimeout(() => { this.noteTimer = null; this.renderStatus(); }, 4000);
+    this.noteTimer = null;
+  }
+
+  // The code the server logged with the failure, in the words of the approved mockup.
+  supportCode(data) {
+    const reference = errorReferenceFrom(data);
+    return reference ? ` If it keeps happening, contact support with code ${reference}.` : "";
+  }
+
+  // Redrawing the list drops the focus; this puts it on a template's row, or on the nearest control left.
+  focusRow(id) {
+    const newButton = this.el("qtNewButton");
+    const target = (id && this.el(`qtMore-${id}`)) || (newButton && !newButton.disabled ? newButton : this.el("qtList")?.querySelector("button:not(:disabled)"));
+    target?.focus();
   }
 
   field(label, control, help) {
@@ -20722,7 +20759,10 @@ class QuoteTemplatesSettings {
 
   atLimit() { return this.list.savedCount >= this.list.limit; }
 
-  limitText() { return `You have ${this.list.limit} saved templates, the most a workspace can keep. Delete one to add or copy another.`; }
+  limitText() {
+    if (!this.list.limit) return "This workspace cannot keep saved templates.";
+    return `You have ${this.list.limit} saved templates, the most a workspace can keep. Delete one to add or copy another.`;
+  }
 
   nameTaken(name, exceptId) {
     const lower = name.toLowerCase();
@@ -20745,9 +20785,9 @@ class QuoteTemplatesSettings {
     if (request !== this.listRequest) return;
     if (!ok || !Array.isArray(data?.templates)) {
       this.list.status = "error";
-      this.list.errorText = status === 503
+      this.list.errorText = (status === 503
         ? "Saved templates are not available on this server yet."
-        : "Check your connection and try again.";
+        : "Check your connection and try again.") + this.supportCode(data);
       this.renderList();
       return;
     }
@@ -20755,7 +20795,7 @@ class QuoteTemplatesSettings {
       status: "ready",
       templates: data.templates,
       defaultId: data.default_template_id || "standard",
-      limit: Number(data.limit) || 10,
+      limit: Number.isInteger(data.limit) ? data.limit : 10,
       savedCount: Number(data.saved_count) || 0,
       errorText: "",
     };
@@ -20787,7 +20827,7 @@ class QuoteTemplatesSettings {
     this.el("qtListLoading").hidden = status !== "loading";
     this.el("qtListError").hidden = status !== "error";
     if (this.el("qtListErrorText")) this.el("qtListErrorText").textContent = this.list.errorText || "Check your connection and try again.";
-    this.el("qtEmpty").hidden = !(ready && this.list.savedCount === 0);
+    this.el("qtEmpty").hidden = !(ready && this.list.savedCount === 0 && !full);
     list.hidden = !ready;
     if (!ready) return;
     this.list.templates.forEach((template) => list.appendChild(this.templateRow(template)));
@@ -20832,7 +20872,7 @@ class QuoteTemplatesSettings {
   templateRow(template) {
     const isDefault = template.id === this.list.defaultId;
     const full = this.atLimit();
-    const limitTip = full ? `You have ${this.list.limit} saved templates. Delete one first.` : null;
+    const limitTip = !full ? null : this.list.limit ? `You have ${this.list.limit} saved templates. Delete one first.` : this.limitText();
     const menuId = `qtMenu-${template.id}`;
     const open = this.menuOpen === template.id;
     const main = template.builtin
@@ -20885,16 +20925,15 @@ class QuoteTemplatesSettings {
     const { ok, data } = await this.api.post(`${QT_API}/default`, { template_id: id });
     if (!ok) {
       this.setBanner(this.el("qtListStatus"), "Not changed.", this.failureText(data));
+      this.focusRow(id);
       return;
     }
     await this.loadList();
     this.setBanner(this.el("qtListStatus"), "Default changed.", `"${template.name}" is now the workspace default. Profiles set to Workspace default use it.`);
+    this.focusRow(id);
   }
 
-  failureText(data) {
-    const reference = data?.error_reference ? ` Reference: ${data.error_reference}.` : "";
-    return `Something went wrong. Try again.${reference}`;
-  }
+  failureText(data) { return `Something went wrong. Try again.${this.supportCode(data)}`; }
 
   /* ---------- Editor: open, save, cancel ---------- */
 
@@ -20907,7 +20946,7 @@ class QuoteTemplatesSettings {
     const name = mode === "new" ? "" : mode === "copy" ? `${source.name} copy`.slice(0, QT_RULES.nameMax) : source.name;
     this.editor = {
       mode, id: mode === "edit" ? source.id : null, saveNumber: mode === "edit" ? source.save_number : null,
-      draft, baseline: draft.snapshot(), baseName: name, confirmDiscard: false,
+      draft, baseline: draft.snapshot(), baseName: name, discardAskedFor: null, rowId: mode === "new" ? null : source.id,
     };
     this.el("qtEditorTitle").textContent = mode === "new" ? "New template" : (mode === "copy" ? `Copy of ${source.name}` : `Edit ${source.name}`);
     this.el("qtNameInput").value = name;
@@ -20915,6 +20954,7 @@ class QuoteTemplatesSettings {
     this.setNotice(this.el("qtListStatus"), "");
     this.el("qtSaveError").hidden = true;
     this.resetCancel();
+    this.holdNote("");
     this.selectedKey = null;
     this.selectedCol = null;
     this.gridNote = "";
@@ -20935,25 +20975,44 @@ class QuoteTemplatesSettings {
     const cancel = this.el("qtCancelButton");
     cancel.textContent = "Cancel";
     cancel.classList.remove("danger-button");
-    if (this.editor) this.editor.confirmDiscard = false;
+    if (this.editor) this.editor.discardAskedFor = null;
   }
 
+  editSnapshot() { return JSON.stringify([this.editor.draft.snapshot(), this.el("qtNameInput").value]); }
+
+  // "Discard changes" stands only for the changes it was asked about: any edit since then asks again.
+  discardAsked() { return Boolean(this.editor) && this.editor.discardAskedFor !== null && this.editor.discardAskedFor === this.editSnapshot(); }
+
+  // Never moves the focus onto "Discard changes", so a second press of the same key cannot discard.
   askDiscard() {
-    this.editor.confirmDiscard = true;
+    this.editor.discardAskedFor = this.editSnapshot();
     this.el("qtCancelButton").textContent = "Discard changes";
     this.el("qtCancelButton").classList.add("danger-button");
-    this.el("qtFooterNote").textContent = "Your unsaved changes will be lost.";
-    this.el("qtCancelButton").focus();
+    this.holdNote(QT_DISCARD_NOTE);
   }
 
-  // First Cancel with unsaved changes asks; a second click discards.
-  cancelEditor() {
+  // The one question every way out of the editor asks, except "Discard changes" itself.
+  mayLeaveEditor() {
+    if (!this.editor) return true;
+    if (this.saveBusy) return false;
+    if (!this.isDirty()) return true;
+    this.askDiscard();
+    return false;
+  }
+
+  // First Cancel with unsaved changes asks; a new click on "Discard changes" discards.
+  cancelEditor(event) {
     if (this.saveBusy) return;
-    if (this.isDirty() && !this.editor.confirmDiscard) { this.askDiscard(); return; }
-    this.closeEditor();
+    if (this.isDirty() && this.discardAsked()) {
+      if (event?.detail > 1) return; // the second half of the double click that asked
+      this.closeEditor();
+    } else if (this.mayLeaveEditor()) {
+      this.closeEditor();
+    }
   }
 
   closeEditor() {
+    const rowId = this.editor?.rowId;
     this.editor = null;
     this.selectedKey = null;
     this.selectedCol = null;
@@ -20962,6 +21021,7 @@ class QuoteTemplatesSettings {
     this.showView("list");
     this.renderList();
     this.scrollBodyTop();
+    this.focusRow(rowId);
   }
 
   nameProblem(name, exceptId) {
@@ -20975,6 +21035,8 @@ class QuoteTemplatesSettings {
 
   setSaveBusy(busy) {
     this.saveBusy = busy;
+    // Edits made while the save is on its way would not be in it, so the page takes none until it is back.
+    this.el("qtEditorView").inert = busy;
     const button = this.el("qtSaveButton");
     button.disabled = busy;
     button.textContent = "";
@@ -21003,7 +21065,8 @@ class QuoteTemplatesSettings {
       this.flashNote(`Fix the ${problems.length === 1 ? "item" : `${problems.length} items`} marked in red, then save.`);
       return;
     }
-    if (editor.mode !== "edit" && this.atLimit()) { this.closeEditor(); return; }
+    if (editor.mode !== "edit" && this.atLimit()) { this.showSaveError(this.limitText()); return; }
+    this.resetCancel();
     this.setSaveBusy(true);
     this.el("qtSaveError").hidden = true;
     const definition = editor.draft.toDefinition(name);
@@ -21013,25 +21076,32 @@ class QuoteTemplatesSettings {
     this.setSaveBusy(false);
     if (this.editor !== editor) return;
     if (!ok) {
-      this.el("qtSaveErrorText").textContent = this.saveFailureText(status, data);
-      this.el("qtSaveError").hidden = false;
-      this.flashNote("Not saved. Your changes are still here.");
-      this.scrollBodyTop();
-      this.el("qtSaveButton").focus();
+      this.showSaveError(this.saveFailureText(status, data));
+      // The list behind the editor is out of date, so "All templates" shows what is saved now.
+      if (status === 409 || status === 404) this.loadList();
       return;
     }
     this.closeEditor();
     await this.loadList();
     this.setBanner(this.el("qtListStatus"), "Saved.", `"${name}" is ready to pick in Company Profile.`);
+    this.focusRow(data?.template?.id);
+  }
+
+  showSaveError(text) {
+    this.el("qtSaveErrorText").textContent = text;
+    this.el("qtSaveError").hidden = false;
+    this.flashNote("Not saved. Your changes are still here.");
+    this.scrollBodyTop();
+    this.el("qtSaveButton").focus();
   }
 
   saveFailureText(status, data) {
     const reason = data?.reason || data?.failure_kind || "";
     if (status === 409 && reason === "template_limit_reached") return this.limitText();
     if (status === 409) return "Someone saved this template since you opened it. Go back to All templates and open it again.";
+    if (status === 404) return "Someone deleted this template since you opened it, so it cannot be saved. Go back to All templates.";
     if (status === 400) return "The layout was not accepted. Check the blocks and columns you changed, then try Save again.";
-    const reference = data?.error_reference ? ` Reference: ${data.error_reference}.` : "";
-    return `Something went wrong. Your changes are still here; try Save again.${reference}`;
+    return `Something went wrong. Your changes are still here; try Save again.${this.supportCode(data)}`;
   }
 
   /* ---------- Preview Excel and PDF ---------- */
@@ -21046,6 +21116,7 @@ class QuoteTemplatesSettings {
       return;
     }
     const name = this.el("qtNameInput").value.trim() || "Preview";
+    const pressed = document.activeElement;
     this.previewBusy = true;
     this.el("qtPreviewExcel").disabled = true;
     this.el("qtPreviewPdf").disabled = true;
@@ -21057,17 +21128,22 @@ class QuoteTemplatesSettings {
       this.previewBusy = false;
       this.el("qtPreviewExcel").disabled = false;
       this.el("qtPreviewPdf").disabled = false;
+      // A disabled button drops the focus; give it back unless it has moved on.
+      if (document.activeElement === document.body) pressed?.focus();
     }
     if (!result.ok) {
-      this.flashNote(result.status === 503 && format === "pdf"
-        ? "PDF preview is not available on this server right now. Use Preview Excel instead."
-        : result.status === 429 ? "Too many previews in a minute. Wait a moment and try again." : "The preview could not be made. Try again.");
+      if (this.editor !== editor) return;
+      const reference = errorReferenceFrom(result.data);
+      if (result.status === 503 && format === "pdf") this.flashNote("PDF preview is not available on this server right now. Use Preview Excel instead.");
+      else if (result.status === 429) this.flashNote("Too many previews in a minute. Wait a moment and try again.");
+      else if (reference) this.holdNote(`The preview could not be made. Try again, or contact support with code ${reference}.`);
+      else this.flashNote("The preview could not be made. Try again.");
       return;
     }
     // Both files download: a PDF opened from page memory would inherit this page's content security
     // policy, which stops the browser's PDF viewer from showing it.
     downloadBlobFile(`quote-template-preview.${format}`, result.blob);
-    this.flashNote(format === "pdf" ? "The sample PDF was downloaded." : "The sample Excel file was downloaded.");
+    if (this.editor === editor) this.flashNote(format === "pdf" ? "The sample PDF was downloaded." : "The sample Excel file was downloaded.");
   }
 
   /* ---------- Page preview ---------- */
@@ -21662,7 +21738,8 @@ class QuoteTemplatesSettings {
     status.textContent = problems.length ? (problems.length === 1 ? "1 thing to fix" : `${problems.length} things to fix`) : "Ready to save";
     status.setAttribute("aria-disabled", problems.length ? "false" : "true");
     status.title = problems.length ? "Show what to fix" : "";
-    if (!this.noteTimer && !this.editor.confirmDiscard) this.el("qtFooterNote").textContent = this.isDirty() ? "Unsaved changes" : "";
+    if (this.editor.discardAskedFor !== null && !this.discardAsked()) this.resetCancel();
+    if (!this.noteTimer) this.el("qtFooterNote").textContent = this.discardAsked() ? QT_DISCARD_NOTE : this.isDirty() ? "Unsaved changes" : "";
   }
 
   renderAll() {
@@ -21689,11 +21766,14 @@ class QuoteTemplatesSettings {
     const nextDefault = isDefault ? "Standard" : (this.template(this.list.defaultId)?.name || "Standard");
     const parts = [];
     if (template.usage > 0) {
-      parts.push(`${template.usage === 1 ? "1 company profile uses it. It" : `${template.usage} company profiles use it. They`} will switch to the workspace default (${nextDefault}) and say so on their next quote.`);
+      // Profiles set to Workspace default follow it without a note, and the default's count includes them.
+      const noted = isDefault ? "" : " and say so on their next quote";
+      parts.push(`${template.usage === 1 ? "1 company profile uses it. It" : `${template.usage} company profiles use it. They`} will switch to the workspace default (${nextDefault})${noted}.`);
     }
     if (isDefault) parts.push("It is the workspace default, so Standard becomes the default.");
     parts.push("Quotes already made keep their layout.");
-    this.deleteId = id;
+    // The delete names exactly what this dialog shows, even if the list is loaded again behind it.
+    this.deleteTarget = { id, name: template.name, saveNumber: template.save_number, isDefault };
     this.renderList();
     this.el("qtDeleteTitle").textContent = `Delete "${template.name}"?`;
     this.el("qtDeleteDetail").textContent = parts.join(" ");
@@ -21705,38 +21785,39 @@ class QuoteTemplatesSettings {
 
   closeDeleteModal() {
     if (this.el("qtDeleteModal")) this.el("qtDeleteModal").hidden = true;
-    this.deleteId = null;
+    this.deleteTarget = null;
   }
 
   closeDelete() {
     if (this.deleteBusy) return;
-    const id = this.deleteId;
+    const id = this.deleteTarget?.id;
     this.closeDeleteModal();
-    this.el(`qtMore-${id}`)?.focus();
+    this.focusRow(id);
   }
 
   async confirmDelete() {
-    const template = this.template(this.deleteId);
-    if (!template || this.deleteBusy) { this.closeDelete(); return; }
+    const target = this.deleteTarget;
+    if (!target || this.deleteBusy) { this.closeDelete(); return; }
     this.deleteBusy = true;
     this.el("qtDeleteConfirm").disabled = true;
     this.setNotice(this.el("qtDeleteError"), "");
-    const { ok, status, data } = await this.api.delete(`${QT_API}/${encodeURIComponent(template.id)}?save_number=${encodeURIComponent(template.save_number)}`);
+    const { ok, status, data } = await this.api.delete(`${QT_API}/${encodeURIComponent(target.id)}?save_number=${encodeURIComponent(target.saveNumber)}`);
     this.deleteBusy = false;
-    this.el("qtDeleteConfirm").disabled = false;
     if (!ok) {
+      // Changed or gone: this dialog no longer shows what would be deleted, so Delete stays off until it is opened again.
+      const outdated = status === 409 || status === 404;
+      this.el("qtDeleteConfirm").disabled = outdated;
       this.setNotice(this.el("qtDeleteError"), status === 409
         ? "Someone changed this template since the list loaded. Close this, check the list, then try again."
         : status === 404 ? "This template was already deleted. Close this to see the list." : this.failureText(data));
+      this.el(outdated ? "qtDeleteCancel" : "qtDeleteConfirm").focus();
       this.loadList();
       return;
     }
-    const wasDefault = this.list.defaultId === template.id;
     this.closeDeleteModal();
     await this.loadList();
-    this.setBanner(this.el("qtListStatus"), "Deleted.", `"${template.name}" is gone.${wasDefault ? " Standard is now the default." : ""}`);
-    const newButton = this.el("qtNewButton");
-    if (newButton && !newButton.disabled) newButton.focus(); else this.el("qtList")?.querySelector("button")?.focus();
+    this.setBanner(this.el("qtListStatus"), "Deleted.", `"${target.name}" is gone.${target.isDefault ? " Standard is now the default." : ""}`);
+    this.focusRow(null);
   }
 
   /* ---------- Company Profile "Quote template" dropdown ---------- */
@@ -21747,27 +21828,39 @@ class QuoteTemplatesSettings {
     return state.companyProfiles.find((profile) => safeProfileId(profile.id || profile.label, "") === preset.id) || null;
   }
 
+  profileTemplates() {
+    const templates = state.quoteTemplateChoices?.templates;
+    return Array.isArray(templates) ? templates : [];
+  }
+
+  // What the profile has now. One saved before templates existed keeps its own layout until a template is picked.
+  profileChoice(profile) {
+    const stored = profile && typeof profile.quote_template_id === "string" ? profile.quote_template_id : "";
+    if (!stored) return "own";
+    return stored === "default" || this.profileTemplates().some((template) => template.id === stored) ? stored : "default";
+  }
+
   renderProfileField({ preset, canManageProfiles, busy }) {
     const select = this.el("quoteTemplateSelect");
     const note = this.el("quoteTemplateNote");
     if (!select || !note) return;
     const choices = state.quoteTemplateChoices;
-    const templates = Array.isArray(choices?.templates) ? choices.templates : [];
+    const templates = this.profileTemplates();
     const profile = this.selectedCompanyProfile(preset);
-    const stored = profile && typeof profile.quote_template_id === "string" ? profile.quote_template_id : "";
-    const known = stored === "default" || templates.some((template) => template.id === stored);
-    // A profile saved before templates existed keeps its own layout until a template is picked.
-    const value = !stored ? "own" : (known ? stored : "default");
+    const value = this.profileChoice(profile);
+    if (this.profilePick?.profileId !== profile?.id) this.profilePick = null;
     select.textContent = "";
     if (value === "own") select.appendChild(qtNode("option", { value: "own", text: "Profile's own layout" }));
     select.appendChild(qtNode("option", { value: "default", text: "Workspace default" }));
     if (templates.length) {
       select.appendChild(qtNode("optgroup", { label: "Templates" }, templates.map((template) => qtNode("option", { value: template.id, text: `${template.name}${template.builtin ? " (built in)" : ""}` }))));
     }
-    select.value = value;
+    if (this.profilePick) select.value = this.profilePick.choice;
+    if (!this.profilePick || select.value !== this.profilePick.choice) { this.profilePick = null; select.value = value; }
     const editable = Boolean(choices?.available && profile && canManageProfiles && profile.permissions?.canUpdate !== false && Number.isInteger(profile.revision ?? profile._revision));
-    select.disabled = !editable || busy || this.profileSaveBusy;
-    select.setAttribute("aria-disabled", String(select.disabled));
+    // While its own choice is being saved the field keeps the focus and takes no input (see profileFieldKey).
+    select.disabled = !editable || busy;
+    select.setAttribute("aria-disabled", String(select.disabled || this.profileSaveBusy));
     const defaultName = templates.find((template) => template.id === choices?.default_template_id)?.name || "Standard";
     if (this.profileSaveBusy) note.textContent = "Saving…";
     else if (choices && !choices.available) note.textContent = "Quote templates are not available on this server.";
@@ -21775,20 +21868,48 @@ class QuoteTemplatesSettings {
     else note.textContent = `Workspace default: ${defaultName}`;
   }
 
-  async saveProfileChoice() {
-    const select = this.el("quoteTemplateSelect");
+  // Arrow keys and letters on the closed list step through the options one by one; none of those is a choice
+  // yet. Enter or leaving the field takes the option shown, Escape goes back to the saved one. A click, and a
+  // pick in the opened list, is a choice and saves at once.
+  profileFieldKey(event) {
+    if (["Tab", "Shift", "Control", "Alt", "Meta"].includes(event.key)) return;
+    if (this.profileSaveBusy) { event.preventDefault(); return; }
+    const opensList = event.key === " " || event.key === "F4" || (event.altKey && ["ArrowDown", "ArrowUp"].includes(event.key));
+    this.profileKeyPick = !opensList && event.key !== "Enter";
+    if (event.key === "Enter" && this.profilePick) {
+      event.preventDefault();
+      this.commitProfilePick();
+    } else if (event.key === "Escape" && this.profilePick) {
+      this.profilePick = null;
+      updatePresetButtons();
+    }
+  }
+
+  profileFieldChanged() {
+    const profile = this.selectedCompanyProfile(selectedPreset());
+    if (!profile || this.profileSaveBusy) { updatePresetButtons(); return; }
+    const choice = this.el("quoteTemplateSelect").value;
+    this.profilePick = choice === this.profileChoice(profile) ? null : { profileId: profile.id, choice };
+    if (!this.profileKeyPick) this.commitProfilePick();
+  }
+
+  commitProfilePick() {
+    if (this.profilePick && !this.profileSaveBusy) this.saveProfileChoice(this.profilePick.choice);
+  }
+
+  async saveProfileChoice(choice) {
     const preset = selectedPreset();
     const profile = this.selectedCompanyProfile(preset);
-    if (!select || !profile || select.value === "own" || this.profileSaveBusy) return;
-    const choice = select.value;
+    if (!profile || profile.id !== this.profilePick?.profileId || choice === "own") return;
     const templateName = choice === "default" ? "the workspace default"
-      : (state.quoteTemplateChoices?.templates || []).find((template) => template.id === choice)?.name || "the chosen template";
+      : this.profileTemplates().find((template) => template.id === choice)?.name || "the chosen template";
     this.profileSaveBusy = true;
     updatePresetButtons();
     const { ok, status, data } = await this.api.post("/api/settings/profiles", {
       operation: "template", id: profile.id, quote_template_id: choice, revision: profile.revision ?? profile._revision ?? 0,
     });
     this.profileSaveBusy = false;
+    this.profilePick = null;
     if (ok && isPlainObject(data?.profile)) {
       profile.quote_template_id = data.profile.quote_template_id;
       if (Number.isInteger(data.profile.revision)) profile.revision = data.profile.revision;

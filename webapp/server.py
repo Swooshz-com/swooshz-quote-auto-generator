@@ -673,6 +673,7 @@ ALLOWED_LOG_EVENTS = {
     "quote_session_projection_failed",
     "quote_session_update_failed",
     "quote_session_runtime_storage_blocked",
+    "quote_template_preview_failed",
     "security_event",
     "server_pricing_reference_import_timing",
     "server_error",
@@ -1603,6 +1604,8 @@ def log_meaning(event: str, details: dict[str, Any], context: str) -> str:
         meaning = "Quote generation stopped for pricing review. Check details.errors for unmatched or ambiguous catalog pricing that needs operator confirmation."
     elif event in {"profile_export_failed", "profile_export_not_found"}:
         meaning = "Profile export failed. Match the browser-visible error reference to this log entry."
+    elif event == "quote_template_preview_failed":
+        meaning = "The quote template preview could not be made. Match the browser-visible error reference to this log entry; details.exit_code is the preview process exit code when it ran to the end."
     elif event == "draft_blocked":
         meaning = "AI draft analysis was blocked before provider calls, usually because images or required quote details were missing."
     elif event in {
@@ -18696,18 +18699,24 @@ class QuoteTemplateStore:
         Until 013 reaches a database the app keeps working: quotes use the Standard template
         or the profile's own layout. Remove this tolerance once 013 is applied everywhere.
         """
+        return self._connected(self._table_present)
+
+    def _connected(self, operation: Callable[[Any], Any]) -> Any:
         try:
             with self.storage.connection() as connection:
-                if self.storage.database_family == "postgres_compatible":
-                    rows = self.storage._postgres_schema_columns(connection, {QUOTE_TEMPLATE_TABLE})
-                else:
-                    rows = self.storage._sqlite_schema_columns(connection, {QUOTE_TEMPLATE_TABLE})
+                return operation(connection)
         except SqagStorageAccessError:
             raise
         except Exception as exc:
             raise SqagStorageAccessError(
                 "Quote templates are unavailable right now.", status=503, reason="quote_templates_unavailable",
             ) from exc
+
+    def _table_present(self, connection: Any) -> bool:
+        if self.storage.database_family == "postgres_compatible":
+            rows = self.storage._postgres_schema_columns(connection, {QUOTE_TEMPLATE_TABLE})
+        else:
+            rows = self.storage._sqlite_schema_columns(connection, {QUOTE_TEMPLATE_TABLE})
         present = {clean_text(row["column_name"]) for row in rows}
         if not present:
             return False
@@ -18776,6 +18785,23 @@ class QuoteTemplateStore:
 
     def default(self) -> dict[str, Any] | None:
         return next((record for record in self.list() if record["is_default"]), None)
+
+    def names(self) -> list[dict[str, Any]] | None:
+        """Id, name and default mark of each saved template, without the layouts; None before migration 013.
+
+        Read on one connection, because the profile list asks for it on every page load.
+        """
+        def read(connection: Any) -> list[dict[str, Any]] | None:
+            if not self._table_present(connection):
+                return None
+            rows = connection.execute(
+                "select template_id, name, is_default from sqag_quote_templates "
+                "where workspace_id = ? order by created_at, template_id",
+                (self.workspace_id,),
+            ).fetchall()
+            return [{"id": row["template_id"], "name": row["name"], "is_default": bool(row["is_default"])} for row in rows]
+
+        return self._connected(read)
 
     def usage(self, default_id: str) -> dict[str, int]:
         """How many company profiles in the workspace each template lays out (counts only, no names).
@@ -18975,16 +19001,16 @@ def quote_template_choices(storage: Any) -> dict[str, Any]:
         "templates": [{"id": standard["id"], "name": standard["name"], "builtin": True}],
     }
     store = quote_template_store_for_storage(storage)
-    if store is None or not store.ready():
+    saved = store.names() if store is not None else None
+    if saved is None:
         return unavailable
-    saved = store.list()
     default_id = next((record["id"] for record in saved if record["is_default"]), STANDARD_QUOTE_TEMPLATE_ID)
     return {
         "available": True,
         "default_template_id": default_id,
         "templates": [
-            {"id": record["id"], "name": record["name"], "builtin": record.get("builtin", False)}
-            for record in [standard, *saved]
+            *unavailable["templates"],
+            *({"id": record["id"], "name": record["name"], "builtin": False} for record in saved),
         ],
     }
 
@@ -19000,6 +19026,14 @@ QUOTE_TEMPLATE_PREVIEW_TYPES = {
 
 class QuoteTemplatePreviewUnavailable(Exception):
     """No PDF converter on this server; the admin can still preview the Excel file."""
+
+
+class QuoteTemplatePreviewFailed(Exception):
+    """The preview process ended without a usable file."""
+
+    def __init__(self, exit_code: int) -> None:
+        super().__init__(f"quote template preview exited with code {exit_code}")
+        self.exit_code = exit_code
 
 
 def render_quote_template_preview(definition: dict[str, Any], preview_format: str) -> bytes:
@@ -19025,7 +19059,7 @@ def render_quote_template_preview(definition: dict[str, Any], preview_format: st
             raise QuoteTemplatePreviewUnavailable()
         output = work / "out" / f"quote-template-preview.{preview_format}"
         if completed.returncode != 0 or not output.is_file():
-            raise RuntimeError(f"quote template preview exited with code {completed.returncode}")
+            raise QuoteTemplatePreviewFailed(completed.returncode)
         return output.read_bytes()
 
 
@@ -36557,6 +36591,15 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self.send_json({"status": "blocked", "errors": safe_error_messages([str(exc)])}, status=400)
             return True
+        except ConnectionError:
+            raise  # the browser went away; there is nobody to answer
+        except Exception as exc:
+            error_reference = new_error_reference()
+            write_local_log("server_error", unexpected_error_log_details(
+                error_reference, exc, reason="quote_template_request_failed", status=500,
+            ))
+            self.send_json(failed_result_payload(error_reference), status=500)
+            return True
         self.send_json({"error": "Not found"}, status=404)
         return True
 
@@ -37513,7 +37556,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
 
     def send_quote_template_preview(self, definition: dict[str, Any], preview_format: Any) -> None:
         """Send the sample quote in a draft template's layout as a file download (Excel or PDF)."""
-        if preview_format not in QUOTE_TEMPLATE_PREVIEW_TYPES:
+        if not isinstance(preview_format, str) or preview_format not in QUOTE_TEMPLATE_PREVIEW_TYPES:
             raise ValueError("Preview format must be xlsx or pdf.")
         try:
             body = render_quote_template_preview(definition, preview_format)
@@ -37525,7 +37568,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             error_reference = new_error_reference()
             write_local_log("quote_template_preview_failed", unexpected_error_log_details(
-                error_reference, exc, preview_format=preview_format,
+                error_reference, exc, preview_format=preview_format, exit_code=getattr(exc, "exit_code", None),
             ))
             self.send_json(failed_result_payload(error_reference), status=500)
             return

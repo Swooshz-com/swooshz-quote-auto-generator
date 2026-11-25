@@ -154,9 +154,10 @@ def main():
         os.environ.update({"QUOTE_DATA_ROOT":argv[2], "QUOTE_OUTPUT_ROOT":argv[3], "QUOTE_TMP_ROOT":argv[4], "QUOTE_LOG_ROOT":argv[5], "SQAG_LOCAL_PRICING_REFERENCES_ROOT":argv[6]})
     # SYNTHETIC_WORKSPACE_SETUP
     database = None
-    if storage == "database":
-        # A stop signal unwinds through the finally blocks so the database is dropped.
+    if storage != "file":
+        # A stop signal unwinds through the finally blocks so the database is dropped or its file removed.
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    if storage == "database":
         database = configure_database_storage(settings)
     sqlite_path = configure_sqlite_storage() if storage == "sqlite" else None
     try:

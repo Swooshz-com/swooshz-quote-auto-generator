@@ -3,6 +3,9 @@ import copy
 import json
 import os
 from pathlib import Path
+import shutil
+import sys
+import tempfile
 import unittest
 import io
 import zipfile
@@ -12,6 +15,10 @@ from scripts import quote_template
 from tests import test_internal_password_auth_webapp as auth_http
 from tests import test_quote_template_permissions as permissions_test
 from webapp import server as s
+
+# The password-login host stubs the log writer and empties the environment; these are the real ones.
+WRITE_LOCAL_LOG = s.write_local_log
+WINDOWS_PROCESS_ENV = {name: os.environ[name] for name in ("SystemRoot", "ComSpec", "PATHEXT") if name in os.environ}
 
 
 def definition(name):
@@ -46,6 +53,60 @@ class QuoteTemplateEditorEndpointsTest(permissions_test.QuoteTemplatePermissions
     def raw(self, headers, method, route, body=None):
         return self.host.http(method, route, headers, json.dumps(body) if body is not None else None)
 
+    def temp_dir(self):
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        return Path(folder)
+
+    def own_log_root(self):
+        """Server logs of this test only, so a returned reference can be looked up in them."""
+        root = self.temp_dir()
+        for patcher in (mock.patch.object(s, "configured_log_root", return_value=root),
+                        mock.patch.object(s, "write_local_log", WRITE_LOCAL_LOG)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return root
+
+    def own_tmp_root(self):
+        root = self.temp_dir()
+        patcher = mock.patch.object(s, "configured_tmp_root", return_value=root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return root
+
+    def logged(self, root, reference):
+        """The one server log entry that holds the reference the browser was given."""
+        self.assertRegex(reference, r"^ERR-[0-9A-F]{8}$")
+        records = [json.loads(line) for path in root.rglob("*.jsonl")
+                   for line in path.read_text(encoding="utf-8").splitlines()]
+        matches = [record for record in records if record["details"].get("error_reference") == reference]
+        self.assertEqual(len(matches), 1, f"{reference} is not in the server log")
+        return matches[0]
+
+    def converter(self, body):
+        """A folder to use as the whole PATH, holding a `soffice` that runs `body`; None for no converter at all.
+
+        The preview child finds its PDF converter on PATH, so the real child process and the real conversion
+        code run; only LibreOffice itself is replaced.
+        """
+        if os.name == "nt":
+            installed = [path for path in (r"C:\Program Files\LibreOffice\program\soffice.exe",
+                                           r"C:\Program Files (x86)\LibreOffice\program\soffice.exe") if Path(path).exists()]
+            if installed:
+                self.skipTest("This Windows machine has LibreOffice at a fixed path; CI (Linux) runs this test.")
+        folder = self.temp_dir()
+        if body is not None:
+            script = folder / "fake_converter.py"
+            script.write_text("import pathlib, sys\nout = pathlib.Path(sys.argv[sys.argv.index('--outdir') + 1])\n"
+                              "pdf = out / (pathlib.Path(sys.argv[-1]).stem + '.pdf')\n" + body + "\n", encoding="utf-8")
+            if os.name == "nt":
+                (folder / "soffice.cmd").write_text(f'@"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
+            else:
+                launcher = folder / "soffice"
+                launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n', encoding="utf-8")
+                launcher.chmod(0o755)
+        return mock.patch.dict(os.environ, {**WINDOWS_PROCESS_ENV, "PATH": str(folder)})
+
     def test_preview_sends_the_sample_quote_as_a_download(self):
         admin = self.login(auth_http.email())
         draft = definition("Draft")
@@ -74,8 +135,8 @@ class QuoteTemplateEditorEndpointsTest(permissions_test.QuoteTemplatePermissions
         self.assertEqual(status, 500)
         self.assertRegex(body.get("error_reference", ""), r"^ERR-[0-9A-F]{8}$")
         self.assertNotIn("synthetic crash", json.dumps(body))
-        reset_rate_limits()  # the checks below would pass the 6-a-minute preview limit
-        for bad in ("docx", "", 7, None):
+        for bad in ("docx", "", 7, None, [], ["xlsx"], {"xlsx": 1}):
+            reset_rate_limits()  # more checks than the 6-a-minute preview limit allows
             with self.subTest(format=bad), mock.patch.object(s, "render_quote_template_preview") as render:
                 status, body = self.call(admin, "POST", route, {"definition": definition("Draft"), "format": bad})
                 self.assertEqual(status, 400, body)
@@ -87,6 +148,93 @@ class QuoteTemplateEditorEndpointsTest(permissions_test.QuoteTemplatePermissions
             status, body = self.call(admin, "POST", route, {"definition": broken, "format": "xlsx"})
         self.assertEqual(status, 400, body)
         render.assert_not_called()
+
+    def test_preview_pdf_comes_from_the_real_child_and_its_failures_are_logged(self):
+        admin = self.login(auth_http.email())
+        log_root, tmp_root = self.own_log_root(), self.own_tmp_root()
+        route = "/api/settings/quote-templates/preview"
+        request = {"definition": definition("Draft"), "format": "pdf"}
+
+        with self.converter(None):
+            status, body = self.call(admin, "POST", route, request)
+        self.assertEqual((status, body["errors"]),
+                         (503, ["PDF preview is not available on this server right now. Use Preview Excel instead."]))
+
+        with self.converter("pdf.write_bytes(b'%PDF-1.4 synthetic converter')"):
+            status, headers, raw = self.raw(admin, "POST", route, request)
+        self.assertEqual((status, raw), (200, b"%PDF-1.4 synthetic converter"))
+        self.assertEqual(headers.get("Content-Type"), "application/pdf")
+
+        failures = (
+            # (case, what the converter does)
+            ("converter fails", "raise SystemExit(1)"),
+            ("converter fails after writing half a file", "pdf.write_bytes(b'%PDF-1.4 half'); raise SystemExit(1)"),
+            ("converter says it worked but wrote nothing", "pass"),
+        )
+        for case, converter in failures:
+            with self.subTest(case=case):
+                with self.converter(converter):
+                    status, body = self.call(admin, "POST", route, request)
+                self.assertEqual(status, 500, body)
+                record = self.logged(log_root, body["error_reference"])
+                self.assertEqual(record["event"], "quote_template_preview_failed")
+                self.assertEqual(record["details"]["preview_format"], "pdf")
+                self.assertEqual(record["details"]["exit_code"], 1)
+        self.assertEqual(list(tmp_root.iterdir()), [], "preview folders are removed")
+
+    def test_preview_child_that_is_too_slow_or_crashes_is_refused_and_logged(self):
+        admin = self.login(auth_http.email())
+        log_root, tmp_root = self.own_log_root(), self.own_tmp_root()
+        route = "/api/settings/quote-templates/preview"
+        request = {"definition": definition("Draft"), "format": "xlsx"}
+
+        # The real child, with less time than a Python process needs to start.
+        with mock.patch.object(s, "QUOTE_TEMPLATE_PREVIEW_TIMEOUT_SECONDS", 0.01):
+            status, body = self.call(admin, "POST", route, request)
+        self.assertEqual(status, 500, body)
+        self.assertEqual(self.logged(log_root, body["error_reference"])["details"]["error_type"], "TimeoutExpired")
+
+        # A child that leaves a file behind and then crashes: the file is never sent.
+        crashing = self.temp_dir() / "crashing_preview.py"
+        crashing.write_text(
+            "import pathlib, sys\nout = pathlib.Path(sys.argv[sys.argv.index('--out') + 1])\nout.mkdir(parents=True)\n"
+            "(out / 'quote-template-preview.xlsx').write_bytes(b'PK half a workbook')\n"
+            "raise RuntimeError('synthetic secret detail')\n", encoding="utf-8")
+        with mock.patch.object(s, "QUOTE_TEMPLATE_PREVIEW_PATH", crashing):
+            status, body = self.call(admin, "POST", route, request)
+        self.assertEqual(status, 500, body)
+        record = self.logged(log_root, body["error_reference"])
+        self.assertEqual((record["details"]["exit_code"], record["details"]["preview_format"]), (1, "xlsx"))
+        self.assertNotIn("synthetic secret detail", json.dumps([record, body]))
+        self.assertEqual(list(tmp_root.iterdir()), [], "preview folders are removed")
+
+    def test_any_unexpected_failure_answers_with_a_reference_the_server_logged(self):
+        admin = self.login(auth_http.email())
+        saved = self.call(admin, "POST", "/api/settings/quote-templates", {"definition": definition("Saved")})[1]["template"]
+        log_root = self.own_log_root()
+        base = "/api/settings/quote-templates"
+        # (store method that breaks, method, route, body)
+        table = (
+            ("list", "GET", base, None),
+            ("get", "GET", f"{base}/{saved['id']}", None),
+            ("create", "POST", base, {"definition": definition("New")}),
+            ("update", "POST", f"{base}/{saved['id']}", {"definition": definition("New"), "save_number": 1}),
+            ("set_default", "POST", f"{base}/default", {"template_id": saved["id"]}),
+            ("delete", "DELETE", f"{base}/{saved['id']}?save_number=1", None),
+        )
+        for store_method, method, route, body in table:
+            with self.subTest(route=f"{method} {route}"):
+                with mock.patch.object(s.QuoteTemplateStore, store_method, side_effect=RuntimeError("synthetic crash /tmp/x")):
+                    status, answer = self.call(admin, method, route, body)
+                self.assertEqual(status, 500, answer)
+                record = self.logged(log_root, answer["error_reference"])
+                self.assertEqual(record["details"]["reason"], "quote_template_request_failed")
+                self.assertNotIn("synthetic crash", json.dumps([record, answer]))
+        # A database fault while the profile list reads the template names: 503, logged, never a guessed list.
+        with mock.patch.object(s.QuoteTemplateStore, "_table_present", side_effect=RuntimeError("synthetic crash")):
+            status, answer = self.call(admin, "GET", "/api/profiles")
+        self.assertEqual(status, 503, answer)
+        self.assertEqual(self.logged(log_root, answer["error_reference"])["details"]["reason"], "quote_templates_unavailable")
 
     def test_preview_is_rate_limited_per_client_before_rendering(self):
         admin = self.login(auth_http.email())
@@ -145,6 +293,40 @@ class QuoteTemplateEditorEndpointsTest(permissions_test.QuoteTemplatePermissions
         self.assertEqual([(item["name"], item["builtin"]) for item in choices["templates"]],
                          [("Standard", True), ("Blue", False)])
         self.assertNotIn("definition", json.dumps(choices))
+        # The page loads this list every time, so the names take one connection and no layouts are read.
+        storage = s.DatabaseSqagStorage(self.url, self.workspace, "admin", "inspection")
+        opened, original = [], s.DatabaseSqagStorage.connection
+
+        def counted(inner, *args, **kwargs):
+            opened.append(1)
+            return original(inner, *args, **kwargs)
+
+        with mock.patch.object(s.DatabaseSqagStorage, "connection", counted), \
+                mock.patch.object(s.QuoteTemplateStore, "_record", side_effect=AssertionError("a layout was read")):
+            self.assertEqual(s.quote_template_choices(storage), choices)
+        self.assertEqual(len(opened), 1)
+
+    def test_profile_list_works_before_migration_013(self):
+        """The live database has no template table yet: the page must load, with the dropdown locked."""
+        admin, operator = self.login(auth_http.email()), self.login(auth_http.email("operator"))
+        status, body = self.call(operator, "POST", "/api/settings/profiles", {
+            "operation": "create", "id": "synthetic-own", "label": "Synthetic own", "defaults": {}})
+        self.assertEqual(status, 200, body)
+        storage = s.DatabaseSqagStorage(self.url, self.workspace, "admin", "inspection")
+        with storage.connection() as connection:
+            connection.execute("drop table sqag_quote_templates")
+            connection.commit()
+        for who in (admin, operator):
+            status, listed = self.call(who, "GET", "/api/profiles")
+            self.assertEqual(status, 200, listed)
+            self.assertEqual(listed["quote_templates"], {"available": False, "default_template_id": "standard",
+                                                         "templates": [{"id": "standard", "name": "Standard", "builtin": True}]})
+        self.assertEqual([item["label"] for item in listed["company_profiles"]], ["Synthetic own"])
+        # Settings says the same, with a reference the server logged.
+        log_root = self.own_log_root()
+        status, answer = self.call(admin, "GET", "/api/settings/quote-templates")
+        self.assertEqual(status, 503, answer)
+        self.assertEqual(self.logged(log_root, answer["error_reference"])["details"]["reason"], "quote_templates_not_migrated")
 
     def test_template_operation_changes_only_the_template(self):
         admin, operator = self.login(auth_http.email()), self.login(auth_http.email("operator"))
