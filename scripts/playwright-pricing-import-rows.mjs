@@ -20,6 +20,8 @@ try {
   await run.start(scenario);
   const page = await run.signedInPage();
   await page.locator("#settingsButton").click();
+  // Settings opens on Manage and loads the selected reference first.
+  await page.waitForFunction(() => state.editingPricingReferenceId && state.pendingPricingReference && !pricingReferenceOperationBusy(), null, { timeout: 30000 });
   await page.locator("#pricingReferenceImportTab").click();
   await page.locator("#pricingReferenceFile").setInputFiles({ name: "synthetic-catalogue.csv", mimeType: "text/csv", buffer: Buffer.from(csv) });
   await page.locator("#pricingReferencePreview .pricing-reference-attention").waitFor({ state: "visible", timeout: 60000 });
