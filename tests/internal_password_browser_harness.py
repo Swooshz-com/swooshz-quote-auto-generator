@@ -35,7 +35,7 @@ def configure_auth_env():
             os.environ.pop(key, None)
     os.environ.update({
         "SQAG_DISABLE_DOTENV":"1", "APP_MODE":"local", "AUTH_REQUIRED":"true", "SQAG_AUTH_MODE":"internal_password",
-        "SESSION_SECRET":"synthetic-browser-session-secret-with-enough-entropy",
+        "SESSION_SECRET":HARNESS_SESSION_SECRET,
         "SQAG_TRACKING_HMAC_KEY":"synthetic-browser-tracking-key", "SQAG_TRACKING_HMAC_KEY_VERSION":"synthetic-v1",
         "SQAG_TRUSTED_PROXY_CIDRS":"127.0.0.1/32", "SQAG_PLATFORM_LAUNCH_MODE":"disabled",
         "SQAG_PUBLIC_BASE_URL":"https://internal-alpha.example.test", "SQAG_INTERNAL_WORKSPACE_ID":"workspace-internal-alpha",
@@ -60,17 +60,42 @@ class HarnessClock:
 
 
 HARNESS_CLOCK_ROUTE = "/__harness/clock"
+HARNESS_SESSION_SECRET_ROUTE = "/__harness/session-secret"
+# A copy of live runs as its own service with its own generated SESSION_SECRET
+# (deploy/rehearsal/resources.json), over the same quote rows.
+HARNESS_SESSION_SECRET = "synthetic-browser-session-secret-with-enough-entropy"
+HARNESS_COPY_SESSION_SECRET = "synthetic-copy-service-session-secret-with-enough-entropy"
 
 
 class HarnessHandler(webapp.QuoteRunnerHandler):
     def do_POST(self):
-        # Exists only on this loopback harness when main() installs a clock;
-        # nothing in webapp/ knows about it.
+        # Exist only on this loopback harness when main() installs a clock;
+        # nothing in webapp/ knows about them.
         clock = getattr(self.server, "harness_clock", None)
-        if urlparse(self.path).path == HARNESS_CLOCK_ROUTE and isinstance(clock, HarnessClock):
+        route = urlparse(self.path).path
+        if route == HARNESS_CLOCK_ROUTE and isinstance(clock, HarnessClock):
             self.handle_harness_clock(clock)
             return
+        if route == HARNESS_SESSION_SECRET_ROUTE and isinstance(clock, HarnessClock):
+            self.handle_harness_session_secret(clock)
+            return
         super().do_POST()
+
+    def handle_harness_session_secret(self, clock):
+        """Serve the same data as a copy service would ({"copy": true}) or as itself again."""
+        if self.client_address[0] != "127.0.0.1":
+            self.send_json({"error": "Not found"}, status=404)
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        body = json.loads(self.rfile.read(length) or b"{}") if 0 < length <= 1024 else {}
+        if not isinstance(body.get("copy"), bool):
+            self.send_json({"error": "copy must be true or false"}, status=400)
+            return
+        os.environ["SESSION_SECRET"] = HARNESS_COPY_SESSION_SECRET if body["copy"] else HARNESS_SESSION_SECRET
+        # A different service: no sign-in carries over, and its sign-in policy is built from its own secret.
+        self.server.internal_auth = webapp.InternalAuthState(clock=clock)
+        self.server.internal_policy = webapp.internal_auth_policy()
+        self.send_json({"status": "ok", "copy": body["copy"]})
 
     def handle_harness_clock(self, clock):
         if self.client_address[0] != "127.0.0.1":

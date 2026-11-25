@@ -440,7 +440,20 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      box, and fails if anything tried to write. `--click-budget` then runs
      the Quote Basis click probe (the CI click-budget job's) on the two
      largest manifest quotes, in a separate browser that answers every save
-     itself and counts it, so nothing reaches the copy. Its exact counts
+     itself and counts it, so nothing reaches the copy. The copy runs with
+     its own generated `SESSION_SECRET`, so the browser recovery scope saved
+     in every quote's Customer checkpoint differs there and Quote Basis opens
+     locked ("Click Next in Customer..."), as it would for a user of the
+     copy. The probe then does what that user does: it presses Next in
+     Customer (that save is answered in the probe browser too) and records
+     the lock in the step's `basis_lock`: which checkpoint fields differed
+     (names only; `copy_only` is true when only `recoveryScope` did) and how
+     it was unlocked, with `next_saves`, the saves the Next press alone
+     made. Any other lock fails the probe with those facts, without pressing
+     Next: another checkpoint field that also differs, a missing checkpoint,
+     a pending pricing-reference change, a lock Next does not clear, or a
+     Next that would ask to confirm changed inputs. Such a lock would show on
+     live too, so that failure goes to the controller as a hold. Its exact counts
      (browser storage writes, IndexedDB puts, renders, rebuilt rows, bytes
      copied, saves per burst) fail the walk; its timings are recorded only,
      because the laptop's speed varies. Pass A passes only if all three
@@ -459,13 +472,20 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      would (the owner's email and `SWOOSHZ_SQAG_REHEARSAL_UAT_LOGIN_PASSWORD`)
      and runs the owner's UAT steps for this release on the copy. Every step
      must pass before the owner is asked; a failure goes back to the builder.
+     Expect every quote saved on live to reopen with Quote Basis locked
+     until Next in Customer is pressed: the copy's `SESSION_SECRET` differs
+     from live's (see the Pass A walk above). Only that lock is expected,
+     the one Pass A records as `copy_only`; a quote Pass A failed with any
+     other lock, or a lock that stays after Next in Customer, is a failure.
    - **Hand-off message**, from the acting thread to the owner:
 
      > The test app is ready for your UAT: https://quote-rehearsal-copy.<server-ip>.sslip.io.
      > Sign in with your own email and the password in the credential store
      > under SWOOSHZ_SQAG_REHEARSAL_UAT_LOGIN_PASSWORD (not your live
      > password). It runs candidate <short> on a copy of live data taken at
-     > <recorded time>; what you change there stays on the copy. The agent's
+     > <recorded time>; what you change there stays on the copy. On this copy
+     > only, a quote you reopen keeps Quote Basis locked until you press Next
+     > in Customer; live does not do this. The agent's
      > UAT passed: <evidence link>. UAT steps: <the release's UAT list>. It
      > stays up until <hand-off time + 24 hours> unless you extend it. Reply
      > "UAT pass <short>" to deploy it to live, or tell me what failed.

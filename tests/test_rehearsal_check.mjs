@@ -8,7 +8,8 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
-import { checkBaseUrl, parseArgs, PRICING_SAVE_TIMEOUT_MS, readOnlyRequestContext, ReadOnlyViolation, scrub, UsageError } from "../scripts/rehearsal-check.mjs";
+import { checkBaseUrl, parseArgs, PRICING_SAVE_TIMEOUT_MS, readOnlyRequestContext, ReadOnlyViolation, scrub, showAllSessions, UsageError } from "../scripts/rehearsal-check.mjs";
+import { signIn } from "../scripts/internal-password-browser-test.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const python = process.env.PYTHON || process.env.PYTHON_EXECUTABLE || (process.platform === "win32" ? "python" : "python3");
@@ -198,6 +199,45 @@ function tableRowCounts() {
   return JSON.parse(probe.stdout.trim());
 }
 
+// Serves the harness's rows as a copy service would (its own session secret) or as itself.
+// Sent to the harness directly, not through the logging proxy.
+async function harnessSessionSecret(origin, copy) {
+  const response = await fetch(`${origin}/__harness/session-secret`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ copy }) });
+  assert.equal(response.status, 200, `harness session-secret switch failed: ${response.status}`);
+}
+
+// A staff edit of the quote's show name in Customer, autosaved but without pressing Next,
+// so its saved Customer checkpoint no longer matches its inputs (as in
+// scripts/playwright-older-quote-reopen.mjs step 4).
+async function changeShowNameWithoutNext(origin, sessionId) {
+  const { chromium } = await import("playwright");
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await signIn(page, origin);
+    // The quote may be past the dashboard's first page (two seeds in database mode).
+    await showAllSessions(page);
+    const card = page.locator(`#dashboardSessionsList [data-quote-session-id="${sessionId}"]`);
+    await card.waitFor({ state: "visible", timeout: 30000 });
+    await card.click();
+    await page.locator('#dashboardSelectedSessionPanel [data-dashboard-panel-action="modify-session"]').click();
+    await page.locator("#panel-analysis.is-active").waitFor({ state: "visible", timeout: 30000 });
+    await page.waitForFunction(() => !state.isBooting && !state.quoteSessionRestoreBusy && !appIsBusy(), null, { timeout: 30000 });
+    await page.locator('button[data-side-panel="customer"]').click();
+    await page.locator("#customerDetailsPanel").waitFor({ state: "visible" });
+    const value = "Changed by the test";
+    const saved = page.waitForResponse((item) => {
+      if (new URL(item.url()).pathname !== "/api/quote-sessions" || item.request().method() !== "POST" || item.status() !== 200) return false;
+      try { return item.request().postDataJSON()?.draft_state?.quoteDetails?.project?.show_name === value; } catch { return false; }
+    }, { timeout: 30000 });
+    await page.locator("#showName").fill(value);
+    await saved;
+    await page.waitForFunction(() => !appIsBusy(), null, { timeout: 30000 });
+  } finally {
+    await browser.close();
+  }
+}
+
 async function startHarness(dirs, storage) {
   // The harness takes the repository root first, then its data folders.
   const child = spawn(python, [path.join(root, "tests", "internal_password_browser_harness.py"), root, dirs.data, dirs.output, dirs.tmp, dirs.logs, dirs.pricing, "--storage", storage], {
@@ -332,7 +372,11 @@ async function runAllProfiles(t, storage) {
     front.log.length = 0;
     const targetsFile = path.join(dirs.results, "targets.json");
     const countsBeforeA = storage === "database" ? tableRowCounts() : null;
+    // Pass A runs on the copy service, which has its own generated session secret over
+    // the same rows (#390 run 2, hold 5), so no saved Customer checkpoint matches there.
+    await harnessSessionSecret(harness.origin, true);
     const passA = await result("live-readonly", ["--manifest", manifestFile, "--targets-out", targetsFile, "--download-files", "--click-budget"], "pass-a");
+    await harnessSessionSecret(harness.origin, false);
     assert.deepEqual(front.log.filter((line) => !/^(GET|HEAD) /.test(line)), ["POST /login"], "Pass A sent a write to the server");
     assert.equal(step(passA.parsed, "no write attempted").status, "pass");
     assert.equal(passA.parsed.downloaded_files, true);
@@ -359,6 +403,17 @@ async function runAllProfiles(t, storage) {
     const probed = clickSteps[0].detail;
     assert.ok([seed.parsed.seed.published_session_id, seed.parsed.seed.excel_only_session_id].includes(probed.id));
     assert.ok(probed.samples.length >= 4 && probed.samples.every((sample) => sample.clicks === 1 && sample.indexed_db_puts === 0 && sample.rebuilt_rows === 0), JSON.stringify(probed.samples));
+    // On the copy Quote Basis opens locked: the probe records why (field names only) and
+    // presses Next in Customer as a user there would, its save answered in the browser.
+    for (const entry of clickSteps) {
+      const { next_saves: nextSaves, ...lock } = entry.detail.basis_lock;
+      assert.deepEqual(lock, {
+        locked: true, customer_next: true, saved_checkpoint: true, differs: ["recoveryScope"], current_unavailable: [],
+        pricing_reference_change_pending: false, save_busy: false, copy_only: true, unlocked_by: "customer_next",
+      }, JSON.stringify(entry.detail.basis_lock));
+      // Counted around the Next press alone, so the measured clicks' saves are not in it.
+      assert.ok(Number.isInteger(nextSaves) && nextSaves >= 1, `Next in Customer did not reach the probe's save stub: ${nextSaves}`);
+    }
     // Whatever the clicks saved was answered in the browser: the proxy check above saw only the sign-in.
     assert.ok(Number.isInteger(probed.stubbed_saves) && Number.isInteger(probed.stubbed_other), JSON.stringify(probed));
     const targets = JSON.parse(await fs.readFile(targetsFile, "utf8"));
@@ -394,6 +449,28 @@ async function runAllProfiles(t, storage) {
     const fonts = step(verify.parsed, "new quote: check XLSX, PDF and fonts").detail.pdf_fonts;
     assert.ok(fonts.length > 0);
     await result("reopen", ["--seed-file", seed.file]);
+    // A quote whose Customer step was changed after its last Next (show name, saved without Next)
+    // locks on live too. On the copy that lock is more than the copy's own secret, so the click
+    // probe must fail with its facts, not press Next through it. Runs last: it changes the quote.
+    const changed = seed.parsed.seed.excel_only_session_id;
+    await changeShowNameWithoutNext(front.origin, changed);
+    await fs.writeFile(manifestFile, JSON.stringify({
+      ...committed,
+      approval: { approved: true, approved_at: "2026-11-20", record: "0000000" },
+      newest_own_quotes: 0,
+      cases: [{ id: changed, reasons: ["generated"] }],
+    }));
+    front.log.length = 0;
+    await harnessSessionSecret(harness.origin, true);
+    const lockedA = await result("live-readonly", ["--manifest", manifestFile, "--download-files", "--click-budget"], "pass-a-changed-customer", { code: 1 });
+    await harnessSessionSecret(harness.origin, false);
+    assert.deepEqual(front.log.filter((line) => !/^(GET|HEAD) /.test(line)), ["POST /login"], "the failed probe sent a write to the server");
+    const lockedStep = step(lockedA.parsed, "click budget on quote 1");
+    assert.equal(lockedStep?.status, "fail", JSON.stringify(lockedStep));
+    assert.match(lockedStep.error, /locked beyond what the copy's own session key causes/);
+    assert.match(lockedStep.error, /"differs":\["customer\.project\.show_name","recoveryScope"\]/);
+    assert.match(lockedStep.error, /"copy_only":false/);
+    assert.ok(!lockedStep.error.includes("Changed by the test"), "the failure holds the changed value");
     const exit = await harness.stop();
     stopped = true;
     assert.equal(exit.code, storage === "database" ? 0 : null, `harness did not stop cleanly: ${harness.stderr()}`);
