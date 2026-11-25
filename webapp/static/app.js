@@ -21850,7 +21850,8 @@ class QuoteTemplatesSettings {
     const value = this.profileChoice(profile);
     if (this.profilePick?.profileId !== profile?.id) this.profilePick = null;
     select.textContent = "";
-    if (value === "own") select.appendChild(qtNode("option", { value: "own", text: "Profile's own layout" }));
+    // A profile with a layout of its own can always go back to it.
+    if (value === "own" || profile?.own_layout === true) select.appendChild(qtNode("option", { value: "own", text: "Profile's own layout" }));
     select.appendChild(qtNode("option", { value: "default", text: "Workspace default" }));
     if (templates.length) {
       select.appendChild(qtNode("optgroup", { label: "Templates" }, templates.map((template) => qtNode("option", { value: template.id, text: `${template.name}${template.builtin ? " (built in)" : ""}` }))));
@@ -21858,7 +21859,7 @@ class QuoteTemplatesSettings {
     if (this.profilePick) select.value = this.profilePick.choice;
     if (!this.profilePick || select.value !== this.profilePick.choice) { this.profilePick = null; select.value = value; }
     const editable = Boolean(choices?.available && profile && canManageProfiles && profile.permissions?.canUpdate !== false && Number.isInteger(profile.revision ?? profile._revision));
-    // While its own choice is being saved the field keeps the focus and takes no input (see profileFieldKey).
+    // While its own choice is being saved the field keeps the focus and takes no other (see profileFieldChanged).
     select.disabled = !editable || busy;
     select.setAttribute("aria-disabled", String(select.disabled || this.profileSaveBusy));
     const defaultName = templates.find((template) => template.id === choices?.default_template_id)?.name || "Standard";
@@ -21873,7 +21874,6 @@ class QuoteTemplatesSettings {
   // pick in the opened list, is a choice and saves at once.
   profileFieldKey(event) {
     if (["Tab", "Shift", "Control", "Alt", "Meta"].includes(event.key)) return;
-    if (this.profileSaveBusy) { event.preventDefault(); return; }
     const opensList = event.key === " " || event.key === "F4" || (event.altKey && ["ArrowDown", "ArrowUp"].includes(event.key));
     this.profileKeyPick = !opensList && event.key !== "Enter";
     if (event.key === "Enter" && this.profilePick) {
@@ -21900,8 +21900,8 @@ class QuoteTemplatesSettings {
   async saveProfileChoice(choice) {
     const preset = selectedPreset();
     const profile = this.selectedCompanyProfile(preset);
-    if (!profile || profile.id !== this.profilePick?.profileId || choice === "own") return;
-    const templateName = choice === "default" ? "the workspace default"
+    if (!profile || profile.id !== this.profilePick?.profileId) return;
+    const templateName = choice === "own" ? "its own layout" : choice === "default" ? "the workspace default"
       : this.profileTemplates().find((template) => template.id === choice)?.name || "the chosen template";
     this.profileSaveBusy = true;
     updatePresetButtons();
@@ -21912,6 +21912,7 @@ class QuoteTemplatesSettings {
     this.profilePick = null;
     if (ok && isPlainObject(data?.profile)) {
       profile.quote_template_id = data.profile.quote_template_id;
+      profile.own_layout = data.profile.own_layout;
       if (Number.isInteger(data.profile.revision)) profile.revision = data.profile.revision;
       renderPresetStatus(`"${profile.label || preset.name}" will use ${templateName} for new quotes.`);
     } else {

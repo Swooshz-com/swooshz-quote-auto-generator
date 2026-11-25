@@ -13,7 +13,10 @@ and checks it; nothing else may accept a definition without going through
 
 Profiles without a template keep using their own layout workbook exactly as
 today. Admins build templates in Settings > Quote Templates, and the Company
-Profile "Quote template" dropdown picks one for a profile.
+Profile "Quote template" dropdown picks one for a profile. A profile with a
+layout workbook of its own can be switched back to it from the same dropdown;
+its new quotes are then laid out exactly as before any template was picked. A
+profile created without a workbook has no layout of its own to go back to.
 
 `scripts/generate_quote.py` renders a quote with a template through
 `write_template_quote_xlsx`, or from the command line with

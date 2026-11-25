@@ -9690,7 +9690,7 @@ def profile_payload_from_export(payload: dict[str, Any]) -> dict[str, Any]:
 
 def normalize_profile_payload(payload: dict[str, Any]) -> dict[str, Any]:
     profile_payload = profile_payload_from_export(payload)
-    if any(key in profile_payload or key in payload for key in ("_access", "_revision", "permissions")):
+    if any(key in profile_payload or key in payload for key in ("_access", "_revision", "_own_layout", "permissions")):
         raise ValueError("Profile access fields cannot be imported or submitted.")
     profile_id = safe_resource_id(profile_payload.get("id") or profile_payload.get("label"), "")
     if not profile_id:
@@ -11049,6 +11049,8 @@ def public_database_profile_summary(profile: dict[str, Any]) -> dict[str, Any]:
         summary["permissions"] = copy.deepcopy(profile["permissions"])
     if "quote_template_id" in profile:
         summary["quote_template_id"] = profile["quote_template_id"]
+    if "own_layout" in profile:
+        summary["own_layout"] = profile["own_layout"]
     if "revision" in profile or "_revision" in profile:
         summary["revision"] = profile.get("revision", profile.get("_revision", 0))
     if defaults:
@@ -13245,8 +13247,10 @@ class DatabaseSqagStorage:
         result = copy.deepcopy(profile)
         result["permissions"] = self.profile_policy.capabilities(profile)
         result["revision"] = profile.get("_revision", 0)
+        result["own_layout"] = profile_has_own_layout(profile)
         result.pop("_access", None)
         result.pop("_revision", None)
+        result.pop("_own_layout", None)
         return result
 
     def _profile_change_row(self, connection, profile_id, *, lock=True):
@@ -13285,15 +13289,28 @@ class DatabaseSqagStorage:
         return self._run_storage_transaction(change)
 
     def change_profile_quote_template(self, profile_id, choice, *, revision):
-        """Set only the profile's quote template; who may change the profile is the same as for a save."""
+        """Set only the profile's quote template; who may change the profile is the same as for a save.
+
+        OWN_LAYOUT_CHOICE takes the template off again: the profile is stored as it was before any template
+        was picked, so its next quotes use its own layout workbook.
+        """
         if type(revision) is not int:
             raise SqagStorageAccessError("Profile revision is required.", status=409, reason="profile_revision_required")
-        if not quote_template_choice_valid(choice):
+        if choice != OWN_LAYOUT_CHOICE and not quote_template_choice_valid(choice):
             raise ValueError("Quote template choice is invalid.")
         def change(connection):
             existing = self._profile_change_row(connection, profile_id)
             self._authorize_profile_change(existing, revision=revision)
-            existing["quote_template_id"] = choice
+            own_layout = profile_has_own_layout(existing)
+            if choice == OWN_LAYOUT_CHOICE:
+                if not own_layout or not self._profile_layout_artifact_exists(profile_id, connection=connection):
+                    raise ValueError("This profile has no layout of its own.")
+                existing.pop("quote_template_id", None)
+                existing.pop("_own_layout", None)
+            else:
+                existing["quote_template_id"] = choice
+                if own_layout:
+                    existing["_own_layout"] = True
             existing["_revision"] = existing.get("_revision", 0) + 1
             self._execute_upsert_payload(connection, "sqag_profiles", "profile_id", profile_id, existing)
             return self._public_access_profile(existing)
@@ -13334,7 +13351,7 @@ class DatabaseSqagStorage:
             raise ValueError("Invalid profile operation.")
         if operation == "update" and type(revision) is not int:
             raise ValueError("Profile revision is required.")
-        if any(key in profile for key in ("_access", "_revision", "permissions")):
+        if any(key in profile for key in ("_access", "_revision", "_own_layout", "permissions")):
             raise ValueError("Profile access fields cannot be submitted.")
         if operation == "create":
             profile = copy.deepcopy(profile)
@@ -13361,6 +13378,12 @@ class DatabaseSqagStorage:
                     # New profiles follow the workspace default template; imports carrying
                     # their own layout workbook keep that workbook.
                     stored["quote_template_id"] = DEFAULT_QUOTE_TEMPLATE_CHOICE
+            stored.pop("_own_layout", None)
+            if "quote_template_id" in stored and (
+                profile_payload_has_layout_artifact(profile)
+                or (existing is not None and profile_has_own_layout(existing))
+            ):
+                stored["_own_layout"] = True
 
         artifact_mode = configured_artifact_storage_mode()
         materialize_default_layout = configured_storage_mode() == "database"
@@ -18618,11 +18641,15 @@ def database_profile_storage_for_auth_session(auth_session: dict[str, Any] | Non
 # before templates existed), "default" follows the workspace default, "standard" is the built-in
 # Standard template, and a saved template id uses that template. Quotes already made keep their
 # stored files; each new quote records the template name, save number and fingerprint.
+# Every stored profile has a layout workbook, but for a profile created without one it is only a copy
+# of the bundled default. `_own_layout` marks a profile that has a template now and a workbook of its
+# own (it used that workbook before, or one was uploaded), so it can be switched back.
 QUOTE_TEMPLATE_LIMIT_ENV_NAME = "SQAG_QUOTE_TEMPLATE_LIMIT"
 QUOTE_TEMPLATE_DEFAULT_LIMIT = 10
 QUOTE_TEMPLATE_MAX_LIMIT = 100
 STANDARD_QUOTE_TEMPLATE_ID = "standard"
 DEFAULT_QUOTE_TEMPLATE_CHOICE = "default"
+OWN_LAYOUT_CHOICE = "own"
 QUOTE_TEMPLATE_ID_RE = re.compile(r"tpl-[0-9a-f]{32}")
 QUOTE_TEMPLATE_DELETED_NOTE = "The template chosen for this profile was deleted, so the default template was used."
 QUOTE_TEMPLATE_TABLE = "sqag_quote_templates"
@@ -18641,6 +18668,10 @@ def configured_quote_template_limit() -> int:
             "The quote template limit setting is invalid.", status=503, reason="quote_template_limit_invalid",
         )
     return int(raw)
+
+
+def profile_has_own_layout(profile: dict[str, Any]) -> bool:
+    return "quote_template_id" not in profile or profile.get("_own_layout") is True
 
 
 def quote_template_choice_valid(value: Any) -> bool:
@@ -35760,7 +35791,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                     profile = {"id": safe_resource_id(payload.get("id"), ""), "quote_template_id": payload.get("quote_template_id")}
                     if not profile["id"]:
                         raise ValueError("Profile id is required and may only contain letters, numbers, dashes, or underscores.")
-                    if not quote_template_choice_valid(profile["quote_template_id"]):
+                    if profile["quote_template_id"] != OWN_LAYOUT_CHOICE and not quote_template_choice_valid(profile["quote_template_id"]):
                         raise ValueError("Quote template choice is invalid.")
                 else:
                     profile = normalize_profile_payload(payload)
@@ -35781,7 +35812,8 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 elif operation == "template":
                     if not isinstance(storage, DatabaseSqagStorage):
                         raise ValueError("Quote templates need database storage.")
-                    check_profile_quote_template_choice(profile, storage)
+                    if profile["quote_template_id"] != OWN_LAYOUT_CHOICE:
+                        check_profile_quote_template_choice(profile, storage)
                     saved = storage.change_profile_quote_template(profile["id"], profile["quote_template_id"], revision=revision)
                 else:
                     check_profile_quote_template_choice(profile, storage)

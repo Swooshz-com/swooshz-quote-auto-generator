@@ -367,6 +367,101 @@ class QuoteTemplateEditorEndpointsTest(permissions_test.QuoteTemplatePermissions
             "operation": "template", "id": "", "quote_template_id": "standard", "revision": 0})[0], 400)
 
 
+    def test_a_profile_can_be_switched_back_to_its_own_layout(self):
+        admin, operator = self.login(auth_http.email()), self.login(auth_http.email("operator"))
+        blue = self.call(admin, "POST", "/api/settings/quote-templates", {"definition": definition("Blue")})[1]["template"]
+        profiles = "/api/settings/profiles"
+        inspection = s.DatabaseSqagStorage(self.url, self.workspace, "admin", "inspection")
+
+        def stored(profile_id):
+            return inspection._read_payload("sqag_profiles", "profile_id", profile_id)
+
+        def listed(headers, profile_id):
+            body = self.call(headers, "GET", "/api/profiles")[1]
+            return next((item for item in body["company_profiles"] if item["id"] == profile_id), None)
+
+        def create(headers, label, *, legacy):
+            status, body = self.call(headers, "POST", profiles, {"operation": "create", "id": "x", "label": label, "defaults": {}})
+            self.assertEqual(status, 200, body)
+            if legacy:  # as every profile saved before templates existed
+                payload = stored(body["profile"]["id"])
+                del payload["quote_template_id"]
+                inspection._upsert_payload("sqag_profiles", "profile_id", payload["id"], payload)
+            return body["profile"]
+
+        def choose(headers, profile_id, choice, revision):
+            reset_rate_limits()  # more profile changes than one minute allows
+            return self.call(headers, "POST", profiles, {
+                "operation": "template", "id": profile_id, "quote_template_id": choice, "revision": revision})
+
+        own = create(operator, "Synthetic own", legacy=True)
+        untouched = stored(own["id"])
+        self.assertIs(listed(operator, own["id"])["own_layout"], True)
+        for choice in (blue["id"], "default", "standard"):  # whatever was picked, and however often
+            with self.subTest(choice=choice):
+                revision = stored(own["id"])["_revision"]
+                status, body = choose(operator, own["id"], choice, revision)
+                self.assertEqual((status, body["profile"]["own_layout"]), (200, True), body)
+                # A save from a screen without the template control keeps both the template and the way back.
+                status, body = self.call(operator, "POST", profiles, {
+                    "operation": "update", "id": own["id"], "label": "Synthetic own", "defaults": {}, "revision": revision + 1})
+                self.assertEqual(status, 200, body)
+                self.assertEqual(stored(own["id"])["quote_template_id"], choice)
+                self.assertEqual((listed(operator, own["id"])["own_layout"], listed(operator, own["id"])["quote_template_id"]), (True, choice))
+                before = stored(own["id"])
+                for label, headers, expected, stale in (("stale revision", operator, 409, revision), ("another member", admin, 404, revision + 2)):
+                    with self.subTest(refused=label):
+                        status, body = choose(headers, own["id"], "own", stale)
+                        self.assertEqual(status, expected, body)
+                        self.assertEqual(stored(own["id"]), before)
+                self.assertEqual(self.call(operator, "POST", profiles, {
+                    "operation": "template", "id": own["id"], "quote_template_id": "own"})[0], 400, "no revision")
+                status, body = choose(operator, own["id"], "own", revision + 2)
+                self.assertEqual((status, body["profile"]["own_layout"], body["profile"]["revision"]), (200, True, revision + 3), body)
+                self.assertNotIn("quote_template_id", body["profile"])
+                kept = {"_revision", "saved_at"}
+                self.assertEqual({k: v for k, v in stored(own["id"]).items() if k not in kept},
+                                 {k: v for k, v in untouched.items() if k not in kept})
+                self.assertNotIn("quote_template_id", listed(operator, own["id"]))
+
+        # A shared profile: an admin may switch it back, an operator may not.
+        shared = create(admin, "Synthetic shared", legacy=True)
+        status, body = self.call(admin, "POST", profiles, {
+            "operation": "access", "id": shared["id"], "revision": shared["revision"],
+            "access": {"version": 1, "owner_user_id": None, "visibility": "shared"}})
+        self.assertEqual(status, 200, body)
+        revision = body["profile"]["revision"]
+        self.assertEqual(choose(admin, shared["id"], blue["id"], revision)[0], 200)
+        before = stored(shared["id"])
+        self.assertEqual(choose(operator, shared["id"], "own", revision + 1)[0], 404)
+        self.assertEqual(stored(shared["id"]), before)
+        self.assertIs(listed(operator, shared["id"])["own_layout"], True)
+        self.assertEqual(choose(admin, shared["id"], "own", revision + 1)[0], 200)
+
+        # A profile created without a workbook has nothing to go back to: not offered, not accepted.
+        fresh = create(operator, "Synthetic fresh", legacy=False)
+        self.assertIs(listed(operator, fresh["id"])["own_layout"], False)
+        before = stored(fresh["id"])
+        status, body = choose(operator, fresh["id"], "own", fresh["revision"])
+        self.assertEqual((status, body["errors"]), (400, ["This profile has no layout of its own."]))
+        self.assertEqual(stored(fresh["id"]), before)
+        self.assertEqual(choose(operator, fresh["id"], blue["id"], fresh["revision"])[0], 200)
+        self.assertIs(listed(operator, fresh["id"])["own_layout"], False)
+        self.assertEqual(choose(operator, fresh["id"], "own", fresh["revision"] + 1)[0], 400)
+        # The mark is the server's: a save cannot bring it, or the choice, along.
+        for extra in ({"_own_layout": True}, {"quote_template_id": "own"}):
+            status, body = self.call(operator, "POST", profiles, {
+                "operation": "update", "id": fresh["id"], "label": "x", "defaults": {}, "revision": fresh["revision"] + 1, **extra})
+            self.assertEqual(status, 400, body)
+        # A workbook that is gone cannot be gone back to.
+        with inspection.connection() as connection:
+            connection.execute("delete from sqag_file_artifacts where owner_id = ?", (own["id"],))
+            connection.commit()
+        revision = stored(own["id"])["_revision"]
+        self.assertEqual(choose(operator, own["id"], blue["id"], revision)[0], 200)
+        self.assertEqual(choose(operator, own["id"], "own", revision + 1)[0], 400)
+
+
 class QuoteTemplateChoicesUnitTest(unittest.TestCase):
     def test_local_file_storage_locks_the_dropdown_on_standard(self):
         storage = s.LocalSqagStorage.__new__(s.LocalSqagStorage)

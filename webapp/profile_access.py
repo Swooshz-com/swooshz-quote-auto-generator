@@ -8,7 +8,7 @@ import copy
 import hashlib
 import json
 
-RESERVED = frozenset({"_access", "_revision", "permissions"})
+RESERVED = frozenset({"_access", "_revision", "_own_layout", "permissions"})
 
 
 def content_profile(profile):

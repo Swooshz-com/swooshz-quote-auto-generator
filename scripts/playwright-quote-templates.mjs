@@ -537,7 +537,9 @@ try {
   await page.route("**/api/settings/profiles", async (route) => { await new Promise((resolve) => setTimeout(resolve, 600)); await route.fallback(); });
   await page.keyboard.press("Enter");
   assert.deepEqual([await field.inputValue(), await focusId(page)], ["standard", "quoteTemplateSelect"], "the focus stays while it saves");
-  await page.keyboard.press("ArrowUp"); // ignored until the save is back
+  await page.keyboard.press("Enter"); // never sends the same choice twice
+  await page.keyboard.press("ArrowUp"); // not taken until the save is back
+  assert.deepEqual([await field.inputValue(), posts], ["standard", ["standard"]]);
   await page.locator("#presetStatus").getByText("will use Standard for new quotes").waitFor();
   await settled();
   await page.unroute("**/api/settings/profiles");
@@ -554,8 +556,9 @@ try {
   await page.keyboard.press("Tab");
   await page.waitForTimeout(300);
   assert.deepEqual(posts, ["standard", "default"]);
+  assert.equal(await field.locator("option[value=own]").count(), 0, "a profile without a layout of its own is not offered one");
 
-  step("Company Profile saved before templates existed keeps its own layout; a stale profile says so");
+  step("Company Profile saved before templates existed: one key never changes it, and it can be switched back");
   const own = await newProfile("Synthetic Own Layout");
   sql("update sqag_profiles set payload_json = json_remove(payload_json, '$.quote_template_id') where profile_id = ?", own.id);
   await page.evaluate(async () => { await loadProfiles(); renderPresetOptions(); });
@@ -568,6 +571,28 @@ try {
   await page.waitForTimeout(300);
   assert.equal(await field.locator("option:checked").innerText(), "Profile's own layout");
   assert.deepEqual(posts, ["standard", "default"], "one arrow key saves nothing");
+  posts.length = 0;
+  await page.keyboard.press("ArrowDown"); // Workspace default
+  await page.keyboard.press("ArrowDown"); // Standard (built in)
+  await page.keyboard.press("Enter");
+  await page.locator("#presetStatus").getByText('"Synthetic Own Layout" will use Standard for new quotes.').waitFor();
+  await settled();
+  assert.equal(await field.inputValue(), "standard");
+  await shot(page, "profile-own-layout", "#quoteCompanyPanel");
+  await page.evaluate(async () => { await loadProfiles(); renderPresetOptions(); }); // also after the page reads it again
+  await page.locator("#presetSelect").selectOption(`company:${own.id}`);
+  assert.equal(await field.locator("option[value=own]").innerText(), "Profile's own layout");
+  await field.focus();
+  await page.keyboard.press("ArrowUp");
+  await page.keyboard.press("ArrowUp");
+  assert.deepEqual([await field.inputValue(), posts], ["own", ["standard"]]);
+  await page.keyboard.press("Enter");
+  await page.locator("#presetStatus").getByText('"Synthetic Own Layout" will use its own layout for new quotes.').waitFor();
+  await settled();
+  assert.deepEqual([await field.inputValue(), posts, await focusId(page)], ["own", ["standard", "own"], "quoteTemplateSelect"]);
+  const restored = (await (await context.request.get(base + "/api/profiles")).json()).company_profiles.find((item) => item.id === own.id);
+  assert.deepEqual([restored.own_layout, "quote_template_id" in restored], [true, false]);
+  own.revision = restored.revision;
   await otherAdmin("POST", "/api/settings/profiles", {
     operation: "access", id: own.id, revision: own.revision, access: { version: 1, owner_user_id: null, visibility: "shared" },
   });
