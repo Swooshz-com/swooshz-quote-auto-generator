@@ -1,6 +1,6 @@
 # Current CI/CD Status
 
-Last updated: 2026-11-19
+Last updated: 2026-11-25
 
 Sources of truth: `.github/workflows/ci.yml`, `.github/workflows/plain-text.yml`,
 and the two Toolkit Programme Sweep workflows
@@ -48,7 +48,8 @@ The programme board lists unblocked assigned or active work first in
 Waiting on and In progress. If an owner test is still owed on an earlier
 pull request, the board lists it after that gate.
 
-Both managed workflows pin Toolkit 3.145.0 (`d667ad5`). When an unfinished task
+Both managed workflows check out Toolkit `main` unless the `TOOLKIT_REF`
+repository variable names another ref. When an unfinished task
 records no pull request or branch and exactly one open pull request from a
 branch of this repository claims it, the sweep records that pull request, its
 branch and head, and moves the task from planned to active. Several claimants,
@@ -67,8 +68,8 @@ After an approved merge, verify the first eligible App-backed sweep on
 Read back an actual graph advance from the saved state and match its revision and
 hash to the published board. To verify replacement, record an eligible claimant
 at the time of the sweep and confirm the saved child follows it. Verify the
-installed worker with a run at the new pin. A queued or held run stays pending
-until the save and redraw are verified.
+installed worker with a run at the Toolkit revision under check. A queued or held
+run stays pending until the save and redraw are verified.
 
 Python discovery includes `tests.test_quote_api_auth` and
 `tests.test_quote_api_tenancy` for the disabled admission boundary.
@@ -112,6 +113,8 @@ or deployment behaviour changes accompany this test.
 - Every checkout binds to the pull request's exact `pull_request.head.sha`, or
   to `github.sha` for push/manual runs; hosted results therefore identify the
   tested source head instead of relying on a synthetic pull-request merge ref.
+- Every action is pinned to the full commit SHA of its release, with the version
+  in a comment; Dependabot's GitHub Actions updates move both together.
 - No deployment job is configured
 - This remediation adds no deployment job
 - No production environment mutation is performed by CI
@@ -201,8 +204,8 @@ or deployment behaviour changes accompany this test.
 
 ## Validate App Checks
 
-- Pins the `Validate app` runner to `ubuntu-24.04`, which supports the locked
-  Playwright 1.64.1 browser dependencies. Other jobs retain their existing
+- Pins the `Validate app` runner to `ubuntu-24.04`, which supports the browser
+  dependencies of the Playwright version locked in `package-lock.json`. Other jobs retain their existing
   runners; checks, triggers, permissions and dependencies are unchanged.
 - Installs Python 3.12.13 (the exact patch shared with the retrospective job) and Node 22.
 - Installs pinned Python dependencies with `python -m pip install --only-binary=:all: -r requirements.txt`.
@@ -287,10 +290,23 @@ or deployment behaviour changes accompany this test.
 - Owner basis UAT uses `tests/owner_uat_mock_harness.py` with a caller-written
   synthetic scenario and network denial. Its lifecycle tests cover normal and
   exceptional shutdown.
-- Last CI check-up: 2026-11-05, local read-only check against e83883b; hosted
-  job times and required-check settings were not accessible from this sandbox.
-  The changed-workflow check reports ten existing action references without
-  full commit pins. Action pinning remains separate from browser scope selection.
+- Last CI check-up: 2026-11-25, against e8af155 with job times and required
+  checks read from GitHub. It found 13 unpinned action references in `ci.yml`,
+  now pinned. Left as they are, each with its reason:
+  - No job-time budget: `Validate app` took 38 minutes on average and 46 at most
+    over the last ten green runs on `main`, every other job at most about three. A
+    budget set to fit that would hide it; splitting the job comes first.
+  - Three browser scripts no test reaches (`playwright-dashboard-auth-recovery`,
+    `playwright-forensics-feedback`, `playwright-live-seeded-ai-check`): run by hand,
+    not package scripts, and too large to test or retire in passing.
+  - No concurrency group on `ci.yml`: `Validate app` and its browser steps keep
+    `always()`, so GitHub does not cancel that job while it runs. A group would
+    make a new push wait for the old job instead of replacing it. Dropping
+    `always()` for speed alone would loosen the gate: a cancelled run could skip
+    `Validate app`.
+  - No concurrency group on the plain-text check: the workflow follows Toolkit's
+    template, which has none, and it takes seconds.
+  - `continue-on-error` on the sweep's two token steps: Toolkit-managed workflow.
 
 ## Security And Secrets
 
@@ -303,9 +319,9 @@ or deployment behaviour changes accompany this test.
 - GitHub repository settings (free on a public repository): Dependabot security
   updates, secret scanning with push protection, CodeQL default setup and private
   vulnerability reporting are on.
-- Dependabot opens weekly version updates for pip, npm and GitHub Actions, with
-  patch and minor updates grouped and a short cooldown (seven days for GitHub
-  Actions, three for the rest). Nothing merges on its own: every update PR waits
+- Dependabot opens weekly version updates for pip, npm and GitHub Actions. npm
+  and GitHub Actions group patch and minor updates after a short cooldown (three
+  days for npm, seven for GitHub Actions); pip has neither. Nothing merges on its own: every update PR waits
   for review.
 
 ## Deploy Runtime Gate

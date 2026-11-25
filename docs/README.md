@@ -30,7 +30,7 @@ See [the repo map](repo-map.md) for parts, entry points, sources of truth and ow
 - `docs/internal-password-auth-mode.md`: canonical temporary staff password mode, admission, session revocation, and readiness contract.
 - `docs/internal-uat-coolify-deploy.md`: release runbook for the internal app
   (rehearsal, live-data test, deploy, rollback); the DB/BLOB artifact path is
-  documented as blocked for production readiness.
+  documented as blocked for hosted, protected, deploy and production readiness.
 - `docs/internal-uat-login-and-pre-vps-dry-run.md`: approved-tester login
   expectations and local/offline deploy-auth checks to run before buying or
   touching a VPS.

@@ -64,8 +64,9 @@ create, test, delete, with no new decisions per run.
   credential store; that key is scoped to the one project, so the guard reads
   the project by the map's `neon_project_id`. After it passes,
   `scripts/rehearsal_database_url.py` is the only way a rehearsal step uses a
-  database URL: `set-service` writes a rehearsal service's `SQAG_DATABASE_URL`
-  through Coolify's API and `run-migrator` runs each migration step. Both run
+  database URL, except that `scripts/copy_live_objects_to_rehearsal.py` runs the
+  same guard, then uses the copy branch's URL itself. `set-service` writes a
+  rehearsal service's `SQAG_DATABASE_URL` through Coolify's API and `run-migrator` runs each migration step. Both run
   the guard again on the exact URL they use and refuse one that is not on the
   guarded branch's endpoint. They, and the live object copy, refuse a guard
   result that Neon's API did not confirm (`neon_api: not_checked`, the key
@@ -107,8 +108,8 @@ by each run.
 9. The quote manifest `deploy/rehearsal/live-cases.json` approved by the
    owner: its `approval` names the date and the issue comment or commit that
    approved the listed quote ids. A walk refuses an unapproved manifest.
-10. The owner's OK for paid AI on each run (`--ai-ok`), capped at US$1 for
-    the whole run by one ledger file shared by every check.
+10. The owner's recorded OK for paid AI (`--ai-ok`) naming its release, runs
+    and cap; one ledger file shared by every check caps each run at US$1.
 
 The owner's standing scope confirmation for this flow lets each run create and
 delete the resources the map names as rehearsal, and copy live's migration
