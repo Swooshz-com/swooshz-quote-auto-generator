@@ -47,6 +47,22 @@ const view = (page) => page.evaluate(() => ({
     .filter((control) => control.getClientRects().length && !control.disabled && !control.matches("button[data-side-panel], #sideBackButton, #sideNextButton"))
     .map((control) => control.id || control.className),
 }));
+// Every control of the quote workspace and whether it can be used, as the app left it.
+const controlStates = (page) => page.evaluate(() => Object.fromEntries([...document.querySelectorAll("#panel-analysis [id]")]
+  .filter((control) => control.matches("button, input, select, textarea, [contenteditable]"))
+  .map((control) => [control.id, control.matches("[contenteditable]") ? control.getAttribute("contenteditable") : !control.disabled])));
+// Staff type into a Customer rich-text field and go to the Dashboard; the save on the way carries it.
+const editCustomerAddress = async (page, text) => {
+  if (await page.evaluate(() => state.activeSidePanel !== "customer")) await run.openPanel(page, "customer");
+  assert(await page.locator("#clientAddressEditor").getAttribute("contenteditable") === "true", "the Customer address cannot be typed into");
+  const saved = page.waitForRequest((request) => {
+    if (request.method() !== "POST" || new URL(request.url()).pathname !== "/api/quote-sessions") return false;
+    try { return JSON.stringify(request.postDataJSON()?.draft_state?.quoteDetails || {}).includes(text); } catch { return false; }
+  }, { timeout: 30000 });
+  await page.locator("#clientAddressEditor").fill(text);
+  await toDashboard(page);
+  await saved;
+};
 const readStep = async (page, panel) => {
   await run.openPanel(page, panel);
   const seen = await view(page);
@@ -195,6 +211,33 @@ try {
   assert(await admin.evaluate(() => state.quoteBasisSections.flatMap((section) => section.lines).find((line) => line.id === "vo-carpet").tag === "Exclude"), "the admin's own quote cannot be edited");
   await toDashboard(admin);
   assert(writes.some((entry) => entry === "POST /api/quote-sessions"), "the admin's own quote was not saved", writes);
+  // Leaving view only gives every control back: an own quote and a New Quote opened right after one, in the same page.
+  await run.openDashboardQuote(admin, generatedId);
+  await readStep(admin, "customer");
+  await toDashboard(admin);
+  await run.openDashboardQuote(admin, ownId);
+  await editCustomerAddress(admin, "Synthetic own address after viewing");
+  const newQuote = async () => {
+    await admin.locator("#newQuoteButton").click();
+    await admin.locator("#imageIntake").waitFor({ state: "visible" });
+    await admin.waitForFunction(() => !appIsBusy(), null, { timeout: 20000 });
+    return controlStates(admin);
+  };
+  // The same page's New Quote after its own quote, and then after a view-only one.
+  const afterOwn = await newQuote();
+  await toDashboard(admin);
+  await run.openDashboardQuote(admin, generatedId);
+  await readStep(admin, "basis");
+  await toDashboard(admin);
+  const afterView = await newQuote();
+  const differs = Object.keys({ ...afterOwn, ...afterView }).filter((id) => afterOwn[id] !== afterView[id]);
+  assert(await admin.evaluate(() => state.quoteViewOnly === false) && !differs.length, "a New Quote after a view-only quote differs from one after an own quote",
+    Object.fromEntries(differs.map((id) => [id, [afterOwn[id], afterView[id]]])));
+  await admin.locator("#imageInput").setInputFiles({ name: "view-only-new-render.png", mimeType: "image/png", buffer: await run.png(admin, 800, 600) });
+  await admin.locator("#fileList .file-item").first().waitFor({ state: "visible" });
+  await admin.locator("#sideNextButton").click();
+  await admin.locator("#customerDetailsPanel").waitFor({ state: "visible" });
+  await editCustomerAddress(admin, "Synthetic new address after viewing");
 
   // 5. Staff see no more than before: not the admin's quote, and their own opens for editing.
   assert((await detail(operator, ownId)).status === 404 && !(await shown(operator)).includes(ownId), "an operator can see the admin's quote");

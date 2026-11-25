@@ -19387,9 +19387,11 @@ class ViewOnlyQuoteGuard {
   static EVENTS = ["click", "dblclick", "keydown", "beforeinput", "input", "change", "paste", "drop", "dragover", "submit"];
   static EDIT_KEYS = new Set(["Enter", " ", "F2", "Delete", "Backspace"]);
 
-  constructor(root, isViewOnly) {
+  // resync gives the app's own controls back their state once the guard lets them go.
+  constructor(root, isViewOnly, resync) {
     this.root = root;
     this.isViewOnly = isViewOnly;
+    this.resync = resync;
     this.locked = new Map();
   }
 
@@ -19410,8 +19412,11 @@ class ViewOnlyQuoteGuard {
 
   sync() {
     if (!this.isViewOnly()) {
+      if (!this.locked.size) return;
       this.locked.forEach((restore) => restore());
       this.locked.clear();
+      // A control the app disabled itself meanwhile (Reset Draft with nothing to reset) stays disabled.
+      this.resync();
       return;
     }
     this.root.querySelectorAll(ViewOnlyQuoteGuard.CONTROLS).forEach((control) => {
@@ -19431,7 +19436,10 @@ class ViewOnlyQuoteGuard {
   }
 }
 
-const viewOnlyQuoteGuard = new ViewOnlyQuoteGuard(elements.quoteFlowPanel, () => state.quoteViewOnly);
+const viewOnlyQuoteGuard = new ViewOnlyQuoteGuard(elements.quoteFlowPanel, () => state.quoteViewOnly, () => {
+  syncControlStates();
+  updatePresetButtons();
+});
 
 function showQuoteNotSavedModal(message) {
   showExcelGeneratingModal({ eyebrow: "Quote workspace", title: "Quote not saved", message });
