@@ -10,7 +10,7 @@
 ## Release And Live Safety
 
 - Release order, per the runbook: rehearsal, live-data test on a copy, agent UAT, owner UAT, deploy, live read-only check, delete the copies.
-- Deploys, live migrations (named target and checksum), env or key changes, deletions, and paid AI calls need the owner's own OK naming the exact action. A standing OK the owner recorded counts only within its exact terms (the deploy permission and the rehearsal-resources scope in the runbook); it never covers live migrations, keys, env changes, deletions or paid AI.
+- Deploys, live migrations (named target and checksum), env or key changes, deletions, and paid AI calls need the owner's own OK naming the exact action. A standing OK the owner recorded counts only within its exact terms (the deploy permission and the rehearsal-resources scope in the runbook); it never covers live migrations, live env or key changes, deleting anything the rehearsal map does not name, or paid AI.
 - Copies of live hold real customer data: they stay up at most 24 hours from the owner hand-off (runbook step 8.2) unless the owner extends it, and are deleted after the live deploy, when the candidate is abandoned, or when those 24 hours pass. Evidence holds ids, counts, hashes and sizes, never customer content.
 - Never commit secrets, real company or bank data, private/customer data, real exported profile JSON, embedded real logos, generated local outputs, or sensitive fixtures.
 
