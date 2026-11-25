@@ -147,7 +147,8 @@ class BoothProfileLineTest(unittest.TestCase):
 
 
 class AppliedBoothSizeTextTest(unittest.TestCase):
-    """After Apply no line states a booth size that contradicts the applied one."""
+    """After Apply no booth profile line states a booth size that contradicts the applied one, and no quote line
+    changes what the server reads from it."""
 
     setUp = BoothProfileLineTest.setUp
     reply = BoothProfileLineTest.reply
@@ -166,63 +167,19 @@ class AppliedBoothSizeTextTest(unittest.TestCase):
         self.assertEqual(text, "Provisional booth footprint 93 sqm, totalling 93 sqm")
         self.assertNotIn("extra-0", rows)
 
-    def test_full_floor_and_booth_worded_lines_follow_the_applied_size(self):
-        texts, rows = self.applied(
-            "Raised platform to full footprint 6m x 6m (36 sqm)",
-            "Skirting around 6000 x 6000 mm booth",
-            "Platform 6m W x 6m D x 100mm H",
-        )
-        self.assertEqual(texts, [
-            "Raised platform to full footprint 93 sqm (93 sqm)",
-            "Skirting around 93 sqm booth",
-            "Platform 93 sqm, 100mm H",
-        ])
-        self.assertEqual([rows[f"extra-{index}"] for index in range(3)], texts)
-
-    def test_other_sizes_stay_as_drafted(self):
-        texts = ("Truss 6m x 6m over the reception", "Meeting room 3m x 4m, 12 sqm", "Wall graphic 6m x 3m", "Tiles 1m x 1m")
-        kept, _rows = self.applied(*texts, quantity=4, unit="nos")
-        self.assertEqual(tuple(kept), texts)
-
-    def test_a_catalogue_item_keeps_the_size_in_its_own_name(self):
-        catalogue = webapp.pricing_references_root() / "synthetic-exhibition-fixture-pricing" / "pricing-catalog.json"
-        data = json.loads(catalogue.read_text(encoding="utf-8"))
-        carpet = next(item for item in data["items"] if item["id"] == known.CARPET)
-        sized = {"canopy": ("nos 6m x 6m booth canopy", "nos"), "kit": ("sqm booth floor 36 sqm kit", "sqm")}
-        for item_id, (description, unit) in sized.items():
-            data["items"].append({**carpet, "id": item_id, "description": description, "unit_hint": unit, "aliases": [description],
-                                  "match_terms": [], "object_families": [], "remarks": [], "visual_references": [], "item_order": 90 + len(item_id)})
-        catalogue.write_text(json.dumps(data), encoding="utf-8")
-        canopy = "nos 6m x 6m booth canopy"
-        # (line, item, quantity, unit, the line once 93 sqm is applied to the AI's 6m x 6m booth)
-        cases = (
-            (f"[ {canopy} ] - White fabric", "canopy", 1, "nos", f"[ {canopy} ] - White fabric"),
-            (canopy, "canopy", 1, "nos", f"[ {canopy} ]"),
-            ("6m x 6m booth canopy in white", "canopy", 1, "nos", f"[ {canopy} ] - In white"),
-            ("[ sqm booth floor 36 sqm kit ]", "kit", 36, "sqm", "[ sqm booth floor 36 sqm kit ]"),
-            # What the line adds after the item's name is the booth's, and follows the applied size.
-            (f"[ {canopy} ] - Over booth footprint 6m x 6m", "canopy", 1, "nos", f"[ {canopy} ] - Over booth footprint 93 sqm"),
-            ("[ sqm synthetic carpet tile ] - To booth footprint 6m x 6m", known.CARPET, 36, "sqm",
-             "[ sqm synthetic carpet tile ] - To booth footprint 93 sqm"),
-        )
-        for text, item_id, quantity, unit, expected in cases:
+    def test_a_profile_line_that_starts_with_its_size_keeps_it_in_its_words(self):
+        for text, applied in (("6m x 6m booth footprint, corner", "93 sqm booth footprint, corner"),
+                              ("36 sqm booth area, 2 open sides", "93 sqm booth area, 2 open sides")):
             with self.subTest(text=text):
-                def reply():
-                    draft = self.reply({"text": text, "quantity": quantity, "unit": unit, "pricing_keyword": item_id},
-                                       project={"booth_width": 6, "booth_depth": 6, "staff_booth_size": known.staff_reply(area=93)})
-                    draft["line_items"][-1].update(pricing_keyword=item_id, section="Synthetic Floors")
-                    return draft
-                applied, _prompt = self.drafts.run_draft(self.drafts.applied_payload("Booth is 93 sqm"), reply())
-                plain, _prompt = self.drafts.run_draft(self.drafts.payload(""), reply())
-                def read(result):
-                    self.assertEqual(result["source"], "openai")
-                    line = next(line for line in self.drafts.basis_lines(result) if line.get("id") == "extra-0")
-                    row = next(row for row in result["line_items"] if row["source_basis_line_id"] == "extra-0")
-                    return {"text": line["text"], "item": line.get("pricing_keyword"), "status": row["status"],
-                            "variant": row["pricing_authority"]["variant"], "price": row.get("catalog_unit_price"), "quantity": row["quantity"]}
-                self.assertEqual(read(applied), {**read(plain), "text": expected,
-                                                 "quantity": 93 if unit == "sqm" else quantity})
-                self.assertEqual((read(applied)["item"], read(applied)["variant"]), (item_id, "catalog"))
+                [shown], rows = self.applied(text, quantity=None, unit=None)
+                self.assertEqual(shown, applied)
+                self.assertNotIn("extra-0", rows)
+
+    def test_quote_lines_keep_their_words(self):
+        texts = ("Skirting around 6000 x 6000 mm booth", "Platform 6m W x 6m D x 100mm H", "Truss 6m x 6m over the reception",
+                 "Meeting room 3m x 4m, 12 sqm", "Floor area 12 sqm for storage", "Booth structure 6m x 6m, 36 sqm")
+        kept, rows = self.applied(*texts, quantity=4, unit="nos")
+        self.assertEqual(tuple(kept), texts)
 
     def test_a_booth_line_that_contradicts_itself_is_corrected_when_the_ai_used_the_staff_size(self):
         [text], _rows = self.applied("Provisional booth footprint 6m W x 6m D, totalling 93 sqm",
@@ -232,22 +189,150 @@ class AppliedBoothSizeTextTest(unittest.TestCase):
 
     def test_text_rules_by_staff_size(self):
         staff = {"booth_width": 8, "booth_depth": 9, "booth_area_sqm": 72}
-        def restated(text, whole_floor=False, informational=True):
-            return webapp.staff_sized_booth_text(text, staff, 36, whole_floor=whole_floor, informational=informational, own_sizes=set())
+        def restated(text):
+            return webapp.applied_booth_profile_text(text, staff, 36)
         self.assertEqual(restated("Booth footprint 6m (W) x 6m (D) = 36 sqm"), "Booth footprint 8m x 9m = 72 sqm")
         self.assertEqual(restated("Booth 6 x 6 x 4m H"), "Booth 8m x 9m x 4m H")
         self.assertEqual(restated("Booth W 6m x D 6m"), "Booth 8m x 9m")
         self.assertEqual(restated("Booth W6000 x D6000mm, 36 sqm"), "Booth 8m x 9m, 72 sqm")
         self.assertEqual(restated("Booth size 8m x 9m, 72 sqm"), "Booth size 8m x 9m, 72 sqm")
-        self.assertEqual(restated("Floor 1m x 1m tiles", whole_floor=True, informational=False), "Floor 1m x 1m tiles")
+        self.assertEqual(restated("Corner booth with a 2m x 1m counter"), "Corner booth with a 2m x 1m counter")
+        self.assertIsNone(restated(None))
 
     def test_long_text_stays_fast(self):
         import time
         staff = {"booth_width": None, "booth_depth": None, "booth_area_sqm": 93}
         for text in ("6m" + " " * 4000, ("6 x" + " " * 40) * 80, "6m w" * 900, "9" * 4000, "w " * 2000, "6 x w" * 800):
             started = time.monotonic()
-            webapp.staff_sized_booth_text(text, staff, 36, whole_floor=True, informational=True, own_sizes=set())
+            webapp.applied_booth_profile_text(text, staff, 36)
             self.assertLess(time.monotonic() - started, 0.5, text[:12])
+
+
+# (name, unit) of catalogue items a line can be matched to: with and without a size in the name, or named after the AI's area.
+ITEMS = {
+    "": ("system structure", None),
+    "plain-nos": ("nos. synthetic stool", "nos"),
+    "plain-lot": ("lot synthetic backdrop", "lot"),
+    "plain-set": ("sets synthetic letters", "sets"),
+    "plain-sqm": ("sqm synthetic floor sheet", "sqm"),
+    "pair-nos": ("nos 6m x 6m booth canopy", "nos"),
+    "bracket-nos": ("nos [ type A ] 6m x 6m booth scheme", "nos"),
+    "pair-sqm": ("sqm 6m x 6m booth floor sheet", "sqm"),
+    "area-nos": ("nos 36 sqm booth package", "nos"),
+    "area-sqm": ("36 sqm booth floor kit", "sqm"),
+    "min-sqm": ("sqm carpet (min 36 sqm)", "sqm"),
+}
+MEASURES = (("nos", 2), ("lot", 1), ("sets", 1), ("sqm", 12), ("sqm", 36))
+# How the line starts, and where else it states a size.
+SHAPES = ("6m x 6m booth {name}", "6 x 6 stand {name}, white", "{name} for the booth footprint 6m x 6m", "[ {name} ] - 6m x 6m booth detail")
+WHOLE_FLOOR_SHAPES = ("{name}", "[ {name} ]", "36 sqm booth {name}", "36.00 m2 {name}", "36 sqm of {name}, 36 sqm underlay",
+                      "[ {name} ] - 36 sqm laid", "- 36 sqm {name}")
+
+
+def quote_shapes():
+    for item, (name, item_unit) in ITEMS.items():
+        for unit, quantity in MEASURES:
+            if item_unit not in (None, unit):
+                continue
+            for shape in SHAPES + (WHOLE_FLOOR_SHAPES if quantity == 36 else ()):
+                text = shape.format(name=name)
+                read = webapp.leading_quantity_prefix(text)
+                # A reply whose text states another count than its row is refused with or without Apply.
+                if not read or read["quantity"] == quantity:
+                    yield {"text": text, "quantity": quantity, "unit": unit, "pricing_keyword": item}
+
+
+class AppliedSizeKeepsWhatTheServerReadsTest(unittest.TestCase):
+    """Apply never changes the quantity, unit, match or price the server reads from a quote line, or blocks the draft.
+
+    The one change is the rule of Known details: a sqm row as large as the AI's booth takes the applied area.
+    Every line is compared with the same draft without Apply, through the real draft path with a fake reply.
+    """
+
+    setUp = BoothProfileLineTest.setUp
+    reply = BoothProfileLineTest.reply
+    SIZES = (
+        {"known": "Booth is 93 sqm", "ai": {"area": 93}, "area": 93.0, "project": {"booth_size": "93 sqm", "booth_area_sqm": "93"}},
+        {"known": "Booth is 8m x 9m", "ai": {"width": 8, "depth": 9}, "area": 72.0,
+         "project": {"booth_size": "8m x 9m", "booth_width": "8", "booth_depth": "9", "booth_area_sqm": "72"}},
+    )
+
+    def read(self, draft, count):
+        shown = {line["id"]: line for line in self.drafts.basis_lines(draft) if str(line.get("id", "")).startswith("extra-")}
+        rows = {row["source_basis_line_id"]: row for row in draft["line_items"]}
+        return [{"text": line["text"], "item": line.get("pricing_keyword"), "line": (float(line["quantity"]), line["unit"]),
+                 "row": (float(row["quantity"]), row["unit"]), "status": row["status"], "price": row.get("catalog_unit_price"),
+                 "variant": row["pricing_authority"]["variant"]}
+                for line, row in ((shown[f"extra-{index}"], rows[f"extra-{index}"]) for index in range(count))]
+
+    def draft(self, lines, size, *, applied):
+        """What the draft holds and what Apply would hold, as first analysed; or the draft analysed again after Apply."""
+        reply = self.reply(*lines, project={"booth_width": 6, "booth_depth": 6, "staff_booth_size": known.staff_reply(**size["ai"])})
+        for line, row in zip(lines, reply["line_items"][-len(lines):]):
+            row.update(pricing_keyword=line["pricing_keyword"], section="Synthetic Floors")
+        payload = self.drafts.payload(size["known"])
+        if applied:
+            payload["project"].update(size["project"], dimension_source="staff", known_details_size_decision={
+                "booth_size": size["project"]["booth_size"], "decision": "applied"})
+        result, _prompt = self.drafts.run_draft(payload, reply)
+        if "quote_basis_sections" not in result:
+            return None
+        drafts = (result,) if applied else (result, result["known_details_size_proposal"]["applied"])
+        return [self.read(draft, len(lines)) for draft in drafts]
+
+    def each(self, lines, size, *, applied):
+        """The whole table in one draft; a blocked draft is taken apart to name the lines that block it."""
+        drafted = self.draft(lines, size, applied=applied)
+        if drafted is not None or len(lines) == 1:
+            return drafted or [[None]] * (1 if applied else 2)
+        half = len(lines) // 2
+        return [first + second for first, second in zip(
+            self.each(lines[:half], size, applied=applied), self.each(lines[half:], size, applied=applied), strict=True)]
+
+    def test_every_shape_keeps_its_quantity_unit_match_and_price(self):
+        catalogue = webapp.pricing_references_root() / "synthetic-exhibition-fixture-pricing" / "pricing-catalog.json"
+        data = json.loads(catalogue.read_text(encoding="utf-8"))
+        carpet = next(item for item in data["items"] if item["id"] == known.CARPET)
+        data["items"].extend({**carpet, "id": item, "description": name, "unit_hint": unit, "aliases": [name], "match_terms": [],
+                              "object_families": [], "remarks": [], "visual_references": [], "item_order": 50 + order}
+                             for order, (item, (name, unit)) in enumerate(ITEMS.items()) if item)
+        catalogue.write_text(json.dumps(data), encoding="utf-8")
+        lines = list(quote_shapes())
+        wrong = []
+        matched = set()
+        for size in self.SIZES:
+            plain, offered = self.each(lines, size, applied=False)
+            [again] = self.each(lines, size, applied=True)
+            for mode, drafted in (("offered", offered), ("analysed again", again)):
+                for line, before, after in zip(lines, plain, drafted, strict=True):
+                    name = f"{size['known']}, {mode}, {line['text']!r} {line['quantity']} {line['unit']} {line['pricing_keyword']}"
+                    if before is None or after is None:
+                        wrong.append(f"{name}: {'the first analysis' if before is None else 'the draft'} is blocked")
+                        continue
+                    matched.add(before["item"])
+                    expected = dict(before)
+                    # Unwrapped, "[ 36 sqm ... ]" is read as 36 sqm whatever its row says, so that row stays as drafted.
+                    if line["quantity"] == 36 and line["text"] != "[ 36 sqm booth floor kit ]":
+                        expected.update(line=(size["area"], "sqm"), row=(size["area"], "sqm"))
+                    if line["quantity"] == 36:
+                        # Words of a resized row follow its size, as before; its catalogue reference stays.
+                        for value in (after, expected):
+                            value["text"] = value["text"].partition("]")[0] if line["pricing_keyword"] else value["text"].replace(
+                                "36 sqm", f"{size['area']:g} sqm")
+                    if after != expected:
+                        wrong.append(f"{name}: {after}, not {expected}")
+        self.assertEqual(wrong, [], f"{len(wrong)} of {len(lines) * 4}")
+        self.assertEqual(matched, {item or None for item in ITEMS}, "every item is matched by some line")
+
+    def test_a_row_whose_text_cannot_hold_the_new_size_stays_as_drafted(self):
+        line = {"text": "[ 36 sqm unknown floor ]", "quantity": 36, "unit": "sqm", "pricing_keyword": ""}
+        staff = {"dimension_source": "staff", "booth_area_sqm": 93, "booth_size": "93 sqm"}
+        resized, rescale = webapp.staff_footprint_rescale(
+            self.reply(line, project={"booth_width": 6, "booth_depth": 6}), staff, {"dimension_source": "ai", "booth_area_sqm": 36})
+        self.assertEqual((resized["line_items"][-1]["quantity"], resized["line_items"][-1]["description"]), (36, line["text"]))
+        self.assertEqual(rescale["resized_line_count"], 1)  # The carpet only.
+        [plain, offered] = self.draft([line], self.SIZES[0], applied=False)
+        self.assertEqual((offered, self.draft([line], self.SIZES[0], applied=True)), (plain, [plain]))
 
 
 if __name__ == "__main__":
