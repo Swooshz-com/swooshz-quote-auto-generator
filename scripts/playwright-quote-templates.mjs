@@ -691,8 +691,22 @@ try {
   assert.equal(await page.locator("#qtNameError").innerText(), "Another template already has this name.");
   assert.deepEqual([await focusId(page), (await editorState(page)).editing], ["qtNameInput", true]);
   await otherAdmin("DELETE", `${API}/${same.id}?save_number=1`);
-  assert.deepEqual(await pressSave(), [200], "the name is free again, so the same draft is saved");
+  // The list is read again first; until that is back nothing can be edited, left or saved a second time.
+  await page.route(`**${API}`, async (route) => {
+    if (route.request().method() === "GET") await new Promise((resolve) => setTimeout(resolve, 500));
+    await route.fallback();
+  });
+  const reading = await page.evaluate(() => {
+    document.querySelector("#qtSaveButton").click();
+    quoteTemplatesSettings.saveEditor();
+    document.querySelector("#qtCancelButton").click();
+    return { inert: document.querySelector("#qtEditorView").inert, saveOff: document.querySelector("#qtSaveButton").disabled, editing: Boolean(quoteTemplatesSettings.editor) };
+  });
+  assert.deepEqual(reading, { inert: true, saveOff: true, editing: true });
   await page.locator("#qtListStatus").getByText('"Same name" is ready to pick in Company Profile.').waitFor();
+  await page.unroute(`**${API}`);
+  assert.deepEqual(answers.slice(-2), [409, 200], "the name is free again, so the same draft is saved, once");
+  assert.equal(await page.locator("#qtCounter").innerText(), "10 of 10 saved");
   expectedFailures = [];
 
   step("a workspace that may keep no templates: New template is off and the page says so");

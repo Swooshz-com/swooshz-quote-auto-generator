@@ -21057,7 +21057,6 @@ class QuoteTemplatesSettings {
       this.setSaveBusy(true);
       await this.loadList();
       this.setSaveBusy(false);
-      if (this.editor !== editor) return;
     }
     const nameProblem = this.nameProblem(name, editor.id);
     if (nameProblem) {

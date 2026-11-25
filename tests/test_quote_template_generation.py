@@ -398,6 +398,18 @@ class DatabaseProfileTemplateTest(unittest.TestCase):
         self.storage.change_profile_quote_template(created["id"], s.OWN_LAYOUT_CHOICE, revision=2)
         self.assertNotIn("quote_template", self.generate_for_real(created["id"])[0])
 
+    def test_the_same_profile_id_in_two_workspaces_stays_apart(self):
+        others = s.DatabaseSqagStorage(self.storage.database_url, "workspace-another", "admin", "another-admin")
+        for storage, label in ((self.storage, "Ours"), (others, "Theirs")):
+            storage.save_profile({**tw.workspace_profile_with_layout("same-profile"), "label": label})
+        for storage, label, choice in ((self.storage, "Ours", "standard"), (others, "Theirs", "default")):
+            before = others._read_payload("sqag_profiles", "profile_id", "same-profile")
+            changed = storage.change_profile_quote_template("same-profile", choice, revision=1)
+            self.assertEqual((changed["label"], changed["quote_template_id"], changed["revision"]), (label, choice, 2))
+            if storage is self.storage:
+                self.assertEqual(others._read_payload("sqag_profiles", "profile_id", "same-profile"), before)
+        self.assertEqual((self.stored("same-profile")["label"], self.stored("same-profile")["quote_template_id"]), ("Ours", "standard"))
+
     def test_own_layout_is_offered_exactly_where_the_server_takes_it(self):
         """Database storage without artifact storage keeps no layout workbook, so the way back is neither listed nor taken."""
         self.storage.save_profile(tw.workspace_profile_with_layout("way-back-profile"))

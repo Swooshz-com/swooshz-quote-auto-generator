@@ -499,6 +499,13 @@ class QuoteTemplateEditorEndpointsTest(permissions_test.QuoteTemplatePermissions
         other.save_profile({"id": own["id"], "label": "Synthetic theirs", "defaults": {}})
         self.assertTrue(other._profile_layout_artifact_exists(own["id"]))
         theirs = other._read_payload("sqag_profiles", "profile_id", own["id"])
+        # And a workbook left without its profile is not counted because another workspace has that profile.
+        third = s.DatabaseSqagStorage(self.url, "workspace-third", "admin", "third-admin")
+        third.save_profile({"id": own["id"], "label": "Synthetic third", "defaults": {}})
+        with third.connection() as connection:
+            connection.execute("delete from sqag_profiles where workspace_id = ?", ("workspace-third",))
+            connection.commit()
+        self.assertFalse(third._profile_layout_artifact_exists(own["id"]))
         revision = stored(own["id"])["_revision"]
         self.assertEqual(choose(operator, own["id"], blue["id"], revision)[0], 200)
         before = stored(own["id"])
