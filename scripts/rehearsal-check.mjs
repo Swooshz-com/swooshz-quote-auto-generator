@@ -1046,6 +1046,8 @@ async function walkQuote(run, sessionId) {
   const files = exportFacts(readback);
   const { sections, lines } = derivedReasons(readback);
   const detail = { generated: readback.status?.quote_generated === true, updated_at: readback.updated_at ?? null, sections, lines, files };
+  // A quote another staff member made opens view only for this login: it is read, never clicked.
+  if (readback.view_only === true) detail.view_only = true;
   if (run.options.downloadFiles) {
     // Pass A only: a GET of what is already stored, checked against its record.
     for (const kind of ["xlsx", "pdf"]) {
@@ -1064,7 +1066,8 @@ async function walkQuote(run, sessionId) {
   assert(page.empty_booth_boxes === 0, "A Detected booth box is empty.");
   assert(page.missing_quantity_boxes === 0, `${page.missing_quantity_boxes} line(s) with no quantity have no quantity box.`);
   // Pass A: why each walked quote's Quote Basis is locked, so the agent UAT knows which locks to expect.
-  if (run.options.downloadFiles) detail.basis_lock = await basisLockFacts(run.page);
+  // A view-only quote has no lock: every step opens and nothing on it can be changed.
+  if (run.options.downloadFiles && !detail.view_only) detail.basis_lock = await basisLockFacts(run.page);
   return { ...detail, ...page };
 }
 
@@ -1124,7 +1127,7 @@ async function liveWalk(run, manifest) {
     for (const id of ids) {
       const entry = list.find((session) => session.session_id === id);
       assert(entry, "A manifest quote is not listed.");
-      assert(!entry.dashboard_summary_only, "A manifest quote is not owned by this login, so it cannot be reopened.");
+      assert(!entry.dashboard_summary_only, "A manifest quote is not visible to this login, so it cannot be reopened.");
     }
     const value = walkTargets(ids, own, newest);
     run.result.targets = value;
@@ -1138,8 +1141,11 @@ async function liveWalk(run, manifest) {
     if (ids.includes(id)) walked.push(detail);
   }
   if (run.options.clickBudget) {
-    const largest = walked.filter((detail) => detail.lines > 0).sort((a, b) => b.lines - a.lines).slice(0, CLICK_BUDGET_QUOTES);
-    if (!largest.length) await run.step("click budget", () => { throw new Error("No manifest quote has basis lines to click."); });
+    // Clicks need a quote this login can edit; one made by another staff member opens view only.
+    const viewOnly = walked.filter((detail) => detail.view_only).map((detail) => detail.id);
+    if (viewOnly.length) await run.step("click budget leaves view-only quotes", () => ({ view_only: viewOnly.length }));
+    const largest = walked.filter((detail) => detail.lines > 0 && !detail.view_only).sort((a, b) => b.lines - a.lines).slice(0, CLICK_BUDGET_QUOTES);
+    if (!largest.length) await run.step("click budget", () => { throw new Error("No manifest quote this login can edit has basis lines to click."); });
     // Every quote is probed even when an earlier one fails, so one run shows all its facts.
     const failed = [];
     for (const [index, detail] of largest.entries()) {
