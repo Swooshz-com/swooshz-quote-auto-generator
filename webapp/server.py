@@ -17155,10 +17155,8 @@ class DatabaseSqagStorage:
         resolved_session_id = safe_quote_session_id(session_id or patch.get("session_id") or payload.get("session_id"), "") or new_quote_session_id()
         existing, _draft_files = self._read_quote_session_metadata_for_workspace(resolved_session_id)
         if existing and not self._quote_session_editable_by_current_user(existing):
-            if draft_precondition:
-                raise SqagStorageAccessError("You do not have permission to perform this action.", status=403, reason="quote_session_not_editable")
-            resolved_session_id = new_quote_session_id()
-            existing = {}
+            # Never saved as a new quote of the saver's own: that copy would be silent.
+            raise SqagStorageAccessError("You do not have permission to perform this action.", status=403, reason="quote_session_not_editable")
         if draft_precondition:
             draft_precondition.require_current(existing)
         if isinstance(patch.get("draft_files"), list):
@@ -17679,6 +17677,9 @@ class DatabaseSqagStorage:
             )
         session = self._public_quote_session(metadata, include_draft_state=include_draft_state, draft_files=draft_files)
         if session:
+            if not self._quote_session_editable_by_current_user(metadata):
+                # Visible to this admin but made by someone else: the page opens it without any editing.
+                session["view_only"] = True
             self.quote_spend_summaries([(session, metadata)])
         return session or None
 
@@ -34698,16 +34699,22 @@ def _run_quote_job(
         return storage_block(exc)
 
     draft_precondition = None
-    if "expected_draft_version" in payload:
+    session_id = safe_quote_session_id(quote_session_patch_payload(payload).get("session_id"), "")
+    existing: dict[str, Any] = {}
+    if quote_session_storage and session_id:
         try:
-            session_id = safe_quote_session_id(quote_session_patch_payload(payload).get("session_id"), "")
-            if not quote_session_storage or not session_id:
-                raise PricingSelectionConflict([], {})
             existing, editable = read_pricing_ledger_record(quote_session_storage, session_id)
             if not editable:
+                # Before any file is built, whether or not the request names a draft version.
                 raise SqagStorageAccessError(
                     "You do not have permission to perform this action.", status=403, reason="quote_session_not_editable",
                 )
+        except SqagStorageAccessError as exc:
+            return storage_block(exc)
+    if "expected_draft_version" in payload:
+        try:
+            if not quote_session_storage or not session_id:
+                raise PricingSelectionConflict([], {})
             draft_precondition = QuoteDraftPrecondition.from_version(
                 existing, pricing_ledger_scope_for_storage(quote_session_storage), payload["expected_draft_version"],
             )
