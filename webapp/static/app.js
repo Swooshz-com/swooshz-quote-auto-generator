@@ -4485,7 +4485,7 @@ function buildSessionSnapshot() {
     workflowStage: state.workflowStage,
     quoteBasis: persistedBasis.quote_basis,
     quoteBasisSections: persistedBasis.quote_basis_sections,
-    lineItems: state.lineItems,
+    lineItems: currentReinclusionRows(),
     outputRows: state.outputRows,
     originalOutputRows: state.originalOutputRows,
     outputErrors: state.outputErrors,
@@ -5090,7 +5090,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.lineItems = Array.isArray(restoredState.lineItems)
     ? restoredState.lineItems.map((row) => normalizeRestoredPricingRow(row, normalizeLineItem))
     : [];
-  recordSavedExclusions(targetSessionId, state.quoteBasisSections, { reset: true });
+  recordSavedExclusions(targetSessionId, state.quoteBasisSections, { reset: true, rows: state.lineItems });
   restorePendingReinclusions();
   state.outputRows = Array.isArray(restoredState.outputRows)
     ? restoredState.outputRows.map((row) => normalizeRestoredPricingRow(row, normalizeOutputRow))
@@ -11033,7 +11033,7 @@ function snapshotOutputRows(rows = state.outputRows) {
   return rows.map((row) => normalizeOutputRow({ ...row }));
 }
 
-function retainExcludedBasisPricingRows(rows) {
+function retainExcludedBasisPricingRows(rows, { confirmed = false } = {}) {
   const excluded = new Set();
   const active = new Set();
   for (const section of state.quoteBasisSections || []) {
@@ -11043,13 +11043,14 @@ function retainExcludedBasisPricingRows(rows) {
       if (line.source_line_item_id) ids.add(line.source_line_item_id);
     }
   }
-  const currentRows = state.lineItems || [];
+  const currentRows = currentReinclusionRows(state.lineItems || []);
   const pendingReincludes = new Map(currentRows.filter((row) => row.reincluded_catalog_selection)
     .map((row) => [row.source_basis_line_id, row.reincluded_catalog_selection]));
-  // Keep a refused re-inclusion distinct from a new Possible Match on subsequent Confirms.
+  // Only Confirm ends a waiting tick: rows rebuilt from Output keep it, whatever their price, and the
+  // rows Confirm answers with lose it unless their price was refused.
   const projected = pendingReincludes.size ? rows.map((row) => {
     const selection = pendingReincludes.get(row.source_basis_line_id);
-    return selection && ["none", "historical"].includes(row.pricing_authority?.variant)
+    return selection && (!confirmed || ["none", "historical"].includes(row.pricing_authority?.variant))
       ? { ...row, reincluded_catalog_selection: selection }
       : row;
   }) : rows;
@@ -13126,7 +13127,7 @@ function reincludedCatalogueSelectionKey(line, section, row) {
   return shortTextKey([
     section.id, section.title, line.id, line.source_line_item_id || "", line.text, line.unit,
     ...Object.entries(authority.context || {}).flat(), currentPricingReference()?.id, authority.catalog_source, authority.catalog_digest,
-  ].join(""));
+  ].join("\u001f"));
 }
 
 // Saved on every row ticked back in and in each copy of the draft, so it is kept short. It only tells
@@ -13140,6 +13141,19 @@ function shortTextKey(text) {
     high = Math.imul(high ^ code, 0x85ebca6b);
   }
   return (low >>> 0).toString(36) + (high >>> 0).toString(36);
+}
+
+// A re-include mark counts only while its line is ticked on screen. Every save (browser copy and server
+// draft) and Output rebuild reads the rows through here, so a mark left behind by any other decision on
+// the line (X, a block X, Re) is never written, restored or priced.
+function currentReinclusionRows(rows = state.lineItems, sections = state.quoteBasisSections) {
+  if (!rows.some((row) => row?.reincluded_catalog_selection)) return rows;
+  const ticked = new Set();
+  (sections || []).forEach((section) => (section.lines || []).forEach((line) => {
+    if (normalizeBasisTag(line.tag) === "Include") [line.id, line.source_line_item_id].filter(Boolean).forEach((id) => ticked.add(id));
+  }));
+  const counts = (row) => !row?.reincluded_catalog_selection || ticked.has(row.source_basis_line_id);
+  return rows.every(counts) ? rows : rows.map((row) => (counts(row) ? row : withoutReincludedSelection(row)));
 }
 
 // Saved drafts keep a line ticked back in as excluded, with its tick recorded on the row, until Confirm
@@ -13170,7 +13184,8 @@ function restorePendingReinclusions() {
   const keys = new Map();
   const sections = pendingReinclusionTagged(state.quoteBasisSections, state.lineItems, "Exclude", "Include", (id, line, section) => {
     const row = state.lineItems.find((entry) => entry.source_basis_line_id === id);
-    keys.set(id, reincludedCatalogueSelectionKey(line, section, row));
+    // Without a catalogue price there is nothing to restore: Confirm treats it as an ordinary line.
+    keys.set(id, reincludedCatalogueSelectionKey(line, section, row) || row.reincluded_catalog_selection);
   });
   if (!keys.size) return;
   state.quoteBasisSections = sections;
@@ -13185,11 +13200,13 @@ function withoutReincludedSelection({ reincluded_catalog_selection, ...row }) {
 
 // Saving a line as excluded ends its price on the server, so ticking it back in has to ask for the
 // price again at Confirm. A line X'd and ticked back before any save still has its price.
-function recordSavedExclusions(sessionId, sections, { reset = false } = {}) {
+function recordSavedExclusions(sessionId, sections, { reset = false, rows = [] } = {}) {
   const saved = !reset && state.savedExclusions?.sessionId === sessionId ? state.savedExclusions.ids : new Set();
   (sections || []).forEach((section) => (section.lines || []).forEach((line) => {
     if (normalizeBasisTag(line.tag) === "Exclude") [line.id, line.source_line_item_id].filter(Boolean).forEach((id) => saved.add(id));
   }));
+  // A line still waiting for Confirm reads Include in the browser copy; the saved draft holds it as excluded.
+  rows.forEach((row) => { if (row.reincluded_catalog_selection) saved.add(row.source_basis_line_id); });
   state.savedExclusions = { sessionId, ids: saved };
 }
 
@@ -13224,7 +13241,7 @@ function applyBasisTag(sectionId, nextTag, lineIndex = null, group = null) {
   // Read every row through one index, then release it before state changes and the re-render.
   const plan = withBasisPricingIndex(() => planBasisTagChanges(sectionId, nextTag, lineIndex, group));
   if (!plan) return;
-  const { sections, deferralChanged, reinclusionChanged, pricingChanges, changedLineIds } = plan;
+  const { sections, deferralChanged, pricingChanges, changedLineIds } = plan;
   const outputsCleared = deferralChanged && Boolean(state.outputRows.length || state.originalOutputRows.length);
   if (pricingChanges.size) {
     state.lineItems = [...state.lineItems.filter((row) => !pricingChanges.has(row.source_basis_line_id)), ...pricingChanges.values()];
@@ -13235,6 +13252,9 @@ function applyBasisTag(sectionId, nextTag, lineIndex = null, group = null) {
   }
   state.quoteBasisSections = sections;
   state.quoteBasis = quoteBasisFromSections(sections);
+  const rows = currentReinclusionRows();
+  const reinclusionChanged = plan.reinclusionChanged || rows !== state.lineItems;
+  state.lineItems = rows;
   state.basisConfirmed = false;
   markOutputRowsDirty();
   // Clearing Output can move other lines between groups, so that redraws the whole card.
@@ -13275,10 +13295,6 @@ function planBasisTagChanges(sectionId, nextTag, lineIndex = null, group = null)
     if (reincluded) {
       reinclusionChanged = true;
       pricingChanges.set(reincluded.source_basis_line_id, reincluded);
-    }
-    if (nextTag === "Exclude" && row?.reincluded_catalog_selection) {
-      reinclusionChanged = true;
-      pricingChanges.set(row.source_basis_line_id, withoutReincludedSelection(row));
     }
     const customPricing = isCustomPricingBasisLine(line) || resolvedTag === "Custom";
     const customConfirmed = customPricing && nextTag !== "Exclude";
@@ -14927,7 +14943,7 @@ async function refreshLineItemsFromServer({ waitForPaint = false } = {}) {
   state.pricingIssues = (Array.isArray(result.data.selections) ? result.data.selections : [])
     .filter((entry) => entry?.status === "refused" && typeof entry.source_basis_line_id === "string" && pricingSelectionRefusalReason(entry.reason))
     .map((entry) => ({ source_basis_line_id: entry.source_basis_line_id, reason: entry.reason }));
-  state.lineItems = retainExcludedBasisPricingRows(acknowledgedRows || result.data.line_items.map(normalizeLineItem));
+  state.lineItems = retainExcludedBasisPricingRows(acknowledgedRows || result.data.line_items.map(normalizeLineItem), { confirmed: true });
   state.outputRows = [];
   state.outputErrors = [];
   if (hold) saveSessionState();
@@ -17096,18 +17112,17 @@ async function modifyDashboardQuote(sessionId, options = {}) {
   }
 }
 
-function copiedQuotePricingRow(row, normalizer = normalizeLineItem) {
-  if (row?.pricing_authority?.variant !== "catalog") {
+function copiedQuotePricingRow(sourceRow, normalizer = normalizeLineItem) {
+  // The copy has no saved price to restore, so a line still waiting for Confirm stays excluded in it.
+  const row = withoutReincludedSelection(sourceRow);
+  if (row.pricing_authority?.variant !== "catalog") {
     const copied = { ...row };
-    delete copied.reincluded_catalog_selection;
     delete copied.unmatched_pricing_offer;
     delete copied.deferred_pricing;
     return copied;
   }
   const unbound = { ...row, pricing_keyword: "", catalog_description: "", pricing_reference_description: "", status: "unmatched" };
   delete unbound.pricing_authority;
-  // The copy has no saved price to restore, so a line still waiting for Confirm stays excluded in it.
-  delete unbound.reincluded_catalog_selection;
   // Reuse legacy recovery's price demotion. Source prices are evidence only;
   // this quote's explicit confirmation must obtain its own server grants.
   return normalizeRestoredPricingRow(unbound, normalizer);
