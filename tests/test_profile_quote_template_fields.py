@@ -60,7 +60,7 @@ class ProfileQuoteTemplateFieldsTest(unittest.TestCase):
         for choice in ("default", "standard", "tpl-" + "0a" * 16):
             with self.subTest(choice=choice):
                 self.assertEqual(s.normalize_profile_payload({**profile(), "quote_template_id": choice})["quote_template_id"], choice)
-        for choice in ("", "Standard", "tpl-XYZ", "../tpl", 3, None, ["standard"]):
+        for choice in ("", "own", "Standard", "tpl-XYZ", "../tpl", 3, None, ["standard"]):
             with self.subTest(choice=choice), self.assertRaisesRegex(ValueError, "Quote template choice is invalid"):
                 s.normalize_profile_payload({**profile(), "quote_template_id": choice})
         self.assertNotIn("quote_template_id", s.normalize_profile_payload(profile()))

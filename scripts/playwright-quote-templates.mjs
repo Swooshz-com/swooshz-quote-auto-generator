@@ -578,6 +578,7 @@ try {
   await page.locator("#presetStatus").getByText('"Synthetic Own Layout" will use Standard for new quotes.').waitFor();
   await settled();
   assert.equal(await field.inputValue(), "standard");
+  assert.equal(await field.locator("option[value=own]").innerText(), "Profile's own layout");
   await shot(page, "profile-own-layout", "#quoteCompanyPanel");
   await page.evaluate(async () => { await loadProfiles(); renderPresetOptions(); }); // also after the page reads it again
   await page.locator("#presetSelect").selectOption(`company:${own.id}`);

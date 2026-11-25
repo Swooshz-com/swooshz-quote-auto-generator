@@ -436,6 +436,10 @@ class QuoteTemplateEditorEndpointsTest(permissions_test.QuoteTemplatePermissions
         self.assertEqual(choose(operator, shared["id"], "own", revision + 1)[0], 404)
         self.assertEqual(stored(shared["id"]), before)
         self.assertIs(listed(operator, shared["id"])["own_layout"], True)
+        # The mark itself stays with the stored row: not in what the page gets, nor in what a quote records.
+        self.assertIs(before["_own_layout"], True)
+        self.assertNotIn("_own_layout", listed(admin, shared["id"]))
+        self.assertNotIn("_own_layout", inspection.profile_detail(shared["id"], source="company"))
         self.assertEqual(choose(admin, shared["id"], "own", revision + 1)[0], 200)
 
         # A profile created without a workbook has nothing to go back to: not offered, not accepted.
