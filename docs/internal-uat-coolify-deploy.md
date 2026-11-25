@@ -451,12 +451,26 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      it was unlocked, with `next_saves`, the saves the Next press alone
      made. Any other lock fails the probe with those facts, without pressing
      Next: another checkpoint field that also differs, a missing checkpoint,
-     a pending pricing-reference change, a lock Next does not clear, or a
-     Next that would ask to confirm changed inputs. Such a lock would show on
+     a pending pricing-reference change, or a Next that would ask to confirm
+     changed inputs. A lock that Next does not clear fails it after the press,
+     with the facts after it (`after_next`). Such a lock would show on
      live too, so that failure goes to the controller as a hold. Its exact counts
      (browser storage writes, IndexedDB puts, renders, rebuilt rows, bytes
      copied, saves per burst) fail the walk; its timings are recorded only,
-     because the laptop's speed varies. Pass A passes only if all three
+     because the laptop's speed varies. The byte budgets come from the sizes
+     the step records: a click may serialise the quote's browser copy once
+     (on a reopened quote that copy also holds the restore key, so it is
+     about twice the draft) and a save the draft six times and the copy once,
+     so a second copy fails. Those sizes have limits of their own: the draft at
+     most 1.75 times the quote as the server holds it (`saved_quote_bytes`),
+     the copy and the restore key that draft once each, the workspace view 4
+     KiB. A quote save must be sent within 1.5 s of the last click; only its
+     answer may be later. A click on a line already in that state is
+     recorded in `clicks_with_nothing_to_change`; one that changes nothing
+     although a line was not in that state fails. Both quotes are probed even
+     when the first fails, and a failed step keeps all its facts in its
+     `detail` (sizes, budgets, lock, samples, every failure in `failures`);
+     its `error` is cut. Pass A passes only if all three
      checks pass, `pass-a-targets.json` lists the same ids as
      `walk-targets.json`, in any order, and `copy-app.js` has the same hash as
      `rehearsal-app.js`. Any failure holds promotion. Keep the copy up for
@@ -475,8 +489,10 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      Expect every quote saved on live to reopen with Quote Basis locked
      until Next in Customer is pressed: the copy's `SESSION_SECRET` differs
      from live's (see the Pass A walk above). Only that lock is expected,
-     the one Pass A records as `copy_only`; a quote Pass A failed with any
-     other lock, or a lock that stays after Next in Customer, is a failure.
+     the one Pass A records as `copy_only` in the `basis_lock` of each walked
+     quote; a quote locked there without `copy_only`, a quote Pass A failed
+     with any other lock, or a lock that stays after Next in Customer, is a
+     failure.
    - **Hand-off message**, from the acting thread to the owner:
 
      > The test app is ready for your UAT: https://quote-rehearsal-copy.<server-ip>.sslip.io.
