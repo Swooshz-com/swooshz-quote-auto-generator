@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,8 @@ from webapp import server as s
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# What a Windows child process needs when a test replaces the whole environment.
+WINDOWS_PROCESS_ENV = {name: os.environ[name] for name in ("SystemRoot", "ComSpec", "PATHEXT") if name in os.environ}
 
 
 def definition(name, *, total_label=None):
@@ -324,6 +327,76 @@ class DatabaseProfileTemplateTest(unittest.TestCase):
         self.assertEqual((result["quote_template"]["id"], result["quote_template"]["note"]),
                          ("standard", s.QUOTE_TEMPLATE_DELETED_NOTE))
         self.assertEqual(captured["template"], quote_template.load_standard_quote_template())
+
+    def generate_for_real(self, profile_id):
+        """The real generator on a stored profile; returns the workbook and the PDF made from it.
+
+        The generator finds its PDF converter on PATH. Here it is a small program whose "PDF" lists the
+        workbook parts it was given, so two PDFs are equal exactly when they were made from equal workbooks.
+        """
+        tools = self.root / "tools"
+        if not tools.is_dir():
+            tools.mkdir()
+            script = tools / "fake_converter.py"
+            script.write_text(
+                "import hashlib, pathlib, sys, zipfile\n"
+                "source = pathlib.Path(sys.argv[-1]); out = pathlib.Path(sys.argv[sys.argv.index('--outdir') + 1])\n"
+                "book = zipfile.ZipFile(source)\n"
+                "parts = [name + ' ' + hashlib.sha256(book.read(name)).hexdigest() for name in sorted(book.namelist())]\n"
+                "(out / (source.stem + '.pdf')).write_bytes(b'%PDF-1.4\\n' + '\\n'.join(parts).encode() + b'\\n%%EOF\\n')\n",
+                encoding="utf-8")
+            if os.name == "nt":
+                (tools / "soffice.cmd").write_text(f'@"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
+            else:
+                launcher = tools / "soffice"
+                launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n', encoding="utf-8")
+                launcher.chmod(0o755)
+        payload = tw.payload_with_workspace_pricing("workspace-pricing")
+        payload["profile_id"] = profile_id
+        for key in ("company", "tax", "quote_text", "signature", "rich_text"):
+            payload.pop(key, None)
+        payload["line_items"] = [{
+            "section": "Graphics", "quantity": 3, "unit": "sqm", "description": "Workspace printed graphics",
+            "pricing_keyword": "workspace-row", "source_basis_line_id": "switch-back-row",
+        }]
+        tw.with_server_analysis_seal(payload, self.session)
+        shutil.rmtree(self.root / "out", ignore_errors=True)
+        with mock.patch.dict(os.environ, {**WINDOWS_PROCESS_ENV, "PATH": str(tools)}):
+            result = s.run_quote_job(payload, output_root=self.root / "out", tmp_root=self.root / "tmp",
+                                     auth_session=self.session, pdf_mode="workbook")
+        self.assertEqual(result["status"], "completed", result)
+        output = Path(result["output_dir"])
+        return result, members(output / "quotation.xlsx"), (output / "quotation.pdf").read_bytes()
+
+    def test_switching_back_gives_the_same_excel_and_pdf_as_an_untouched_profile(self):
+        saved = self.store.create(definition("Linked look", total_label="Linked total"))
+        for profile_id in ("untouched-profile", "switched-profile"):
+            self.storage.save_profile(tw.workspace_profile_with_layout(profile_id))
+        untouched, untouched_book, untouched_pdf = self.generate_for_real("untouched-profile")
+        self.assertNotIn("quote_template", untouched)
+        self.assertTrue(untouched_pdf.startswith(b"%PDF-1.4"))
+
+        changed = self.storage.change_profile_quote_template("switched-profile", saved["id"], revision=1)
+        with_template, template_book, template_pdf = self.generate_for_real("switched-profile")
+        self.assertEqual(with_template["quote_template"]["name"], "Linked look")
+        self.assertNotEqual(template_book, untouched_book)
+        self.assertNotEqual(template_pdf, untouched_pdf)
+
+        self.storage.change_profile_quote_template("switched-profile", s.OWN_LAYOUT_CHOICE, revision=changed["revision"])
+        back, back_book, back_pdf = self.generate_for_real("switched-profile")
+        self.assertNotIn("quote_template", back)
+        self.assertEqual(back_book, untouched_book)
+        self.assertEqual(back_pdf, untouched_pdf)
+
+        # A workbook uploaded to a profile that follows a template is a layout of its own from then on.
+        fresh = tw.workspace_profile_with_layout("fresh-profile")
+        layout = {key: fresh.pop(key) for key in ("_pack_assets", "pack", "profile_pack") if key in fresh}
+        created = self.storage.save_profile(fresh, operation="create")
+        self.assertIs(created["own_layout"], False)
+        uploaded = self.storage.save_profile({**fresh, **layout, "id": created["id"]}, operation="update", revision=1)
+        self.assertEqual((uploaded["own_layout"], uploaded["quote_template_id"]), (True, "default"))
+        self.storage.change_profile_quote_template(created["id"], s.OWN_LAYOUT_CHOICE, revision=2)
+        self.assertNotIn("quote_template", self.generate_for_real(created["id"])[0])
 
     def test_profiles_with_their_own_workbook_stay_legacy_and_new_ones_follow_the_default(self):
         self.storage.save_profile(tw.workspace_profile_with_layout("legacy-profile"))

@@ -2,11 +2,14 @@
 """Loopback-only synthetic password login harness; never loads host dotenv values.
 
 Usage: internal_password_browser_harness.py <repo root> [data output tmp logs pricing]
-       [--storage file|database]
+       [--storage file|database|sqlite]
 
 --storage database runs the app in live's storage modes (database metadata on a
 disposable PostgreSQL database, object artifacts on an in-memory object store);
-see tests/disposable_database_mode.py. The default is file storage.
+see tests/disposable_database_mode.py. --storage sqlite keeps metadata and
+artifacts in a new SQLite file under the tmp folder with every migration applied
+(for features, such as quote templates, that need database storage but no
+PostgreSQL server). The default is file storage.
 """
 from __future__ import annotations
 import json
@@ -116,8 +119,8 @@ def parse_storage(argv):
     storage = "file"
     if "--storage" in args:
         index = args.index("--storage")
-        if index + 1 >= len(args) or args[index + 1] not in {"file", "database"}:
-            raise SystemExit("--storage must be file or database")
+        if index + 1 >= len(args) or args[index + 1] not in {"file", "database", "sqlite"}:
+            raise SystemExit("--storage must be file, database or sqlite")
         storage = args[index + 1]
         del args[index:index + 2]
     return storage, args
@@ -150,6 +153,19 @@ def configure_database_storage(settings):
     return database
 
 
+def configure_sqlite_storage():
+    """Point the app at a new SQLite database with every migration applied."""
+    tmp_root = Path(os.environ.get("QUOTE_TMP_ROOT") or ROOT / "_tmp")
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    path = tmp_root / f"browser-harness-{os.getpid()}.sqlite3"
+    if path.exists():
+        path.unlink()
+    url = "sqlite:///" + path.as_posix()
+    webapp.apply_sqag_storage_migrations(url)
+    os.environ.update({"SQAG_STORAGE_MODE":"database", "SQAG_ARTIFACT_STORAGE_MODE":"database", "SQAG_DATABASE_URL":url})
+    return path
+
+
 def main():
     storage, argv = parse_storage(sys.argv)
     settings = None
@@ -163,10 +179,12 @@ def main():
         os.environ.update({"QUOTE_DATA_ROOT":argv[2], "QUOTE_OUTPUT_ROOT":argv[3], "QUOTE_TMP_ROOT":argv[4], "QUOTE_LOG_ROOT":argv[5], "SQAG_LOCAL_PRICING_REFERENCES_ROOT":argv[6]})
     # SYNTHETIC_WORKSPACE_SETUP
     database = None
-    if storage == "database":
-        # A stop signal unwinds through the finally blocks so the database is dropped.
+    if storage != "file":
+        # A stop signal unwinds through the finally blocks so the database is dropped or its file removed.
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    if storage == "database":
         database = configure_database_storage(settings)
+    sqlite_path = configure_sqlite_storage() if storage == "sqlite" else None
     try:
         clock = HarnessClock()
         server = webapp.ThreadingHTTPServer(("127.0.0.1", 0), HarnessHandler,
@@ -180,6 +198,8 @@ def main():
     finally:
         if database is not None:
             database.drop()
+        if sqlite_path is not None and sqlite_path.exists():
+            sqlite_path.unlink()
     return 0
 
 if __name__ == "__main__":
