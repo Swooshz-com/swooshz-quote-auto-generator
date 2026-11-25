@@ -67,6 +67,13 @@ def main() -> int:
     original_reader = webapp.read_dotenv_value
     webapp.read_dotenv_value = lambda name: 'ordinary-mock-only-no-network' if name == webapp.OPENROUTER_API_KEY_ENV_NAME else original_reader(name)
     webapp.request_openai_quote_basis = owner_mock_provider
+    # A scenario may also answer the pricing import; the reply still passes the import contract.
+    pricing_import = json.loads(scenario_path.read_text(encoding='utf-8')).get('pricing_import')
+    if pricing_import is not None:
+        original_gateway = webapp.configured_ai_gateway
+        webapp.configured_ai_gateway = lambda feature, *args, **kwargs: (
+            None if feature == 'pricing_reference_import' else original_gateway(feature, *args, **kwargs))
+        webapp.request_openai_pricing_catalog_import = lambda *_args, **_kwargs: webapp.PRICING_IMPORT.admit(pricing_import)
     original_cookie_header = webapp.cookie_header_value
     webapp.cookie_header_value = lambda *args, **kwargs: original_cookie_header(
         *args, **kwargs

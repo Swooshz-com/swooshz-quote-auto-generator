@@ -10933,7 +10933,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertIn("printed_graphic", reference["items"][0]["object_families"])
 
     def test_pricing_reference_save_blocks_rows_without_unit_hint(self):
-        with self.assertRaisesRegex(ValueError, "Pricing unit_hint is missing"):
+        with self.assertRaisesRegex(ValueError, "Unit is missing for pricing rows"):
             webapp.normalize_pricing_reference_payload({
                 "id": "missing-unit-ref",
                 "label": "Missing Unit Ref",
@@ -13579,7 +13579,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertIn("change the quoted green carpet line to red", prompt)
         self.assertIn("Apply the revision directly", prompt)
 
-    def test_openai_prompt_requires_default_booth_size_as_confirm_line(self):
+    def test_openai_prompt_never_asks_for_a_booth_size_line(self):
         payload = valid_payload()
         payload["project"].pop("booth_width", None)
         payload["project"].pop("booth_depth", None)
@@ -13588,10 +13588,11 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         prompt = webapp.build_quote_draft_prompt(payload)
 
         self.assertIn('"source": "default"', prompt)
-        self.assertIn("When dimensions use a default booth size", prompt)
         self.assertIn("Do not derive booth dimensions from the quotation title", prompt)
-        self.assertIn("must appear as a Confirm line", prompt)
-        self.assertIn("never as Include", prompt)
+        # The server adds its own default-size reminder under Detected booth (#334).
+        self.assertIn("The booth itself is never a quote line", prompt)
+        self.assertNotIn("must appear as a Confirm line", prompt)
+        self.assertNotIn("Keep pure informational booth-size lines", prompt)
 
     def test_openai_prompt_treats_uploads_as_untrusted_and_protects_secrets(self):
         response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis': {}, 'line_items': []})))
@@ -30733,6 +30734,8 @@ eval([
   "humanizeImportLayoutLabel",
   "pricingReferenceRowIssues",
   "compactPreviewList",
+  "pricingReferenceColumnLabel",
+  "pricingReferenceSkippedRowsText",
   "pricingReferencePreviewAttention",
   "pricingReferencePreviewNextStep",
 ].map(extractFunction).join("\n"));
@@ -30746,8 +30749,8 @@ assert.strictEqual(humanizeImportLayoutLabel("v2-sectioned-pricing-workbook"), "
 const result = {
   items: [
     { warning: "OK" },
-    { warning: "unit_hint required" },
-    { warning: "internal_cost must be positive" },
+    { warning: "unit required" },
+    { warning: "cost required" },
   ],
   missing: ["markup_multiplier"],
   errors: ["Missing required columns: markup_multiplier."],
@@ -30759,8 +30762,8 @@ const attention = pricingReferencePreviewAttention(result, {
   currencyNeedsReview: !isValidCurrencyCode("GAY"),
 });
 
-assert.ok(attention.some((item) => item.label === "Missing required columns" && item.text === "markup_multiplier"));
-assert.ok(attention.some((item) => item.label === "2 rows need edit" && item.text.includes("row 2: unit_hint required")));
+assert.ok(attention.some((item) => item.label === "Missing required columns" && item.text === "Markup (markup_multiplier)"));
+assert.ok(attention.some((item) => item.label === "2 rows need edit" && item.text.includes("row 2: unit required")));
 assert.ok(!attention.some((item) => item.label === "Currency review"));
 assert.ok(attention.some((item) => item.label === "Skipped rows" && item.text.includes("2 rows were skipped")));
 assert.strictEqual(pricingReferencePreviewNextStep(result, attention), "Fix the flagged import issues, then review the rows again.");
@@ -30866,7 +30869,7 @@ const state = {
       remarks: "COFFEE PER DAY",
       match_terms: "coffee tea service",
       object_families: "coffee_service",
-      warning: "unit_hint required",
+      warning: "unit required",
     }],
     errors: [],
   },
@@ -30929,7 +30932,7 @@ eval([
   "refreshPricingReferencePreviewValidity",
 ].map(extractFunction).join("\n"));
 
-assert.strictEqual(state.pendingPricingReference.items[0].warning, "unit_hint required");
+assert.strictEqual(state.pendingPricingReference.items[0].warning, "unit required");
 state.pendingPricingReference.items[0].unit_hint = "nos";
 assert.strictEqual(refreshPricingReferencePreviewValidity(state.pendingPricingReference), true);
 assert.strictEqual(state.pendingPricingReference.items[0].warning, "OK");

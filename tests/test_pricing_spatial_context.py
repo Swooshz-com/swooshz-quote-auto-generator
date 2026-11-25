@@ -41,7 +41,8 @@ class PricingSpatialContextTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         evidence = json.loads(result.stdout)
         self.assertEqual(evidence['status'], 'PASS')
-        self.assertEqual(evidence['selectionStatuses'], [200, 409, 200, 200])
+        # The stale tab is refused by the save that now precedes its selection, so no selection request is stale.
+        self.assertEqual(evidence['selectionStatuses'], [200, 200, 200])
         self.assertEqual(evidence['spatialBeforeConfirm']['price'], None)
         self.assertEqual(evidence['saveReopen'], 'PASS')
         self.assertEqual(evidence['excludedReopen'], 'PASS')
@@ -327,7 +328,7 @@ class PricingSpatialContextTest(unittest.TestCase):
                      'duplicate', 'mixed', 'mixed-ordinary-refused', 'legacy', 'legacy-no-ledger', 'legacy-forged',
                      'legacy-missing-seal', 'legacy-stale-seal',
                      'legacy-digest', 'legacy-reference-id', 'legacy-source', 'legacy-unit',
-                     'legacy-item', 'legacy-quantity', 'legacy-duplicate', 'legacy-alias-row', 'legacy-wrong-scope',
+                     'legacy-pending', 'legacy-no-ledger-pending', 'legacy-pending-included', 'legacy-item', 'legacy-quantity', 'legacy-duplicate', 'legacy-alias-row', 'legacy-wrong-scope',
                      'legacy-incoming-reference-id', 'legacy-incoming-digest', 'legacy-top-level-digest'):
             with self.subTest(case=case):
                 payload, item = self.selection_payload('Synthetic cafe chairs at the synthetic round tables')
@@ -393,10 +394,11 @@ class PricingSpatialContextTest(unittest.TestCase):
                     saved['pricing_ledger']['analysis'] = {'issued_at': seal['issued_at'] + 1}
                     saved = webapp.write_quote_session_metadata(saved)
                     acknowledged = storage.get_quote_session(session_id, include_draft_state=True)
-                if case == 'legacy-no-ledger':
+                if case in ('legacy-no-ledger', 'legacy-no-ledger-pending'):
                     saved.pop('pricing_ledger')
                     webapp.write_quote_session_metadata(saved)
                     acknowledged = storage.get_quote_session(session_id, include_draft_state=True)
+                if case == 'legacy-no-ledger':
                     # Recovery authority comes from saved evidence, even if the browser omits it.
                     payload['quote_session']['draft_state']['originalAnalysisSnapshot'].pop('pricing_analysis_seal')
                 if case == 'reference':
@@ -408,6 +410,16 @@ class PricingSpatialContextTest(unittest.TestCase):
                 payload['quote_basis_sections'] = copy.deepcopy(saved['draft_state']['quoteBasisSections'])
                 if case.startswith('legacy'):
                     payload['line_items'] = recovered
+                if case in ('legacy-pending', 'legacy-no-ledger-pending', 'legacy-pending-included'):
+                    # The tick is saved before Confirm (Dashboard, leaving, autosave): the row as it was
+                    # excluded, with the tick on it. Saving it as included would end the proof.
+                    pending = copy.deepcopy(payload)
+                    pending['line_items'][0]['reincluded_catalog_selection'] = 'synthetic-browser-intent'
+                    if case == 'legacy-pending-included':
+                        self.fixture._ledger_line(pending, row_id)['tag'] = 'Include'
+                    self.fixture._ledger_sync(pending)
+                    acknowledged = storage.create_or_update_quote_session(pending)
+                    saved = webapp.read_quote_session_metadata(session_id)
                 if case.startswith('other-tab'):
                     newer = copy.deepcopy(payload)
                     newer_line = self.fixture._ledger_line(newer, row_id)
@@ -438,7 +450,7 @@ class PricingSpatialContextTest(unittest.TestCase):
                     line['text'] += ' for another position'
                 if case == 'current':
                     payload['line_items'][0]['catalog_unit_price'] = 999
-                if case in ('current', 'legacy', 'legacy-no-ledger'):
+                if case in ('current', 'legacy', 'legacy-no-ledger', 'legacy-pending', 'legacy-no-ledger-pending'):
                     payload['line_items'][0]['reincluded_catalog_selection'] = 'synthetic-browser-intent'
                 if case == 'duplicate':
                     payload['line_items'].append(copy.deepcopy(payload['line_items'][0]))
@@ -464,7 +476,7 @@ class PricingSpatialContextTest(unittest.TestCase):
                                           'expected_revision': 0})
                 self.assertIsNone(self.fixture._ledger_price(webapp.normalize_line_items_for_quote_basis_review(payload), row_id))
                 persisted = webapp.read_quote_session_metadata(session_id)
-                if case in ('current', 'legacy', 'legacy-no-ledger', 'mixed-ordinary-refused'):
+                if case in ('current', 'legacy', 'legacy-no-ledger', 'legacy-pending', 'legacy-no-ledger-pending', 'mixed-ordinary-refused'):
                     with mock.patch.object(webapp, 'write_quote_session_metadata', wraps=webapp.write_quote_session_metadata) as writes:
                         result = webapp.apply_pricing_selections(payload, selections, storage)
                         self.assertEqual(writes.call_count, 1)
@@ -525,6 +537,14 @@ const retainExcludedBasisPricingRows = (rows) => rows;
 const clearQuoteSessionDraftSaveTimer = () => ({});
 const saveSessionState = () => recoveryCopies.push(structuredClone(state));
 const queueQuoteSessionDraftStateSave = () => assert.fail("unsafe autosave");
+const recordSavedExclusions = () => {};
+const withoutReincludedSelection = ({ reincluded_catalog_selection, ...row }) => row;
+let draftSaves, draftSaveAnswer;
+const saveQuoteSessionDraftState = async ({ saveFailure }) => {
+  draftSaves += 1;
+  if (draftSaveAnswer.failure) saveFailure.failure = draftSaveAnswer.failure;
+  return draftSaveAnswer.session;
+};
 const postJson = async (path, payload) => {
   assert.equal(path, "/api/quote-sessions/pricing-selections");
   calls.push(payload);
@@ -551,6 +571,8 @@ function setup(count, ordinary = 0, version = baseline) {
       ? {...row, pricing_authority: {variant: "none"}} : {...row, reincluded_catalog_selection: row.source_basis_line_id}),
     quoteBasisSections: [{lines: ids.map((id) => ({id, tag: "Include", pricing_keyword: "synthetic-item"}))}]};
   calls = [];
+  draftSaves = 0;
+  draftSaveAnswer = { session: { session_id: sessionId } };
   recoveryCopies = [];
   quoteSessionDraftSaveTimer = null;
 }
@@ -560,6 +582,7 @@ function setup(count, ordinary = 0, version = baseline) {
     assert((await refreshLineItemsFromServer()).ok);
     assert.equal(calls.length, 1);
     assert.equal(calls[0].expected_draft_version, baseline);
+    assert.equal(draftSaves, 1, "the draft on screen is saved before its re-included lines are sent");
     assert.equal(calls[0].pricing_selections.length, count);
     assert.equal(calls[0].pricing_selections.filter((entry) => entry.reinclude).length, count - ordinary);
     assert.equal(state.pricingDraftVersion, acknowledged);
@@ -585,7 +608,7 @@ function setup(count, ordinary = 0, version = baseline) {
   assert((await refreshLineItemsFromServer()).ok);
   assert.equal(state.pricingDraftVersion, baseline);
   for (const failure of ["stale", "unknown-reason", "refused-reinclude", "wrong-id", "stale-revision",
-    "malformed-revision", "missing-data", "network", "no-baseline", "invalid-batch", "missing-row",
+    "malformed-revision", "missing-data", "network", "refused-with-unknown-row", "refused-with-stale", "no-baseline", "invalid-batch", "missing-row",
     "ordinary-authority", "ordinary-item", "ordinary-duplicate", "ordinary-refusal-conflicts", "same-version-advanced"]) {
     setup(failure === "invalid-batch" ? 201 : 2, 1, failure === "no-baseline" ? "" : baseline);
     const ledger = response.data.quote_session.pricing_ledger;
@@ -602,6 +625,9 @@ function setup(count, ordinary = 0, version = baseline) {
     if (failure === "ordinary-duplicate") response.data.line_items.push(structuredClone(response.data.line_items[0]));
     if (failure === "ordinary-refusal-conflicts") Object.assign(response.data.selections[0], {status: "refused", reason: "unit_review_required"});
     if (failure === "stale") response = {ok: false, status: 409, data: {...response.data, status: "conflict"}};
+    if (failure.startsWith("refused-with")) response = {ok: false, status: 409, data: {status: "conflict", selections: [
+      {source_basis_line_id: "synthetic-row-1", status: "refused", reason: failure === "refused-with-stale" ? "stale" : "ineligible"},
+      ...(failure === "refused-with-unknown-row" ? [{source_basis_line_id: "synthetic-row-9", status: "refused", reason: "ineligible"}] : [])]}};
     if (failure === "network") response = {ok: false, data: {fetch_failed: true}};
     if (failure === "invalid-batch") response = {ok: false, status: 400, data: {status: "blocked"}};
     const before = structuredClone(state.lineItems);
@@ -613,6 +639,33 @@ function setup(count, ordinary = 0, version = baseline) {
     assert.equal(calls.length, failure === "no-baseline" ? 0 : 1);
     if (failure === "invalid-batch") assert.equal(calls[0].pricing_selections.length, 201);
   }
+  // Refused before anything was saved: the version and every line stay, only the refused row loses its selection.
+  setup(3, 1);
+  response = {ok: false, status: 409, data: {status: "conflict", selections: [
+    {source_basis_line_id: "synthetic-row-2", status: "refused", reason: "reference_changed"}]}};
+  const refused = await refreshLineItemsFromServer();
+  assert.deepEqual(refused.data.refused_reinclusions, [{source_basis_line_id: "synthetic-row-2", reason: "reference_changed"}]);
+  assert.equal(state.pricingDraftVersion, baseline);
+  assert.deepEqual(state.pricingIssues, refused.data.refused_reinclusions);
+  assert.deepEqual(state.lineItems.map((row) => Boolean(row.reincluded_catalog_selection)), [false, true, false]);
+  assert.equal(recoveryCopies.at(-1).pricingDraftVersion, baseline);
+  // A draft that cannot be saved holds Confirm with that reason; nothing is sent and the lines stay.
+  setup(2, 1);
+  draftSaveAnswer = { session: null, failure: { status: 0, fetch_failed: true } };
+  const unsaved = await refreshLineItemsFromServer();
+  assert.equal(unsaved.ok, false);
+  assert.equal(unsaved.data.quote_session_save_failure.fetch_failed, true);
+  assert.equal(calls.length, 0);
+  assert.equal(state.pricingDraftVersion, baseline);
+  assert(state.lineItems[1].reincluded_catalog_selection);
+  // A line changed beyond its quantity after the tick goes to Confirm as an ordinary line, not as a dead end.
+  setup(2, 1);
+  state.quoteBasisSections[0].lines[1].tag = "Custom";
+  state.quoteBasisSections[0].lines[1].custom_pricing = true;
+  response.data.selections = response.data.selections.slice(0, 1);
+  await refreshLineItemsFromServer();
+  assert.deepEqual(calls[0].pricing_selections.map((entry) => entry.source_basis_line_id), ["synthetic-row-0"]);
+  assert.notEqual(state.pricingDraftVersion, false);
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """
         result = subprocess.run([fixtures.require_node(self), '-'], input=harness, text=True, capture_output=True,
