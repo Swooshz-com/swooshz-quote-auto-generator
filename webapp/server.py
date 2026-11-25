@@ -26672,6 +26672,7 @@ def rescaled_footprint_text(value: Any, old_area: float, new_area: float) -> Any
         name, detail = reference
         return f"[ {name} ] - {rescaled_footprint_text(detail, old_area, new_area)}" if detail else value
     prefix = leading_quantity_prefix(value)
+    prefix = prefix if prefix and footprint_quantity_matches(prefix["quantity"], old_area) else None
     pattern = rf"(?<![\d.]){re.escape(format_dimension(old_area))}(?:\.0+)?(\s*(?:sqm|sq\.?\s*m\b|m2|m\u00b2))"
     text = re.sub(pattern, lambda match: f"{format_dimension(new_area)}{match.group(1)}", prefix["text"] if prefix else value, flags=re.IGNORECASE)
     return f"{format_dimension(new_area)} {prefix['unit']} {text}" if prefix else text
@@ -26789,8 +26790,8 @@ def staff_footprint_rescale(
         if not footprint_quantity_matches(row.get("quantity"), ai_area):
             return False
         texts = {key: rescaled_footprint_text(row[key], ai_area, staff_area) for key in ("text", "description") if key in row}
-        # The server reads a row's leading count from its text: where that cannot be the new size, the row stays as drafted.
-        if any(read and read["quantity"] != staff_quantity for read in map(row_text_measurement, texts.values())):
+        # The server reads a row's leading count from its text: where that would still be the old size, the row stays as drafted.
+        if any(read and footprint_quantity_matches(read["quantity"], ai_area) for read in map(row_text_measurement, texts.values())):
             return False
         # A predicted size keeps its Est. mark at the new size (owner: predicted quantities always show Est.).
         estimate = normalized_quantity_estimate(row.get("quantity_estimate"))
