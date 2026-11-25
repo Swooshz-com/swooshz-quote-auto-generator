@@ -197,7 +197,7 @@ class QuoteTemplateStoreContract:
         with mock.patch.dict(os.environ, {s.QUOTE_TEMPLATE_LIMIT_ENV_NAME: "1"}):
             self.assertEqual(theirs.create(definition("Their one"))["name"], "Their one")
 
-    def test_names_defaults_and_profile_counts_stay_in_their_workspace(self):
+    def test_names_and_defaults_stay_in_their_workspace(self):
         mine, theirs = self.store(), self.store("workspace-other")
         saved, other = mine.create(definition("Mine")), theirs.create(definition("Theirs"))
 
@@ -227,10 +227,6 @@ class QuoteTemplateStoreContract:
         self.assertEqual(theirs.list(), before)
         mine.update(saved["id"], definition("Mine v2"), 1)
         self.assertEqual((mine.get(saved["id"])["name"], theirs.get(saved["id"])["name"]), ("Mine v2", "Same id"))
-        # How many profiles use a template counts this workspace's profiles only.
-        self.storage("workspace-other")._upsert_payload("sqag_profiles", "profile_id", "synthetic-theirs", {
-            "id": "synthetic-theirs", "quote_template_id": saved["id"]})
-        self.assertEqual((mine.usage("standard"), theirs.usage("standard")), ({}, {saved["id"]: 1}))
         mine.delete(saved["id"], 2)
         self.assertEqual((names(mine), [name for name, _ in names(theirs)]), ([], [record["name"] for record in before]))
 
@@ -247,6 +243,14 @@ class SqliteQuoteTemplateStoreTest(QuoteTemplateStoreContract, unittest.TestCase
 
     def storage(self, workspace=WORKSPACE):
         return s.DatabaseSqagStorage(self.url, workspace, "admin", "admin-user")
+
+    # SQLite only: in the PostgreSQL fixture the runtime role holds migration 013's grants, not those on profiles.
+    def test_profile_counts_stay_in_their_workspace(self):
+        mine, theirs = self.store(), self.store("workspace-other")
+        saved = mine.create(definition("Mine"))
+        self.storage("workspace-other")._upsert_payload("sqag_profiles", "profile_id", "synthetic-theirs", {
+            "id": "synthetic-theirs", "quote_template_id": saved["id"]})
+        self.assertEqual((mine.usage("standard"), theirs.usage("standard")), ({}, {saved["id"]: 1}))
 
     def test_before_migration_013_templates_are_off_and_quotes_fall_back(self):
         with self.storage().connection() as connection:
