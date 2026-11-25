@@ -1266,20 +1266,25 @@ async function openQuoteBasis(page, stubbed, facts) {
   await page.locator("#quoteBasisButton").click();
 }
 
+// The opened quote's draft against the one the server holds, which the app under test did not write
+// (the copy's quotes were saved on live): opening fills in missing fields, a second copy would double it.
+const OPENED_DRAFT_RATIO = 1.75;
+
 async function clickBudgetOnQuote(run, sessionId) {
   // Filled as the probe goes and kept in the result file whether the step passes or fails:
   // sizes, counts, reason codes and checkpoint field names, never quote text.
   const facts = { id: sessionId, failures: [] };
   const stubbed = [];
+  const pageErrors = [];
   let context;
   try {
     const readback = await quoteSession(run, sessionId);
     facts.lines = derivedReasons(readback).lines;
+    facts.saved_quote_bytes = JSON.stringify(readback.draft_state ?? null).length;
     const { cookies } = await run.context.storageState();
     context = await run.browser.newContext({ storageState: { cookies, origins: [] } });
     await context.route("**/*", saveStub(run, readback, stubbed));
     const page = await context.newPage();
-    const pageErrors = [];
     page.on("pageerror", (error) => pageErrors.push(error.name));
     const quotePosts = [];
     page.on("request", (request) => {
@@ -1295,13 +1300,14 @@ async function clickBudgetOnQuote(run, sessionId) {
     await openQuoteBasis(page, stubbed, facts);
     await page.locator("#basisReviewSurface li[data-basis-key]").first().waitFor({ state: "visible", timeout: 30000 });
     const check = (ok, message, detail) => { if (!ok) facts.failures.push(scrubText(message + (detail === undefined ? "" : ": " + JSON.stringify(detail)))); };
-    await probeOpenQuote(page, { quotePosts, facts, check });
+    await probeOpenQuote(page, { quotePosts, facts, check, draftLimit: Math.floor(OPENED_DRAFT_RATIO * facts.saved_quote_bytes) });
     check(pageErrors.length === 0, "the page threw errors", pageErrors);
     assert(facts.failures.length === 0, `Click budget, ${facts.failures.length} failure(s): ${facts.failures.join("; ")}`);
     return facts;
   } catch (error) {
     throw Object.assign(error, { stepFacts: facts });
   } finally {
+    facts.page_errors = pageErrors.map((name) => scrubText(name));
     facts.stubbed_saves = stubbedQuoteSaves(stubbed);
     facts.stubbed_other = stubbed.length - stubbedQuoteSaves(stubbed);
     await context?.close().catch(() => {});

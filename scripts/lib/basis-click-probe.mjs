@@ -4,8 +4,9 @@
 // on the copy of live). The page functions it reads (state, renderQuoteBasisMessage,
 // QUOTE_SESSION_STORAGE_KEY) are the app's own globals in webapp/static/app.js.
 
-// A deferred quote save is armed 650 ms after a click; 1.5 s covers it. Work before the
-// 400 ms mark belongs to the click itself.
+// A deferred quote save is armed 650 ms after a click, so it must be sent within 1.5 s of the last
+// click; only its answer may come later (a slow server), and the sample waits for that. Work before
+// the 400 ms mark belongs to the click itself.
 export const CLICK_WINDOW_MS = 1500;
 export const CLICK_PHASE_MS = 400;
 
@@ -20,48 +21,57 @@ export const CLICK_COUNT_BUDGET = Object.freeze({
   encodedBytesPerClick: 16 * 1024,
 });
 
-// What one click and one save of this quote write, measured before the first measured click with
-// the app's own functions, so nothing the clicks do can raise a budget. A reopened quote's browser
-// copy also holds the dashboard-restore key (a JSON string of the whole draft), so it is about twice
-// the draft; a quote that was never reopened holds the draft once.
+// The sizes of the open quote, measured before the first measured click, so nothing the clicks do can
+// raise a budget. A reopened quote's browser copy also holds the dashboard-restore key (a JSON string
+// of the whole draft), so it is about twice the draft; a quote never reopened holds the draft once.
 export function measureQuoteSizes(page) {
   return page.evaluate(() => {
     const chars = (value) => (JSON.stringify(value) ?? "").length;
+    const draft = currentQuoteSessionDraftState();
     const snapshot = buildSessionSnapshot();
     return {
-      quote_bytes: chars(currentQuoteSessionDraftState()), browser_copy_bytes: chars(snapshot),
-      restored_key_bytes: chars(snapshot.quoteSessionRestoredDraftKey), sections_bytes: chars(state.quoteBasisSections),
-      basis_bytes: chars(snapshot.quoteBasis), view_bytes: chars(buildWorkspaceViewSnapshot()),
+      quote_bytes: chars(draft), quote_as_text_bytes: chars(JSON.stringify(draft)), sections_bytes: chars(draft.quoteBasisSections), basis_bytes: chars(draft.quoteBasis),
+      browser_copy_bytes: chars(snapshot), restored_key_bytes: chars(snapshot.quoteSessionRestoredDraftKey), view_bytes: chars(buildWorkspaceViewSnapshot()),
     };
   });
 }
 
-// The small calls of one click or save (per-row pricing checks, file keys, the post's own fields):
-// at most 3,700 characters a click on the two largest real quotes and 2,700 a save in CI.
+// The small calls of one click or save (the view, per-row pricing checks, file keys, the post's own
+// fields): at most 4,400 characters a click on the two largest real quotes and 3,400 a save in CI.
 export const SMALL_CALLS_BYTES = 16 * 1024;
+// What the browser copy holds besides the draft and the restore key (ledger revisions, ids): 920 to 2,270.
+export const COPY_EXTRA_BYTES = 8 * 1024;
+// The workspace view holds ids and dashboard choices, no quote data: 668 characters.
+export const VIEW_BYTES = 4 * 1024;
 // One save copies the draft, builds two comparison keys (two serialisations each) and posts it.
 const DRAFT_SERIALISATIONS_PER_SAVE = 6;
 
-// The byte budgets of a measured quote. A changing click: one browser copy, the section clone, two
-// basis projections and the view. A click with nothing to change: the section clone alone. A save:
-// the draft six times, one browser copy, four basis projections and the view. Each is exact but for
-// SMALL_CALLS_BYTES, so a second copy of the quote in a click or a save goes over.
+// The byte budgets of a measured quote. A changing click: one browser copy, the section clone and two
+// basis projections. A click with nothing to change: the section clone alone. A save: the draft six
+// times, one browser copy and four basis projections. Each is exact but for SMALL_CALLS_BYTES, so a
+// second copy of a quote larger than that, in a click or a save, goes over.
 export function quoteClickBudget(sizes) {
-  const copy = sizes.browser_copy_bytes + sizes.view_bytes;
   return {
     ...CLICK_COUNT_BUDGET,
-    serialisedBytesPerClick: copy + sizes.sections_bytes + 2 * sizes.basis_bytes + SMALL_CALLS_BYTES,
+    serialisedBytesPerClick: sizes.browser_copy_bytes + sizes.sections_bytes + 2 * sizes.basis_bytes + SMALL_CALLS_BYTES,
     serialisedBytesPerIdleClick: sizes.sections_bytes + SMALL_CALLS_BYTES,
-    serialisedBytesPerQuoteSave: DRAFT_SERIALISATIONS_PER_SAVE * sizes.quote_bytes + copy + 4 * sizes.basis_bytes + SMALL_CALLS_BYTES,
+    serialisedBytesPerQuoteSave: DRAFT_SERIALISATIONS_PER_SAVE * sizes.quote_bytes + sizes.browser_copy_bytes + 4 * sizes.basis_bytes + SMALL_CALLS_BYTES,
   };
 }
 
-// The budgets follow the browser copy, so the copy itself must hold no more than the quote once and,
-// on a reopened quote, its restore key (the same draft as an escaped JSON string) once.
-export function judgeBrowserCopy(sizes, check) {
-  check(sizes.browser_copy_bytes - sizes.restored_key_bytes <= 1.25 * sizes.quote_bytes + SMALL_CALLS_BYTES,
-    "the browser copy holds the quote more than once beside its restore key", sizes);
-  check(sizes.restored_key_bytes <= 1.5 * sizes.quote_bytes, "the browser copy's restore key is larger than one copy of the quote", sizes);
+// Every size a budget adds is bounded, so a fault that is there before the sizes are read cannot raise
+// its own budget:
+// - the draft by the caller's limit, which the page does not set (Pass A: the quote as live saved it;
+//   CI: a constant of its synthetic quote);
+// - the sections and the basis by the draft they are read from;
+// - the restore key by that draft as a JSON string, and the browser copy by the draft, the key and
+//   COPY_EXTRA_BYTES;
+// - the view by VIEW_BYTES; no budget adds its size.
+export function judgeQuoteSizes(sizes, draftLimit, check) {
+  check(Number.isSafeInteger(draftLimit) && sizes.quote_bytes <= draftLimit, "the draft is larger than the quote it was opened from allows", { ...sizes, draft_limit: draftLimit });
+  check(sizes.restored_key_bytes <= sizes.quote_as_text_bytes + COPY_EXTRA_BYTES, "the browser copy's restore key is larger than one copy of the quote", sizes);
+  check(sizes.browser_copy_bytes - sizes.restored_key_bytes <= sizes.quote_bytes + COPY_EXTRA_BYTES, "the browser copy holds the quote more than once beside its restore key", sizes);
+  check(sizes.view_bytes <= VIEW_BYTES, "the workspace view holds more than ids and dashboard choices", sizes);
 }
 
 // Probes in the page. Each counts only while armed, so the caller's own page reads never count.
@@ -92,7 +102,8 @@ export function installClickProbe(page) {
     };
     // Whether each click changed the quote: its sections and rows just before the app handles the
     // click and once it has. A click that changed nothing must have had nothing to change, judged
-    // here as planBasisTagChanges in app.js does (the same tag, and a Custom line's confirmation).
+    // here both by the line's own tag and confirmation and by the app's own plan for that click, so
+    // neither a click dropped after the plan nor a plan that finds nothing counts as nothing to change.
     const quoteNow = () => stringify([state.quoteBasisSections, state.lineItems]);
     const settled = (line, wanted) => {
       const tag = normalizeBasisTag(line.tag);
@@ -104,11 +115,13 @@ export function installClickProbe(page) {
       const button = target?.closest?.("#basisReviewSurface [data-basis-section-action], #basisReviewSurface [data-basis-tag]");
       const section = state.quoteBasisSections.find((item) => item.id === button?.dataset.basisSection);
       if (!section) return 1;
-      const { basisSectionAction: blockAction, basisSectionGroup: group } = button.dataset;
+      const { basisSectionAction: blockAction, basisSectionGroup: group, basisTag, basisLineIndex } = button.dataset;
       const lines = blockAction
         ? withBasisPricingIndex(() => section.lines.filter((line) => !group || (!basisLineIsInformationalDimension(line) && basisPricingGroup(line, section) === group)))
-        : [section.lines[Number(button.dataset.basisLineIndex)]];
-      return lines.filter((line) => !line || !settled(line, blockAction || button.dataset.basisTag)).length;
+        : [section.lines[Number(basisLineIndex)]];
+      const unsettled = lines.filter((line) => !line || !settled(line, blockAction || basisTag)).length;
+      const plan = () => (blockAction ? planBasisTagChanges(section.id, blockAction, null, group || null) : planBasisTagChanges(section.id, normalizeBasisTag(basisTag), Number(basisLineIndex)));
+      return unsettled || (withBasisPricingIndex(plan) ? 1 : 0);
     };
     document.addEventListener("click", (event) => {
       log("click");
@@ -122,6 +135,8 @@ export function installClickProbe(page) {
         // The app's own functions, read while nothing is counted.
         const armed = probe.armed;
         probe.armed = false;
+        // A read that throws leaves the click ignored, never "nothing to change".
+        entry.linesToChange = 1;
         try { entry.linesToChange = linesToChange(event.target); } finally { probe.armed = armed; }
       }, 0);
     }, true);
@@ -196,11 +211,12 @@ export function judgeClickCounts(sample, posts, budget, check) {
     { changing: sample.changingClicks, nothing_to_change: sample.idleClicks, ignored: sample.ignoredClicks });
   check(sample.clickQuoteLocalStorageWrites <= budget.clickQuoteLocalStorageWrites * sample.changingClicks, label + " wrote the quote to browser storage more than once per click that changed it",
     { writes: sample.clickQuoteLocalStorageWrites, changing: sample.changingClicks });
-  // Any time in the sample: on a slow machine the click's own write can come after the click phase.
-  check(sample.quoteLocalStorageWrites >= sample.changingClicks, label + " changed the quote without writing it to browser storage",
-    { writes: sample.quoteLocalStorageWrites, changing: sample.changingClicks });
+  // Any time in the sample: on a slow machine the click's own write can come after the click phase. A
+  // save's acknowledgement is its own write, so it never stands in for the click's.
+  check(sample.quoteLocalStorageWrites >= sample.changingClicks + posts.length, label + " changed the quote without writing it to browser storage",
+    { writes: sample.quoteLocalStorageWrites, changing: sample.changingClicks, saves: posts.length });
   // A deferred quote save writes its acknowledgement once; nothing else may write after the click.
-  check(sample.quoteLocalStorageWrites <= sample.clicks + posts.length, label + " wrote the quote to browser storage outside the click and its save", { writes: sample.quoteLocalStorageWrites, writers: sample.writers });
+  check(sample.quoteLocalStorageWrites <= sample.changingClicks + posts.length, label + " wrote the quote to browser storage outside the click and its save", { writes: sample.quoteLocalStorageWrites, writers: sample.writers });
   check(sample.indexedDbPuts === budget.indexedDbPuts, label + " rewrote unchanged reference files to IndexedDB", sample.indexedDbPuts);
   check(sample.basisRenders <= budget.basisRenders * sample.clicks, label + " rendered the Quote Basis more than once per click", sample.basisRenders);
   check(sample.matchesFullRender, label + " left the Quote Basis different from a full render of the same state");
@@ -212,6 +228,7 @@ export function judgeClickCounts(sample, posts, budget, check) {
   check(sample.serialisedBytes <= allowed, label + " serialised too much data", { serialised: sample.serialisedBytes, allowed });
   check(sample.encodedBytes <= budget.encodedBytesPerClick * sample.clicks, label + " text-encoded too much data", sample.encodedBytes);
   check(posts.length <= budget.quoteSavesPerBurst, label + " saved the quote more than once", posts.length);
+  check(sample.lateSaves === 0, label + " sent a quote save after the " + CLICK_WINDOW_MS + " ms click window", sample.lateSaves);
   check(posts.every((post) => post.files === 0), label + " sent reference files the server already has", posts.map((post) => post.files));
 }
 
@@ -249,9 +266,10 @@ export function linesIn(page, group, prefix = "") {
 }
 
 // A slow server's answer to a quote save lands in the sample that caused it, never in the next one.
+// Only the answer may be late: a save sent after the click window fails its sample (lateSaves).
 const finishQuoteSaves = (page) => page.waitForFunction(() => !quoteSessionDraftSaveTimer && !quoteSessionDraftSavePromise && !appIsBusy(), null, { timeout: 30000 });
 
-// One sample: arm, click, wait out the deferred save, read and judge the counts.
+// One sample: arm, click, wait out the click window and the answer to a save sent in it, read and judge.
 // `quotePosts` is the caller's live list of quote saves; `judge(sample, posts)` adds the caller's checks.
 export async function measureClicks(page, { group, action, clicks, expectedClicks = 1, touched = [], quotePosts, judge }) {
   const postsBefore = quotePosts.length;
@@ -261,10 +279,12 @@ export async function measureClicks(page, { group, action, clicks, expectedClick
     await (await click()).click();
   }
   await page.waitForTimeout(CLICK_WINDOW_MS);
+  const postsInWindow = quotePosts.length;
   await finishQuoteSaves(page);
   const sample = { group, action, expectedClicks, ...(await readClickProbe(page)) };
   const posts = quotePosts.slice(postsBefore);
   sample.quoteSaves = posts.length;
+  sample.lateSaves = quotePosts.length - postsInWindow;
   judge(sample, posts);
   return sample;
 }
@@ -286,21 +306,23 @@ export const clickFacts = (sample) => ({
   clicks_that_changed: sample.changingClicks, clicks_with_nothing_to_change: sample.idleClicks, clicks_ignored: sample.ignoredClicks,
   quote_local_storage_writes: sample.quoteLocalStorageWrites, indexed_db_puts: sample.indexedDbPuts, basis_renders: sample.basisRenders,
   rebuilt_rows: sample.rebuiltRows, kept_rows: sample.keptRows, matches_full_render: sample.matchesFullRender,
-  serialised_bytes: sample.serialisedBytes, encoded_bytes: sample.encodedBytes, quote_saves: sample.quoteSaves,
+  serialised_bytes: sample.serialisedBytes, encoded_bytes: sample.encodedBytes, quote_saves: sample.quoteSaves, late_saves: sample.lateSaves,
   input_to_paint_ms: Math.round(sample.inputToPaintMs), longest_frame_ms: Math.max(0, ...sample.clickFrames, ...sample.laterFrames),
 });
 
 // The whole probe of the quote shown in Quote Basis: its own size and budgets, the four clicks in
-// every group, then five fast clicks on three lines of the largest group, which arm one save, not
-// five. `facts` is filled as it goes, so a probe that stops half way keeps what it measured.
-export async function probeOpenQuote(page, { quotePosts, facts, check }) {
+// every group, then five fast clicks on three lines of the largest group and of Unmatched, whose
+// clicks save: five clicks arm one save, not five. `draftLimit` is the largest draft this quote may
+// have (see judgeQuoteSizes). `facts` is filled as it goes, so a probe that stops half way keeps what
+// it measured.
+export async function probeOpenQuote(page, { quotePosts, facts, check, draftLimit }) {
   // Any save that opening Quote Basis armed finishes before the first measured click.
   await page.waitForTimeout(CLICK_WINDOW_MS);
   await finishQuoteSaves(page);
   const sizes = await measureQuoteSizes(page);
   const budget = quoteClickBudget(sizes);
-  Object.assign(facts, { ...sizes, budget, groups: {}, samples: [], burst: null });
-  judgeBrowserCopy(sizes, check);
+  Object.assign(facts, { ...sizes, draft_limit: draftLimit, budget, groups: {}, samples: [], bursts: [] });
+  judgeQuoteSizes(sizes, draftLimit, check);
   await installClickProbe(page);
   const measure = async (options) => clickFacts(await measureClicks(page, { ...options, quotePosts, judge: (sample, posts) => judgeClickCounts(sample, posts, budget, check) }));
   for (const group of ["Matched", "Review", "Unmatched"]) {
@@ -312,15 +334,17 @@ export async function probeOpenQuote(page, { quotePosts, facts, check }) {
     check(facts.samples.slice(first).some((sample) => sample.clicks_that_changed > 0), group + " clicks all had nothing to change, so the group was not measured");
   }
   check(facts.samples.length > 0, "the quote shows no basis line to click");
-  const burstGroup = Object.entries(facts.groups).sort((a, b) => b[1] - a[1]).find(([, count]) => count >= 3)?.[0];
-  if (burstGroup) {
-    const three = (await linesIn(page, burstGroup)).slice(0, 3);
-    facts.burst = await measure({
-      group: burstGroup, action: "burst", expectedClicks: 5, touched: three,
+  const largest = Object.entries(facts.groups).sort((a, b) => b[1] - a[1])[0][0];
+  for (const group of new Set([largest, "Unmatched"])) {
+    const three = (await linesIn(page, group)).slice(0, 3);
+    if (three.length < 3) continue;
+    const burst = await measure({
+      group, action: "burst", expectedClicks: 5, touched: three,
       clicks: [() => lineButton(page, three[0], true), () => lineButton(page, three[1], true), () => lineButton(page, three[2], true),
         () => lineButton(page, three[0], false), () => lineButton(page, three[1], false)],
     });
-    check(facts.burst.clicks_that_changed > 0, burstGroup + " burst clicks all had nothing to change, so the burst was not measured");
+    facts.bursts.push(burst);
+    check(burst.clicks_that_changed > 0, group + " burst clicks all had nothing to change, so the burst was not measured");
   }
   return { sizes, budget };
 }

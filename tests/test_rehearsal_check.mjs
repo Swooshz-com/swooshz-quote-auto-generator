@@ -434,7 +434,9 @@ async function runAllProfiles(t, storage) {
     for (const n of [2, 3]) assert.equal(typeof step(passA.parsed, `quote ${n} reopens read-only`).detail.basis_lock?.locked, "boolean");
     // A reopened quote's browser copy holds the draft and its restore key; the budgets come from those sizes.
     for (const { detail } of clickSteps) {
-      assert.deepEqual(detail.failures, []);
+      assert.deepEqual([detail.failures, detail.page_errors], [[], []]);
+      // The draft the probe found is the one the server holds, give or take what opening fills in.
+      assert.ok(detail.saved_quote_bytes > 0 && detail.quote_bytes <= detail.draft_limit && detail.draft_limit < 2 * detail.saved_quote_bytes, JSON.stringify(detail));
       assert.ok(detail.restored_key_bytes > detail.quote_bytes && detail.browser_copy_bytes > detail.quote_bytes + detail.restored_key_bytes, JSON.stringify(detail));
       assert.ok(detail.budget.serialisedBytesPerClick > detail.browser_copy_bytes && detail.budget.serialisedBytesPerClick < 2 * detail.browser_copy_bytes, JSON.stringify(detail.budget));
       assert.ok(detail.samples.every((sample) => sample.clicks_that_changed + sample.clicks_with_nothing_to_change === 1 && sample.quote_local_storage_writes >= sample.clicks_that_changed), JSON.stringify(detail.samples));
@@ -510,7 +512,7 @@ async function runAllProfiles(t, storage) {
     assert.equal(doubled.detail.id, seed.parsed.seed.published_session_id);
     assert.equal(doubled.detail.basis_lock.unlocked_by, "customer_next");
     assert.ok(doubled.detail.quote_bytes > 0 && doubled.detail.budget.serialisedBytesPerClick > 0 && doubled.detail.samples.length >= 4, JSON.stringify(doubled.detail));
-    const changing = [...doubled.detail.samples, doubled.detail.burst].filter((sample) => sample?.clicks_that_changed > 0);
+    const changing = [...doubled.detail.samples, ...doubled.detail.bursts].filter((sample) => sample.clicks_that_changed > 0);
     assert.ok(changing.length >= 2, JSON.stringify(doubled.detail.samples));
     assert.deepEqual(doubled.detail.failures.map((line) => line.replace(/: .*$/, "")), changing.map((sample) => `${sample.group}:${sample.action} serialised too much data`), JSON.stringify(doubled.detail));
     assert.ok(doubled.detail.failures.every((line) => /"serialised":[0-9]+,"allowed":[0-9]+/.test(line)), JSON.stringify(doubled.detail.failures));

@@ -569,10 +569,12 @@ test("the page checks catch a block without its own tick and X, an empty booth b
   }
 });
 
-// The two largest real quotes' sizes and clicks on the copy of live (#390 hold 8): character counts only.
-const holdEight = [
-  { sizes: { quote_bytes: 145344, browser_copy_bytes: 305149, restored_key_bytes: 157538, sections_bytes: 26872, basis_bytes: 7860, view_bytes: 668 }, clicks: [350222, 350686, 351609, 352076, 352073], idle: 27336, burst: [4, 1, 1431126] },
-  { sizes: { quote_bytes: 209210, browser_copy_bytes: 440527, restored_key_bytes: 229332, sections_bytes: 29071, basis_bytes: 8248, view_bytes: 668 }, clicks: [486763], idle: 29071, burst: [5, 0, 2435538] },
+// The two largest real quotes' sizes and clicks on the copy of live (#390 hold 8), then the CI job's
+// reopened quote with its real saves: character counts only.
+const measuredQuotes = [
+  { sizes: { quote_bytes: 145344, quote_as_text_bytes: 157700, browser_copy_bytes: 305149, restored_key_bytes: 157538, sections_bytes: 26872, basis_bytes: 7860, view_bytes: 668 }, clicks: [350222, 350686, 351609, 352076, 352073], idle: 27336, burst: [4, 1, 1431126] },
+  { sizes: { quote_bytes: 209210, quote_as_text_bytes: 229500, browser_copy_bytes: 440527, restored_key_bytes: 229332, sections_bytes: 29071, basis_bytes: 8248, view_bytes: 668 }, clicks: [486763], idle: 29071, burst: [5, 0, 2435538] },
+  { sizes: { quote_bytes: 224430, quote_as_text_bytes: 247640, browser_copy_bytes: 473873, restored_key_bytes: 247551, sections_bytes: 23372, basis_bytes: 3596, view_bytes: 668 }, clicks: [505105, 505158], idle: 23372, burst: [5, 0, 2526786], savingClicks: [2339189, 2342143, 2342829, 2343234] },
 ];
 function judged(sample, saves, budget) {
   const failures = [];
@@ -581,14 +583,14 @@ function judged(sample, saves, budget) {
   clickProbe.judgeClickCounts({
     group: "Review", action: "click", clicks, expectedClicks: clicks, changingClicks: changing, idleClicks: clicks - changing, ignoredClicks: 0,
     clickQuoteLocalStorageWrites: changing, quoteLocalStorageWrites: changing + saves, writers: [], indexedDbPuts: 0, basisRenders: 0, matchesFullRender: true,
-    rebuiltRows: 0, keptRows: 40, serialisedBytes: 0, encodedBytes: 0, ...sample,
+    rebuiltRows: 0, keptRows: 40, serialisedBytes: 0, encodedBytes: 0, lateSaves: 0, ...sample,
   }, Array.from({ length: saves }, () => ({ files: 0 })), budget, (ok, message) => { if (!ok) failures.push(message.replace("Review:click ", "")); });
   return failures;
 }
 
 test("the click budget follows the browser copy a click writes, and fails on a second copy of the quote", () => {
   const tooMuch = ["serialised too much data"];
-  for (const { sizes, clicks, idle, burst } of holdEight) {
+  for (const { sizes, clicks, idle, burst, savingClicks = [] } of measuredQuotes) {
     const budget = clickProbe.quoteClickBudget(sizes);
     for (const serialisedBytes of clicks) {
       // The old budget followed the draft state, which is half of what one click writes on a reopened quote.
@@ -605,36 +607,64 @@ test("the click budget follows the browser copy a click writes, and fails on a s
     const fast = { clicks: changing + idleClicks, changingClicks: changing };
     assert.deepEqual(judged({ ...fast, serialisedBytes }, 0, budget), []);
     assert.deepEqual(judged({ ...fast, serialisedBytes: serialisedBytes + sizes.quote_bytes }, 0, budget), tooMuch);
-    // A save copies, compares and posts the draft and writes the browser copy once.
-    const save = clicks[0] + 6 * sizes.quote_bytes + sizes.browser_copy_bytes + 4 * sizes.basis_bytes;
-    assert.deepEqual(judged({ serialisedBytes: save }, 1, budget), []);
-    assert.deepEqual(judged({ serialisedBytes: save + sizes.quote_bytes }, 1, budget), tooMuch, "a seventh draft copy in a save");
-    // More saves than a burst may make never raise the budget.
-    assert.deepEqual(judged({ serialisedBytes: save + (save - clicks[0]) }, 2, budget), [...tooMuch, "saved the quote more than once"]);
+    // Clicks with their real save: a seventh copy of the draft goes over, and more saves than a burst may make never raise the budget.
+    for (const saving of savingClicks) {
+      assert.deepEqual(judged({ serialisedBytes: saving }, 1, budget), [], "one save");
+      assert.deepEqual(judged({ serialisedBytes: saving + sizes.quote_bytes }, 1, budget), tooMuch, "a seventh draft copy in a save");
+      assert.deepEqual(judged({ serialisedBytes: 2 * saving - clicks[0] }, 2, budget), [...tooMuch, "saved the quote more than once"]);
+    }
+    // What the workspace view holds never adds to a budget.
+    assert.deepEqual(clickProbe.quoteClickBudget({ ...sizes, view_bytes: 400000 }), budget);
   }
 });
 
 test("a click that changed nothing must have had nothing to change, and a change must be written", () => {
-  const budget = clickProbe.quoteClickBudget(holdEight[0].sizes);
+  const budget = clickProbe.quoteClickBudget(measuredQuotes[0].sizes);
   const idle = { changingClicks: 0, serialisedBytes: 1 };
+  const tooMany = "wrote the quote to browser storage more than once per click that changed it";
+  const outside = "wrote the quote to browser storage outside the click and its save";
+  const unwritten = "changed the quote without writing it to browser storage";
   assert.deepEqual(judged(idle, 0, budget), []);
   assert.deepEqual(judged({ ...idle, idleClicks: 0, ignoredClicks: 1 }, 0, budget), ["changed nothing although a line it acts on was not in that state yet"]);
-  assert.deepEqual(judged({ ...idle, clickQuoteLocalStorageWrites: 1, quoteLocalStorageWrites: 1 }, 0, budget), ["wrote the quote to browser storage more than once per click that changed it"]);
-  assert.deepEqual(judged({ clickQuoteLocalStorageWrites: 0, quoteLocalStorageWrites: 0 }, 0, budget), ["changed the quote without writing it to browser storage"]);
-  assert.deepEqual(judged({ clickQuoteLocalStorageWrites: 2, quoteLocalStorageWrites: 2 }, 0, budget), ["wrote the quote to browser storage more than once per click that changed it", "wrote the quote to browser storage outside the click and its save"]);
+  assert.deepEqual(judged({ ...idle, clickQuoteLocalStorageWrites: 1, quoteLocalStorageWrites: 1 }, 0, budget), [tooMany, outside]);
+  assert.deepEqual(judged({ clickQuoteLocalStorageWrites: 0, quoteLocalStorageWrites: 0 }, 0, budget), [unwritten]);
+  assert.deepEqual(judged({ clickQuoteLocalStorageWrites: 2, quoteLocalStorageWrites: 2 }, 0, budget), [tooMany, outside]);
+  // A slow click's own write may come after the click phase; a save's acknowledgement never stands in for it.
+  assert.deepEqual(judged({ clickQuoteLocalStorageWrites: 0 }, 1, budget), []);
+  assert.deepEqual(judged({ clickQuoteLocalStorageWrites: 0, quoteLocalStorageWrites: 1 }, 1, budget), [unwritten]);
 });
 
-test("the browser copy the budgets follow holds the quote once and its restore key once", () => {
-  const copyFailures = (sizes) => {
+test("a quote save sent after the click window fails, whenever it is answered", () => {
+  const budget = clickProbe.quoteClickBudget(measuredQuotes[2].sizes);
+  assert.deepEqual(judged({}, 1, budget), []);
+  assert.deepEqual(judged({ lateSaves: 1 }, 1, budget), ["sent a quote save after the 1500 ms click window"]);
+});
+
+test("every size a byte budget adds is bounded by something the page cannot raise", () => {
+  const over = (sizes, limit) => {
     const failures = [];
-    clickProbe.judgeBrowserCopy(sizes, (ok, message) => { if (!ok) failures.push(message); });
+    clickProbe.judgeQuoteSizes(sizes, limit, (ok, message) => { if (!ok) failures.push(message); });
     return failures;
   };
-  for (const { sizes } of holdEight) {
-    assert.deepEqual(copyFailures(sizes), []);
-    assert.deepEqual(copyFailures({ ...sizes, browser_copy_bytes: sizes.browser_copy_bytes + sizes.quote_bytes }), ["the browser copy holds the quote more than once beside its restore key"]);
-    assert.deepEqual(copyFailures({ ...sizes, browser_copy_bytes: sizes.browser_copy_bytes + sizes.restored_key_bytes, restored_key_bytes: 2 * sizes.restored_key_bytes }), ["the browser copy's restore key is larger than one copy of the quote"]);
+  const inDraft = "the draft is larger than the quote it was opened from allows";
+  const inCopy = "the browser copy holds the quote more than once beside its restore key";
+  const inKey = "the browser copy's restore key is larger than one copy of the quote";
+  const inView = "the workspace view holds more than ids and dashboard choices";
+  // The small seeded CI quote too: no allowance is as large as its draft.
+  const small = { quote_bytes: 18570, quote_as_text_bytes: 20450, browser_copy_bytes: 39834, restored_key_bytes: 20344, sections_bytes: 505, basis_bytes: 122, view_bytes: 668 };
+  for (const sizes of [...measuredQuotes.map((quote) => quote.sizes), small]) {
+    const limit = Math.floor(1.75 * sizes.quote_bytes);
+    const more = (name, amount) => ({ ...sizes, [name]: sizes[name] + amount });
+    assert.deepEqual(over(sizes, limit), []);
+    assert.deepEqual(over(more("browser_copy_bytes", sizes.quote_bytes), limit), [inCopy], "a second draft in the copy");
+    assert.deepEqual(over(more("browser_copy_bytes", Math.ceil(0.24 * sizes.quote_bytes) + 8192), limit), [inCopy], "a quarter of a draft in the copy");
+    assert.deepEqual(over(more("browser_copy_bytes", sizes.restored_key_bytes), limit), [inCopy], "a second restore key");
+    assert.deepEqual(over({ ...more("browser_copy_bytes", sizes.restored_key_bytes), restored_key_bytes: 2 * sizes.restored_key_bytes }, limit), [inKey], "a key that holds the quote twice");
+    assert.deepEqual(over({ ...more("view_bytes", sizes.restored_key_bytes) }, limit), [inView], "the restore key in the view");
+    assert.deepEqual(over({ ...sizes, quote_bytes: 2 * sizes.quote_bytes, quote_as_text_bytes: 2 * sizes.quote_as_text_bytes, browser_copy_bytes: sizes.browser_copy_bytes + sizes.quote_bytes }, limit), [inDraft], "a second draft in the draft");
   }
+  // A missing or unreadable limit fails; it never means no limit.
+  for (const limit of [undefined, Number.NaN, 0]) assert.deepEqual(over(small, limit), [inDraft]);
 });
 
 // The lock facts on a page with the app's own names (webapp/static/app.js) and its strict compare.
