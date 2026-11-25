@@ -187,6 +187,10 @@ npm run playwright:ai-stress
 npm run playwright:smoke
 ```
 
+After a change to Python code or backend behaviour, restart the local webapp
+server and check `http://127.0.0.1:8765/api/health` before browser testing it by
+hand or reporting it ready. The browser suites above start their own server.
+
 ## Button sizing and placement checks
 
 - Run `python -m unittest tests.test_button_standard tests.test_quote_flow_reliability`
