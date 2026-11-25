@@ -1,6 +1,6 @@
 # Quote template definition (`sqag.quote-template.v1`)
 
-Admins will build quote templates in Settings > Quote Templates. A template
+Admins build quote templates in Settings > Quote Templates. A template
 is a JSON definition that says where each part of a quotation sits on the Excel
 grid and how it looks. The PDF is converted from the Excel file, so one template
 drives both.

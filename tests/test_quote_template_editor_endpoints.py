@@ -282,6 +282,10 @@ class QuoteTemplateEditorEndpointsTest(permissions_test.QuoteTemplatePermissions
 
     def test_profile_list_sends_template_names_for_the_dropdown(self):
         admin, operator = self.login(auth_http.email()), self.login(auth_http.email("operator"))
+        # Another workspace's template, and its default, never show here.
+        other = s.DatabaseSqagStorage(self.url, "workspace-other", "admin", "other-admin")
+        theirs = s.QuoteTemplateStore(other).create(definition("Theirs"))
+        s.QuoteTemplateStore(other).set_default(theirs["id"])
         status, body = self.call(operator, "GET", "/api/profiles")
         self.assertEqual(status, 200, body)
         self.assertEqual(body["quote_templates"], {"available": True, "default_template_id": "standard",
@@ -293,6 +297,9 @@ class QuoteTemplateEditorEndpointsTest(permissions_test.QuoteTemplatePermissions
         self.assertEqual([(item["name"], item["builtin"]) for item in choices["templates"]],
                          [("Standard", True), ("Blue", False)])
         self.assertNotIn("definition", json.dumps(choices))
+        others = s.quote_template_choices(other)
+        self.assertEqual(([item["name"] for item in others["templates"]], others["default_template_id"]),
+                         (["Standard", "Theirs"], theirs["id"]))
         # The page loads this list every time, so the names take one connection and no layouts are read.
         storage = s.DatabaseSqagStorage(self.url, self.workspace, "admin", "inspection")
         opened, original = [], s.DatabaseSqagStorage.connection
@@ -440,12 +447,38 @@ class QuoteTemplateEditorEndpointsTest(permissions_test.QuoteTemplatePermissions
         self.assertIs(before["_own_layout"], True)
         self.assertNotIn("_own_layout", listed(admin, shared["id"]))
         self.assertNotIn("_own_layout", inspection.profile_detail(shared["id"], source="company"))
-        self.assertEqual(choose(admin, shared["id"], "own", revision + 1)[0], 200)
+        # Nor in any settings answer: list, export, and what each kind of change sends back.
+        access = {"version": 1, "owner_user_id": None, "visibility": "shared"}
+        for label, method, route, body in (
+            ("list", "GET", profiles, None),
+            ("export", "GET", f"{profiles}/{shared['id']}/export.json", None),
+            ("template", "POST", profiles, {"operation": "template", "quote_template_id": "standard"}),
+            ("update", "POST", profiles, {"operation": "update", "label": "Synthetic shared", "defaults": {}}),
+            ("access", "POST", profiles, {"operation": "access", "access": access}),
+        ):
+            with self.subTest(answer=label):
+                reset_rate_limits()
+                now = stored(shared["id"])["_revision"]
+                status, _, raw = self.raw(admin, method, route, {"id": shared["id"], "revision": now, **body} if body else None)
+                answer = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+                self.assertEqual(status, 200, answer)
+                self.assertIn(shared["id"], answer)
+                self.assertNotIn("_own_layout", answer)
+                self.assertIs(stored(shared["id"])["_own_layout"], True)
+        self.assertEqual(choose(admin, shared["id"], "own", stored(shared["id"])["_revision"])[0], 200)
 
         # A profile created without a workbook has nothing to go back to: not offered, not accepted.
         fresh = create(operator, "Synthetic fresh", legacy=False)
         self.assertIs(listed(operator, fresh["id"])["own_layout"], False)
         before = stored(fresh["id"])
+        # Who may change it, and the save number, come first: another member, or an old page, learns nothing about its layout.
+        for label, headers, expected, revision in (("another member", admin, 404, fresh["revision"]),
+                                                   ("stale revision", operator, 409, fresh["revision"] + 1)):
+            with self.subTest(no_own_layout=label):
+                status, body = choose(headers, fresh["id"], "own", revision)
+                self.assertEqual(status, expected, body)
+                self.assertNotIn("layout", json.dumps(body))
+        self.assertEqual(stored(fresh["id"]), before)
         status, body = choose(operator, fresh["id"], "own", fresh["revision"])
         self.assertEqual((status, body["errors"]), (400, ["This profile has no layout of its own."]))
         self.assertEqual(stored(fresh["id"]), before)
@@ -461,9 +494,24 @@ class QuoteTemplateEditorEndpointsTest(permissions_test.QuoteTemplatePermissions
         with inspection.connection() as connection:
             connection.execute("delete from sqag_file_artifacts where owner_id = ?", (own["id"],))
             connection.commit()
+        # Nor does another workspace's workbook count, even for a profile with the same id there.
+        other = s.DatabaseSqagStorage(self.url, "workspace-other", "admin", "other-admin")
+        other.save_profile({"id": own["id"], "label": "Synthetic theirs", "defaults": {}})
+        self.assertTrue(other._profile_layout_artifact_exists(own["id"]))
+        theirs = other._read_payload("sqag_profiles", "profile_id", own["id"])
+        # And a workbook left without its profile is not counted because another workspace has that profile.
+        third = s.DatabaseSqagStorage(self.url, "workspace-third", "admin", "third-admin")
+        third.save_profile({"id": own["id"], "label": "Synthetic third", "defaults": {}})
+        with third.connection() as connection:
+            connection.execute("delete from sqag_profiles where workspace_id = ?", ("workspace-third",))
+            connection.commit()
+        self.assertFalse(third._profile_layout_artifact_exists(own["id"]))
         revision = stored(own["id"])["_revision"]
         self.assertEqual(choose(operator, own["id"], blue["id"], revision)[0], 200)
+        before = stored(own["id"])
         self.assertEqual(choose(operator, own["id"], "own", revision + 1)[0], 400)
+        self.assertEqual(stored(own["id"]), before)
+        self.assertEqual(other._read_payload("sqag_profiles", "profile_id", own["id"]), theirs)
 
 
 class QuoteTemplateChoicesUnitTest(unittest.TestCase):
