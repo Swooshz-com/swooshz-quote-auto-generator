@@ -6,22 +6,7 @@ platform concerns belong in `Swooshz-com/swooshz-platform`.
 
 ## Source Map
 
-Recorded against source `0f5b1ca` and updated for shared drafting.
-The quote-module maintainers own these sources.
-Update this map when an entry point or source of truth moves.
-
-| Part | Entry points and sources of truth |
-| --- | --- |
-| Web requests, saved quotes and access | `webapp/server.py`; browser behaviour in `webapp/static/app.js`; Password admission in `webapp/internal_password_auth.py` |
-| Catalogue matching and row prices | `webapp/quote_engine.py` builds the lookup from the selected catalogue, ranks matches and calculates line amounts. `webapp/server.py` resolves and checks the catalogue snapshot, applies pricing authority and grants, and maps the results into draft, review and final-brief rows. |
-| Quote drafting | Staff requests and jobs enter through `webapp/server.py`. `webapp/quote_engine.py` sequences draft sends through the server's gateway adapter. See [quote architecture](ARCHITECTURE.md). |
-| Inference | `webapp/ai_gateway.py`; [gateway contract](ai-gateway.md) |
-| Artifact persistence and forensics | `webapp/object_storage.py`, `webapp/forensics.py` and the storage contracts listed below |
-| Workbook generation | `scripts/generate_quote.py` and `templates/`; selected profile/reference authority is defined by `AGENTS.md` |
-| Quote service admission, disabled | `webapp/quote_api_auth.py`, `webapp/quote_context.py`, injected `webapp/quote_api_registry.py`; [API contract](quotation-api-v1.md) and [privilege contract](runtime-privilege-contract.md) |
-| Database evolution | `migrations/`, `webapp/postgres_migrations.py` and [migration runbook](postgres-migration-runbook.md) |
-| Validation | `tests/`, browser commands in `package.json`, [testing plan](testing-plan.md) and `.github/workflows/ci.yml` |
-| Agent guidance and tracking | `AGENTS.md` and `.github/toolkit-programme.json` |
+See [the repo map](repo-map.md) for parts, entry points, sources of truth and ownership.
 
 ## Current Docs
 
@@ -29,9 +14,6 @@ Update this map when an entry point or source of truth moves.
   [machine-readable spec](quotation-api-v1.openapi.json): proposed server-to-server
   estimates, confirmation, safe projections and offline fake-backed contract tests;
   no API runtime is implemented by these documents.
-- `docs/sqag-current-status.md`: current RC verdict plus SQAG namespace cleanup
-  update, module boundary, runtime data model, private asset rules, owner smoke
-  checklist, audit findings, and docs cleanup summary.
 - `docs/ui-design-standard.md`: how new or changed screens look and are
   checked, taken from the existing UI (type, colour, spacing, buttons, forms,
   containers, status, review checklist).
@@ -90,26 +72,16 @@ old handoff notes were consolidated instead of archived.
 
 ## Removed Or Consolidated Docs
 
-- `docs/internal-team-test-handoff.md` was consolidated into
-  `docs/sqag-current-status.md` and removed.
+- `docs/internal-team-test-handoff.md` and `docs/sqag-current-status.md` (a
+  September 2026 release-candidate audit that no longer matched how the app
+  runs) were removed. `AGENTS.md`, `docs/repo-map.md` and the runbooks hold the
+  current scope and release order.
 
-No unique current RC requirements were deleted without being summarized in the
-current status/handoff doc.
+## Scope
 
-## Future Platform Ownership
-
-The following topics should not be implemented in this repo as part of SQAG RC:
-
-- login, accounts, users, roles, company membership, and app access
-- Stripe, billing, credits, subscriptions, ledgers, and entitlement
-- Supabase or other hosted database design
-- DB-backed quote history and dashboards
-- generic Hostinger, Coolify, Docker, DNS, public hosting, or production
-  infrastructure setup; SQAG only keeps app-specific internal UAT adapter
-  notes under `docs/internal-uat-coolify-deploy.md`
-- Swooshz platform shell, navigation, app registry, app whitelist, and cross-app
-  architecture
-- SEOzilla integration or other platform-level app integrations
+Current scope and what stays out of scope without the owner's explicit request
+are in `AGENTS.md`. Platform-shell, app-registry and cross-app concerns belong
+in `Swooshz-com/swooshz-platform`.
 
 ## Runtime And Private Asset Reminder
 
