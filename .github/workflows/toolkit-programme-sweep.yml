@@ -1,4 +1,4 @@
-# AI-AGENT-TOOLKIT:cloud-workflows:RENDERED programme-sweep toolkit=82306852ca9e5207af491b4169a6c52cd1c1555d sha256=b92c25bf0259 layout=1
+# AI-AGENT-TOOLKIT:cloud-workflows:RENDERED programme-sweep toolkit=7af1cad817daad5d56cea2bd1f666ad1bef8e684 sha256=016476dddbed layout=1
 # A copy of the Toolkit's own workflow, rendered at the Toolkit commit above. It runs Toolkit main, or the commit this repository's TOOLKIT_REF variable pins. Do not edit it here: refresh the repository rules to update it.
 # Toolkit Programme Sweep: the programme refresh, run on GitHub instead of a computer.
 #
@@ -19,8 +19,12 @@
 # tag ends with one warning, mints nothing and edits nothing. With no App configured it ends with a
 # warning and writes nothing. A repository whose state lives
 # on a public branch is skipped with a notice too. Runs never overlap: one at a time, none
-# cancelled, and the sweep's lease in the evidence store keeps it from writing while the
-# computer's sweep is running. A pass works for up to 50 minutes, is killed at 55 and the job is
+# cancelled, and the sweep's lease in the evidence store keeps it from writing while another sweep
+# (a computer's, or a pass whose release never landed, until its lease runs out) holds it. A run
+# that meets that lease waits for it, checking every minute for up to 30 minutes, then runs its pass
+# with the time left, so the run after a merge still refreshes the board; one that never gets the
+# lease fails, so it is not a green success, and starts one follow-up run. A pass works for up to 50
+# minutes, is killed at 55 and the job is
 # stopped at 58, so it ends before the next hourly start; the next run reports a stopped one. It has
 # no request cap of its own: it reads until the App's remaining hourly count reaches the safety
 # margin, saves where it got to and the next run resumes. Each governed repository has its own App,
