@@ -34714,7 +34714,8 @@ def _run_quote_job(
         return storage_block(exc)
 
     draft_precondition = None
-    session_id = safe_quote_session_id(quote_session_patch_payload(payload).get("session_id"), "")
+    # Named as the final save names it, so a quote the caller cannot edit is refused before any file is built.
+    session_id = safe_quote_session_id(quote_session_patch_payload(payload).get("session_id") or payload.get("session_id"), "")
     existing: dict[str, Any] = {}
     if quote_session_storage and session_id:
         try:

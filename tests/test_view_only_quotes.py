@@ -113,6 +113,7 @@ class ViewOnlyQuoteBrowserTest(unittest.TestCase):
         self.assertEqual({evidence['refused'][name] for name in ('withoutVersion', 'withVersion', 'asNew')}, {403})
         self.assertEqual(evidence['refused']['generate without a version'], 'blocked')
         self.assertEqual(evidence['refused']['generate with a version'], 'blocked')
+        self.assertEqual(evidence['refused']['generate naming the quote at the top'], 'blocked')
 
 
 if __name__ == '__main__':

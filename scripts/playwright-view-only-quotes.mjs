@@ -187,7 +187,12 @@ try {
   }
   // The owner's own generate request, sent by the admin: refused before a file is built, with or without a version.
   const { expected_draft_version, ...unversioned } = generatePayload;
-  for (const [name, payload] of Object.entries({ "generate without a version": unversioned, "generate with a version": { ...unversioned, expected_draft_version } })) {
+  // Also when only the top-level session_id names the quote, as the final save would read it.
+  const { quote_session: { session_id: named, ...unnamed }, ...rest } = unversioned;
+  for (const [name, payload] of Object.entries({
+    "generate without a version": unversioned, "generate with a version": { ...unversioned, expected_draft_version },
+    "generate naming the quote at the top": { ...rest, quote_session: unnamed, session_id: named },
+  })) {
     const started = await run.api(admin, "POST", "/api/jobs", { type: "generate", payload });
     assert(started.status === 202 && started.body.job_id, "the generate job was not started", started);
     let job = null;
