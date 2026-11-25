@@ -19,6 +19,6 @@
     "playwright:quote-templates": "node scripts/playwright-quote-templates.mjs"
   },
   "devDependencies": {
-    "playwright": "^1.65.0"
+    "playwright": "^1.65.1"
   }
 }
