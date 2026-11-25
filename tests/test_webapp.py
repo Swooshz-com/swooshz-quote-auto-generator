@@ -20681,6 +20681,7 @@ const elements = {
 let checkpointVerified = true;
 function customerStepCheckpointIsCurrent() { return checkpointVerified; }
 
+const UNRESOLVED_BASIS_LINES_MESSAGE = source.match(/const UNRESOLVED_BASIS_LINES_MESSAGE = "(.*)";/)[1];
 eval([
   "normalizeTextNewlines",
   "splitLines",
@@ -31325,6 +31326,7 @@ for (const name of ["BASIS_FREE_QUANTITY_UNITS", "BASIS_FLOOR_SECTION_RE"]) {
   eval.call(globalThis, declaration[0].replace(/^const /, "var "));
 }
 eval(source.slice(source.indexOf("function canonicalBasisSectionText"), source.indexOf("function pythonWhitespaceText")));
+const UNRESOLVED_BASIS_LINES_MESSAGE = source.match(/const UNRESOLVED_BASIS_LINES_MESSAGE = "(.*)";/)[1];
 eval([
   "normalizeAnalysisMode",
   "normalizeTextNewlines",
