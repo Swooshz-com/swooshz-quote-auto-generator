@@ -74,6 +74,16 @@ def main() -> int:
         webapp.configured_ai_gateway = lambda feature, *args, **kwargs: (
             None if feature == 'pricing_reference_import' else original_gateway(feature, *args, **kwargs))
         webapp.request_openai_pricing_catalog_import = lambda *_args, **_kwargs: webapp.PRICING_IMPORT.admit(pricing_import)
+    # And the Re chat: the reply keeps the selected line's words and gives it this tag.
+    basis_chat_tag = json.loads(scenario_path.read_text(encoding='utf-8')).get('basis_chat_tag') if scenario_path.is_file() else None
+    if basis_chat_tag:
+        def owner_mock_basis_chat(payload, auth_session=None):
+            chat = payload['basis_chat']
+            line = next(section for section in payload['quote_basis_sections'] if section['id'] == chat['field'])['lines'][chat['line_index']]
+            return webapp.normalize_basis_chat_result({'intent': 'proposal', 'proposal': {
+                'message': 'Change this line?', 'replacement_line': {'tag': basis_chat_tag, 'text': line['text'], 'confidence_pct': 95},
+            }}, payload, 'openrouter', auth_session=auth_session)
+        webapp.request_configured_basis_chat = owner_mock_basis_chat
     original_cookie_header = webapp.cookie_header_value
     webapp.cookie_header_value = lambda *args, **kwargs: original_cookie_header(
         *args, **kwargs

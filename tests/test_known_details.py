@@ -428,7 +428,7 @@ class KnownDetailsDraftTest(unittest.TestCase):
                   "quote_basis_sections": [{"id": "floor", "lines": [{"quantity": 36, "unit": "sqm", "text": "136 sqm stays"}]}]}
         staff = webapp.booth_dimensions_result(None, None, 93, "staff")
         ai = webapp.booth_dimensions_from_payload({"project": parsed["project"]})
-        result, rescale = webapp.staff_footprint_rescale(parsed, staff, ai)
+        result, rescale = webapp.staff_footprint_rescale(parsed, staff, ai, {})
         self.assertEqual([row["quantity"] for row in result["line_items"]], [93, 36, 93, 36.5])
         self.assertEqual(result["line_items"][0]["description"], "Carpet 93 sqm, full floor")
         self.assertEqual(result["quote_basis_sections"][0]["lines"][0], {"quantity": 93, "unit": "sqm", "text": "136 sqm stays"})
@@ -436,9 +436,9 @@ class KnownDetailsDraftTest(unittest.TestCase):
         self.assertEqual(parsed["line_items"][0]["quantity"], "36")  # input is never mutated
         # No staff size, a default AI size or a matching AI size: nothing to resize.
         default = webapp.booth_dimensions_from_payload({"project": {}})
-        self.assertIsNone(webapp.staff_footprint_rescale(parsed, default, ai)[1])
-        self.assertIsNone(webapp.staff_footprint_rescale(parsed, staff, default)[1])
-        self.assertIsNone(webapp.staff_footprint_rescale(parsed, staff, staff)[1])
+        self.assertIsNone(webapp.staff_footprint_rescale(parsed, default, ai, {})[1])
+        self.assertIsNone(webapp.staff_footprint_rescale(parsed, staff, default, {})[1])
+        self.assertIsNone(webapp.staff_footprint_rescale(parsed, staff, staff, {})[1])
 
     def test_resized_predicted_line_keeps_its_est_mark(self):
         # G2 round 1 F3: the AI predicted 36 sqm (Est.); after the resize to 93 sqm the line still shows Est.

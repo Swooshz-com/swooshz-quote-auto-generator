@@ -149,7 +149,7 @@ async function run(test = {}) {
   }
   vm.runInContext([
     'normalizeBasisTag',
-    'retainExcludedBasisPricingRows',
+    'currentReinclusionRows', 'withoutReincludedSelection', 'retainExcludedBasisPricingRows',
     'validQuoteDraftVersion', 'validPricingLedgerReceipt', 'unchangedDraftLedgerMatches', 'pricingSelectionRefusalReason',
     'selectedCatalogueAuthorityMatches', 'pricingSelectionAcknowledgement', 'rememberPricingSelectionAcknowledgement',
     'requireQuoteDraftReopen',

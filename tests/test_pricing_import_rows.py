@@ -23,12 +23,16 @@ def row(description="Synthetic display", **extra):
 
 
 def preview(csv, ai_items=None):
+    return preview_file("synthetic.csv", "text/csv", csv.encode("utf-8"), ai_items)
+
+
+def preview_file(filename, mime, raw, ai_items=None):
     with mock.patch.object(webapp, "read_dotenv_value", side_effect={
             **fixtures.SYNTHETIC_DRAFT_CONFIG, "OPENROUTER_API_KEY": "sk-test-redacted"}.get), \
             mock.patch.object(webapp, "request_openai_pricing_catalog_import", return_value={"items": ai_items or []}) as ai:
         result = webapp.pricing_reference_import_preview({
-            "filename": "synthetic.csv",
-            "data_url": "data:text/csv;base64," + base64.b64encode(csv.encode("utf-8")).decode("ascii"),
+            "filename": filename,
+            "data_url": f"data:{mime};base64," + base64.b64encode(raw).decode("ascii"),
         })
     return result, ai
 
@@ -88,6 +92,15 @@ class PricingImportRowsTest(unittest.TestCase):
         result, ai = preview(csv, [row("Display")])
         ai.assert_called_once()
         self.assertEqual(result["items"][0]["sale_unit_price"], 120)
+
+    def test_a_sectioned_workbook_whose_rows_are_all_unpriced_still_goes_to_the_ai_reader(self):
+        workbook = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        for priced in (True, False):
+            with self.subTest(priced=priced):
+                raw = fixtures.synthetic_sectioned_pricing_workbook_bytes(include_visuals=False, priced=priced)
+                result, ai = preview_file("synthetic.xlsx", workbook, raw, [row("Display")])
+                self.assertEqual(ai.call_count, 0 if priced else 1)
+                self.assertEqual(result["layout"] == "sectioned-pricing-workbook", priced)
 
     def test_saving_still_takes_only_priced_rows(self):
         self.assertIsNone(webapp.sanitize_pricing_reference_item(row(internal_cost=None)))

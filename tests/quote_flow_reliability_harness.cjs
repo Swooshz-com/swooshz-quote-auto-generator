@@ -351,7 +351,7 @@ async function lifecycleCases() {
   const families = ["images", "customer", "quote_company", "dependency_customer", "dependency_images", "dependency_basis", "basis"];
   let cases = 0;
   for (const family of families) for (const phase of ["ordinary", "cancel_before", "cancel_pending", "pagehide_pending"]) for (const outcome of ["success", "failure", "throw"]) {
-    const f = lifecycleFixture(["withQuoteStepLoading", "advanceCustomerStep", "goToNextSidePanel", "confirmQuoteDependencyChange", "confirmBasis", "retainExcludedBasisPricingRows"]);
+    const f = lifecycleFixture(["withQuoteStepLoading", "advanceCustomerStep", "goToNextSidePanel", "confirmQuoteDependencyChange", "confirmBasis", "currentReinclusionRows", "withoutReincludedSelection", "retainExcludedBasisPricingRows"]);
     const { context: c, state, elements } = f;
     const panel = family.replace("dependency_", "");
     const panels = ["images", "customer", "quote_company", "basis", "output"];
@@ -610,7 +610,7 @@ async function lifecycleCases() {
     vm.runInContext([
       "handleGenerate", "validQuoteDraftVersion", "acknowledgeGeneratedQuoteDraft", "generationFailureMessages",
       "validPricingLedgerReceipt", "unchangedDraftLedgerMatches",
-      "setDownloadFiles", "clearActiveJob", "retainExcludedBasisPricingRows",
+      "setDownloadFiles", "clearActiveJob", "currentReinclusionRows", "withoutReincludedSelection", "retainExcludedBasisPricingRows",
       "postCommitProjectionWarningFrom", "postCommitProjectionWarningMessage",
     ].map(extract).join("\n"), c);
     state.activeSidePanel = "output";

@@ -178,7 +178,7 @@ const functions = ["canonicalPricingAuthorityText", "withQuoteStepLoading", "sho
   "quoteDependencyChangeCopy", "hideQuoteDependencyConfirmModal", "requestQuoteDependencyChangeConfirmation",
   "confirmQuoteDependencyChange", "missingCustomerFields", "customerDetailsBlockReason",
   "missingQuoteCompanyFields", "missingDetailFields", "startAnalysisBlockReason", "quoteCompanyDetailsBlockReason",
-  "standardServiceDecisionsForSave", "currentStandardServiceDecisions", "normalizeStandardServiceDecisions", "buildSessionSnapshot", "pendingReinclusionTagged", "pendingReinclusionDraftBasis", "recordSavedExclusions", "currentQuoteSessionDraftState", "currentQuoteSessionPayload", "buildPayload",
+  "standardServiceDecisionsForSave", "currentStandardServiceDecisions", "normalizeStandardServiceDecisions", "currentReinclusionRows", "withoutReincludedSelection", "buildSessionSnapshot", "pendingReinclusionTagged", "pendingReinclusionDraftBasis", "recordSavedExclusions", "currentQuoteSessionDraftState", "currentQuoteSessionPayload", "buildPayload",
   "quoteSessionDraftComparisonKey", "quoteSessionDraftFileComparisonKey", "rememberConfirmedQuoteSessionDraft",
   "quoteSessionDraftFilesAreConfirmed", "quoteSessionDraftIsConfirmed", "saveCurrentQuoteSession",
   "validQuoteDraftVersion", "validPricingLedgerReceipt", "unchangedDraftLedgerMatches", "requireQuoteDraftReopen",

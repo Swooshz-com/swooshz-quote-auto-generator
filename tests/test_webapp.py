@@ -666,7 +666,7 @@ def excel_col(index: int) -> str:
     return result
 
 
-def synthetic_sectioned_pricing_workbook_bytes(include_visuals: bool = True) -> bytes:
+def synthetic_sectioned_pricing_workbook_bytes(include_visuals: bool = True, priced: bool = True) -> bytes:
     catalog = json.loads(KONCEPT_CATALOG.read_text(encoding="utf-8"))
     rows: list[list[object | None]] = []
     price_row_numbers: list[int] = []
@@ -683,7 +683,8 @@ def synthetic_sectioned_pricing_workbook_bytes(include_visuals: bool = True) -> 
         row[webapp.SECTIONED_WORKBOOK_COL_DEFAULT_ESTIMATE] = item.get("default_quote_amount")
         row[webapp.SECTIONED_WORKBOOK_COL_COST] = item["internal_cost"]
         row[webapp.SECTIONED_WORKBOOK_COL_GST] = item.get("gst_multiplier")
-        row[webapp.SECTIONED_WORKBOOK_COL_MARKUP] = item["markup_multiplier"]
+        # A blank cost or markup is not an unpriced row in this layout; a markup that cannot be used is.
+        row[webapp.SECTIONED_WORKBOOK_COL_MARKUP] = item["markup_multiplier"] if priced else -1
         row[webapp.SECTIONED_WORKBOOK_COL_REMARKS] = "; ".join(item.get("remarks") or [])
         rows.append(row)
         price_row_numbers.append(len(rows))
@@ -25058,6 +25059,8 @@ eval([
   "emptyQuoteCommercialTouched",
   "normalizeQuoteCommercialTouched",
   "isPlainObject", "standardServiceDecisionsForSave", "currentStandardServiceDecisions", "normalizeStandardServiceDecisions",
+  "currentReinclusionRows",
+  "withoutReincludedSelection",
   "buildSessionSnapshot",
   "detachedBasisChatAuthorityValue",
   "basisChatBrowserSnapshot",
@@ -26459,7 +26462,7 @@ eval([
   "outputEditorPlaceholder",
   "outputEditorHtml",
   "renderOutputEditCell",
-  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor", "retainExcludedBasisPricingRows",
+  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor", "currentReinclusionRows", "withoutReincludedSelection", "retainExcludedBasisPricingRows",
   "appIsBusy", "applyOutputIncludedAction",
   "handleOutputEditorCommit",
 ].map(extractFunction).join("\n"));
@@ -26679,7 +26682,7 @@ eval([
   "downloadFileIsFresh",
   "pdfFileIsFresh",
   "updateDownloadButton",
-  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "outputPriceAuthority", "outputPriceDenomination", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor", "retainExcludedBasisPricingRows",
+  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "outputPriceAuthority", "outputPriceDenomination", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor", "currentReinclusionRows", "withoutReincludedSelection", "retainExcludedBasisPricingRows",
   "hideOutputDeleteModal",
   "confirmOutputRowDelete",
 ].map(extractFunction).join("\n"));
@@ -29061,7 +29064,7 @@ const required = ["isPlainObject", "objectHasExactKeys", "safeQuoteSessionId", "
   "quoteSessionDraftFileComparisonKey", "rememberConfirmedQuoteSessionDraft", "quoteSessionDraftFilesAreConfirmed",
   "quoteSessionDraftIsConfirmed", "currentQuoteSessionIsRestoredFromDashboard", "quoteSessionDraftStateCanSave",
   "clearQuoteSessionDraftSaveTimer", "saveCurrentQuoteSession", "saveQuoteSessionDraftState", "ensureQuoteSession",
-  "quoteSessionDraftSynchronizationFailureMessage", "standardServiceDecisionsForSave", "currentStandardServiceDecisions", "normalizeStandardServiceDecisions", "handleDraftBasis", "handleGenerate", "retainExcludedBasisPricingRows",
+  "quoteSessionDraftSynchronizationFailureMessage", "standardServiceDecisionsForSave", "currentStandardServiceDecisions", "normalizeStandardServiceDecisions", "handleDraftBasis", "handleGenerate", "currentReinclusionRows", "withoutReincludedSelection", "retainExcludedBasisPricingRows",
   "ensureSavedServerJobStarted", "startJob", "duplicateDashboardQuote", "finishDashboardOperation", "copiedQuotePricingRow", "sameLineItemSourceIdentities", "adoptGenerationOutputRows", "authenticationRecoveryNavigating"];
 if (scenario.realRefresh || scenario.kind === "excel" || scenario.kind === "dashboard-failure") required.push("getJson", "applySessionData", "renderAuthState");
 if (scenario.refreshBoundary) required.push("markPageUnloading");
@@ -31437,6 +31440,7 @@ eval([
   "applyPossiblePricingMatch",
   "reincludedCatalogueSelectionKey",
   "shortTextKey",
+  "currentReinclusionRows",
   "withoutReincludedSelection",
   "recordSavedExclusions",
   "basisLineIsSavedExcluded",
@@ -31922,6 +31926,11 @@ for (const tick of [
     tick();
     assert.deepStrictEqual(pendingPricingSelections(), savedExcluded ? [{ source_basis_line_id: catalogLine.id,
       catalog_item_id: catalogLine.pricing_keyword, expected_revision: 3, reinclude: true }] : []);
+    // A price the current reference no longer backs is not asked for again.
+    const admitted = outputPriceAuthority;
+    outputPriceAuthority = () => null;
+    assert.deepStrictEqual(pendingPricingSelections(), []);
+    outputPriceAuthority = admitted;
     assert.equal(queuedDraftSaves, savedExcluded ? 1 : 0, "the tick is saved with the quote");
     retagBasisLine("objects", 0, "Exclude");
     assert.ok(!state.lineItems.some((row) => row.reincluded_catalog_selection), "X kept the selection");
@@ -33052,7 +33061,7 @@ eval([
   "outputPricingIsDeferred",
   "outputRowsToLineItems",
   "pricingSelectionReviewMessage", "outputRowsValid",
-  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor", "retainExcludedBasisPricingRows",
+  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor", "currentReinclusionRows", "withoutReincludedSelection", "retainExcludedBasisPricingRows",
 ].map(extractFunction).join("\n"));
 
 function selectedPricingReferenceCurrency() { return "SGD"; }
