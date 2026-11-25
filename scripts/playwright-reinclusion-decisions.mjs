@@ -62,6 +62,9 @@ const onBasis = async (sessionId) => {
   return page;
 };
 const reload = async (page) => {
+  // A save cut off by F5 may or may not have reached the server, so the page asks for a reopen: settle first.
+  await idle(page);
+  await page.waitForLoadState("networkidle");
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && state.quoteBasisSections.length > 0 && !appIsBusy(), null, { timeout: 30000 });
   assert(await page.evaluate(() => state.activeSidePanel) === "basis", "F5 left Quote Basis");
@@ -283,6 +286,8 @@ try {
   ({ page, sessionId } = await finished(["carpet"]));
   const outputIndex = (id) => page.evaluate((rowId) => state.outputRows.findIndex((row) => row.source_basis_line_id === rowId), id);
   const editRow = async (id, field, value) => {
+    // A save that lands while the editor is open commits what is typed and closes it.
+    await idle(page);
     const index = await outputIndex(id);
     await page.locator(`tr[data-output-row="${index}"] [data-output-edit-field="${field}"]`).click();
     if (value) {
