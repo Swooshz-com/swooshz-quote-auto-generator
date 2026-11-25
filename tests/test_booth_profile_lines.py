@@ -85,6 +85,13 @@ class BoothProfileLineTest(unittest.TestCase):
                     self.assertEqual(self.drafts.row(result, known.CARPET)["quantity"], 36)
             self.assertIn("The booth itself is never a quote line", prompt)
 
+    def test_a_marked_line_without_size_or_row_is_accepted_as_the_contract_asks(self):
+        reply = self.reply({"text": "Two-sided corner plot note", "quantity": None, "unit": None, "booth_profile": True}, linked=False)
+        result, _prompt = self.drafts.run_draft(self.drafts.payload(""), reply)
+        self.assertEqual(result["source"], "openai")
+        self.assertNotIn("Two-sided corner plot note", self.quote_lines(result))
+        self.assertEqual(len(result["line_items"]), 2)
+
     def test_physical_and_priced_lines_stay_quote_lines(self):
         for text in PHYSICAL_TEXTS:
             with self.subTest(text=text):
@@ -170,6 +177,8 @@ class AppliedBoothSizeTextTest(unittest.TestCase):
             return webapp.staff_sized_booth_text(text, staff, 36, whole_floor=whole_floor, informational=informational)
         self.assertEqual(restated("Booth footprint 6m (W) x 6m (D) = 36 sqm"), "Booth footprint 8m x 9m = 72 sqm")
         self.assertEqual(restated("Booth 6 x 6 x 4m H"), "Booth 8m x 9m x 4m H")
+        self.assertEqual(restated("Booth W 6m x D 6m"), "Booth 8m x 9m")
+        self.assertEqual(restated("Booth W6000 x D6000mm, 36 sqm"), "Booth 8m x 9m, 72 sqm")
         self.assertEqual(restated("Booth size 8m x 9m, 72 sqm"), "Booth size 8m x 9m, 72 sqm")
         self.assertEqual(restated("Floor 1m x 1m tiles", whole_floor=True, informational=False), "Floor 1m x 1m tiles")
         self.assertIsNone(restated(None))
@@ -177,7 +186,7 @@ class AppliedBoothSizeTextTest(unittest.TestCase):
     def test_long_text_stays_fast(self):
         import time
         staff = {"booth_width": None, "booth_depth": None, "booth_area_sqm": 93}
-        for text in ("6m" + " " * 4000, ("6 x" + " " * 40) * 80, "6m w" * 900, "9" * 4000):
+        for text in ("6m" + " " * 4000, ("6 x" + " " * 40) * 80, "6m w" * 900, "9" * 4000, "w " * 2000, "6 x w" * 800):
             started = time.monotonic()
             webapp.staff_sized_booth_text(text, staff, 36, whole_floor=True, informational=True)
             self.assertLess(time.monotonic() - started, 0.5, text[:12])

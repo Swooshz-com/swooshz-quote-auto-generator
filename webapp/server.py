@@ -26667,8 +26667,8 @@ def rescaled_footprint_text(value: Any, old_area: float, new_area: float) -> Any
 
 
 BOOTH_STATED_PAIR_RE = re.compile(
-    rf"(?<![\d.]){BOOTH_SIZE_NUMBER}(?:\s*{BOOTH_SIZE_LENGTH_UNIT})?(?:\s*\(?(?:w|d|l|wide|width|deep|depth|long|length)\b\)?)?"
-    rf"\s*(?:x|\u00d7|\*|by)\s*"
+    rf"(?:\b[wdl]\s*)?(?<![\d.]){BOOTH_SIZE_NUMBER}(?:\s*{BOOTH_SIZE_LENGTH_UNIT})?(?:\s*\(?(?:w|d|l|wide|width|deep|depth|long|length)\b\)?)?"
+    rf"\s*(?:x|\u00d7|\*|by)\s*(?:[wdl]\s*)?"
     rf"{BOOTH_SIZE_NUMBER}(?:\s*{BOOTH_SIZE_LENGTH_UNIT})?(?:\s*\(?(?:w|d|l|wide|width|deep|depth|long|length)\b\)?)?(?!\d|\.\d)",
     flags=re.IGNORECASE,
 )
