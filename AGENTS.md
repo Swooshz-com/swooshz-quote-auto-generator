@@ -10,8 +10,8 @@
 ## Release And Live Safety
 
 - Release order, per the runbook: rehearsal, live-data test on a copy, agent UAT, owner UAT, deploy, live read-only check, delete the copies.
-- These need the owner's own OK for the exact action: deploys, live migrations (named target and checksum), env or key changes, deletions, and paid AI calls.
-- Copies of live hold real customer data: keep them at most 24 hours unless the owner extends it, then delete them. Evidence holds ids and counts only.
+- Deploys, live migrations (named target and checksum), env or key changes, deletions, and paid AI calls need the owner's own OK naming the exact action. An OK the owner recorded as standing (for example the recorded deploy permission) counts within its exact terms.
+- Copies of live hold real customer data: they stay up at most 24 hours from the owner hand-off (runbook step 8.2) unless the owner extends it, and are deleted after the live deploy, when the candidate is abandoned, or when those 24 hours pass. Evidence holds ids and counts only.
 - Never commit real company or bank data, private/customer data, real exported profile JSON, embedded real logos, generated local outputs, or sensitive fixtures.
 
 ## UI
@@ -25,7 +25,7 @@
 - Do not generate a quote from a text-only item list, and do not ask the user to create, edit, inspect, or approve an internal generator brief file.
 - Suggest a quote basis from images and user notes, then ask the user to confirm it before generating. Do not silently assume materials, finishes, dimensions, or inclusions.
 - Use the active selected pricing reference pack's `pricing-catalog.json` as the authoritative pricing reference.
-- The quote look comes from the active selected profile: its `quotation-layout.xlsx` and `layout-rules.json` (readable quantity widths, bold table headers, centered quantity values, thousands separators, dynamic totals, header logo/details inside the print area). A profile with a saved quote template (`quote_template_id`, see `docs/quote-template-schema.md`) uses that template instead; "Profile's own layout" switches it back to its own workbook. Keep all of these formatting rules whichever source is used.
+- The quote look comes from the active selected profile. With no `quote_template_id` it uses the profile's own `quotation-layout.xlsx` and `layout-rules.json` (readable quantity widths, bold table headers, centered quantity values, thousands separators, dynamic totals, header logo/details inside the print area). With a choice (`docs/quote-template-schema.md`): `default` is the workspace default template, else the built-in Standard; a deleted template falls back to that default with a note; "Profile's own layout" switches back to the workbook. A template replaces `layout-rules.json`: the schema and generator enforce A4 fit, logo width inside its block, text width limits, `#,##0.00` amounts, normally calculated totals and no live formulas, while fonts, sizes, bold, alignment, widths and labels are the admin's choice.
 - Use `sqm` for square-metre quantities; do not use `m2` in customer-facing output.
 - Do not expose internal cost, GST, markup, or supplier notes in customer-facing output unless the user explicitly asks.
 - Do not generate PDFs by default. `quotation.xlsx` is the formatted customer-ready master output; Excel-only is the default webapp behavior.
