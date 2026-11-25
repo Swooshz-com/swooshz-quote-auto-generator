@@ -31434,6 +31434,7 @@ eval([
             "catalogBackedPossibleMatchText",
   "applyPossiblePricingMatch",
   "reincludedCatalogueSelectionKey",
+  "shortTextKey",
   "withoutReincludedSelection",
   "recordSavedExclusions",
   "basisLineIsSavedExcluded",

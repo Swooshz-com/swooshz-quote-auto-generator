@@ -530,6 +530,7 @@ const isPlainObject = (value) => value && typeof value === "object" && !Array.is
 const quoteSessionDraftStateCanSave = () => true;
 const normalizeBasisTag = (tag) => tag;
 const reincludedCatalogueSelectionKey = (_line, _section, row) => row.source_basis_line_id;
+const outputPriceAuthority = (row) => row.pricing_authority;
 const buildLineItemNormalizePayload = () => ({});
 const normalizeLineItem = (row) => row;
 const pricingAuthorityPrice = (authority) => authority?.price ?? null;

@@ -13105,13 +13105,27 @@ function applyPossiblePricingMatch(sectionId, lineIndex, matchIndex) {
 }
 
 function reincludedCatalogueSelectionKey(line, section, row) {
-  const authority = outputPriceAuthority(row);
+  // Read as saved: a tick can mark a whole block, so the price itself is checked once, at Confirm.
+  const authority = row.pricing_authority;
   if (authority?.variant !== "catalog" || authority.catalog_item_id !== line.pricing_keyword) return "";
   // A typed quantity keeps the selection, like a quantity edit on a priced line; Confirm saves it first.
-  return JSON.stringify([
+  return shortTextKey([
     section.id, section.title, line.id, line.source_line_item_id || "", line.text, line.unit,
-    authority.context, currentPricingReference()?.id, authority.catalog_source, authority.catalog_digest,
-  ]);
+    ...Object.entries(authority.context || {}).flat(), currentPricingReference()?.id, authority.catalog_source, authority.catalog_digest,
+  ].join(""));
+}
+
+// Saved on every row ticked back in and in each copy of the draft, so it is kept short. It only tells
+// whether the line changed since the tick; the server proves the selection itself.
+function shortTextKey(text) {
+  let low = 0x811c9dc5;
+  let high = 0x9e3779b9;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    low = Math.imul(low ^ code, 0x01000193);
+    high = Math.imul(high ^ code, 0x85ebca6b);
+  }
+  return (low >>> 0).toString(36) + (high >>> 0).toString(36);
 }
 
 // Saved drafts keep a line ticked back in as excluded, with its tick recorded on the row, until Confirm
@@ -13135,7 +13149,7 @@ function pendingReinclusionDraftBasis(snapshot) {
   const quoteBasisSections = pendingReinclusionTagged(snapshot.quoteBasisSections, snapshot.lineItems, "Include", "Exclude");
   return quoteBasisSections === snapshot.quoteBasisSections
     ? { quoteBasis: snapshot.quoteBasis, quoteBasisSections }
-    : { quoteBasis: canonicalQuoteBasisForPersistence(quoteBasisFromSections(quoteBasisSections), quoteBasisSections), quoteBasisSections };
+    : { quoteBasis: canonicalQuoteBasis(quoteBasisFromSections(quoteBasisSections)), quoteBasisSections };
 }
 
 function restorePendingReinclusions() {
@@ -13146,7 +13160,7 @@ function restorePendingReinclusions() {
   });
   if (!keys.size) return;
   state.quoteBasisSections = sections;
-  state.quoteBasis = canonicalQuoteBasisForPersistence(quoteBasisFromSections(sections), sections);
+  state.quoteBasis = canonicalQuoteBasis(quoteBasisFromSections(sections));
   state.lineItems = state.lineItems.map((row) => (keys.has(row.source_basis_line_id)
     ? { ...row, reincluded_catalog_selection: keys.get(row.source_basis_line_id) } : row));
 }
@@ -14942,6 +14956,7 @@ function pendingPricingSelections() {
     const revision = revisions[rowId];
     const reinclude = Boolean(row.reincluded_catalog_selection) || row.pricing_authority?.variant === "catalog";
     if (reinclude && (!row.reincluded_catalog_selection || (revision !== undefined && (!Number.isSafeInteger(revision) || revision < 0))
+      || outputPriceAuthority(row)?.variant !== "catalog"
       || row.reincluded_catalog_selection !== reincludedCatalogueSelectionKey(line, section, row))) return;
     selections.set(rowId, { source_basis_line_id: rowId, catalog_item_id: itemId,
       expected_revision: Number.isInteger(revision) && revision >= 0 ? revision : 0,
