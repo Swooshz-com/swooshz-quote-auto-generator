@@ -235,12 +235,6 @@
       "rule": "number-reference",
       "fingerprint": "4fe2a194b6698cdbc2a90624f7dd3f2aa7db72fd20bd658753da86a06ff22494",
       "count": 3
-    },
-    {
-      "file": "docs/sqag-current-status.md",
-      "rule": "number-reference",
-      "fingerprint": "08d794b7a0f150e78ce8dda6fee92c0e1f14dc6d46709d663aaa6b124230bd96",
-      "count": 1
     }
   ]
 }

@@ -49,7 +49,7 @@ the resolved catalogue. This is the entry point for a future pass that
 shortlists matches against the full selected snapshot before choosing a row.
 The server verifies pricing authority and grants, and owns quote versions and
 publication. `scripts/generate_quote.py` independently validates the trusted
-brief and produces the XLSX with the selected profile layout.
+brief and produces the XLSX with the selected profile layout or quote template.
 
 The external quotation API remains disabled. Staff access and persisted quote
 data are governed by the existing server and storage boundaries.

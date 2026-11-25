@@ -57,3 +57,6 @@ fixtures/**/*.pdf
 tests/fixtures/**/*.pdf
 tests/fixtures/quote-generator/samples/
 fixtures/samples/
+
+# Worktree scratch
+.tmp/
