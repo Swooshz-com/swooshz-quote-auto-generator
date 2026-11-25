@@ -259,6 +259,10 @@ DRAFT_SYNTHESIS = ResponseContract("draft_synthesis_v1", obj(
             # Owner (18 Nov 2026): the Quote Basis shows "Est." on a quantity the AI predicted rather than read.
             quantity_estimated=Field("boolean", nullable=True,
                                      instruction="true when quantity was predicted rather than stated or counted"),
+            # #334: the booth profile is never a quote line.
+            booth_profile=Field("boolean", nullable=True, optional=True,
+                                instruction="true only when the line describes the booth itself (its size, floor area, shape, "
+                                            "open sides, height or layout) and names nothing to build, supply, hire or do"),
             pricing_keyword=Field("string", nullable=True),
         )),
     )),

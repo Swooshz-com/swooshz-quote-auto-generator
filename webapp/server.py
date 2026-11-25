@@ -5870,7 +5870,73 @@ def is_informational_dimension_basis_line(line: dict[str, Any]) -> bool:
         return False
     if clean_text(line.get("pricing_reference_description") or line.get("catalog_description")):
         return False
-    return is_informational_dimension_text(line.get("text") or line.get("description"))
+    return line.get("booth_profile") is True or is_informational_dimension_text(line.get("text") or line.get("description"))
+
+
+# The booth profile (#334: size, floor area, shape, open sides, height, layout) is shown under Detected booth
+# and is never a quote line. A draft line is the booth profile when the AI marks it, or when it names nothing
+# but the booth: every word is the booth, a profile property or filler. Any other word (a material, an object,
+# a service) keeps it a quote line.
+BOOTH_PROFILE_SUBJECT_WORDS = frozenset("booth stand space exhibit exhibition".split())
+BOOTH_PROFILE_PROPERTY_WORDS = frozenset(
+    "size footprint dimension dimensions area shape profile side sides open corner island peninsula inline "
+    "height orientation configuration layout".split()
+)
+BOOTH_PROFILE_FILLER_WORDS = frozenset((
+    "a an the of for to be is are was were and or with without on in at from as by per this that its no not only each "
+    "use used using based because before after until when "
+    "total totalling totaling overall whole full gross net approximately approx about around estimated estimate assumed "
+    "assumption provisional proposed indicative nominal default defaults defaulted fixed known detected stated given shown "
+    "confirm confirmed confirms confirming confirmation review reviewed check checked verify verified required needed pending "
+    "subject clear unclear missing found generating quoting quote note client customer organiser organizer "
+    "drawing drawings plan plans reference references render renders image images details floor "
+    "type width depth length wide deep high long front rear "
+    "x w d h l m mm cm ft sqm sqft sq square metre metres meter meters"
+).split())
+
+
+def names_only_the_booth(value: Any) -> bool:
+    text = clean_text(value).lower()
+    if not text or bracketed_catalog_reference_parts(text):
+        return False
+    # "6m" and "6x6" are sizes: only their letters are left as words.
+    words = set(re.findall(r"[^\W\d_]+", text.replace("\u00b2", "2")))
+    return bool(words & BOOTH_PROFILE_SUBJECT_WORDS and words & BOOTH_PROFILE_PROPERTY_WORDS) and not (
+        words - BOOTH_PROFILE_SUBJECT_WORDS - BOOTH_PROFILE_PROPERTY_WORDS - BOOTH_PROFILE_FILLER_WORDS
+    )
+
+
+def separate_booth_profile_lines(parsed: Any) -> Any:
+    """Take the booth profile out of an AI draft's quote lines, before any line is sized or priced.
+
+    A line or row the AI matched to the catalogue is a quote line whatever its words say.
+    """
+    if not isinstance(parsed, dict):
+        return parsed
+    linked = raw_draft_line_items_by_basis_line(parsed)
+    profile_ids: set[str] = set()
+    for section in parsed.get("quote_basis_sections") if isinstance(parsed.get("quote_basis_sections"), list) else []:
+        for line in section.get("lines") if isinstance(section, dict) and isinstance(section.get("lines"), list) else []:
+            if not isinstance(line, dict):
+                continue
+            marked = line.pop("booth_profile", None) is True
+            line_id = clean_text(line.get("id"))
+            rows = linked.get(line_id, []) if line_id else []
+            if any(clean_text(entry.get("pricing_keyword")) for entry in (line, *rows)):
+                continue
+            if not marked and not names_only_the_booth(line.get("text") or line.get("description")):
+                continue
+            for key in ("quantity", "unit", "quantity_estimated", "quantity_estimate"):
+                line.pop(key, None)
+            line["booth_profile"] = True
+            if line_id:
+                profile_ids.add(line_id)
+    if profile_ids and isinstance(parsed.get("line_items"), list):
+        parsed["line_items"] = [
+            row for row in parsed["line_items"]
+            if not (isinstance(row, dict) and clean_text(row.get("source_basis_line_id")) in profile_ids)
+        ]
+    return parsed
 
 
 def basis_line_allows_quote_output(line: dict[str, Any]) -> bool:
@@ -5935,10 +6001,12 @@ def normalized_quantity_estimate(value: Any) -> dict[str, Any] | None:
 def normalize_basis_lines(value: Any) -> list[dict[str, Any]]:
     if isinstance(value, dict):
         value = canonicalize_primary_order_fields(value)
-        quantity_parts = normalized_line_text_quantity_parts(
-            value.get("text") or value.get("line") or value.get("description"),
-            value.get("quantity"),
-            value.get("unit"),
+        line_text = value.get("text") or value.get("line") or value.get("description")
+        quantity_parts = (
+            # The booth profile has no quantity: "93 sqm booth, corner" is its wording.
+            {"text": clean_customer_quote_line_text(line_text), "quantity": "", "unit": ""}
+            if value.get("booth_profile") is True
+            else normalized_line_text_quantity_parts(line_text, value.get("quantity"), value.get("unit"))
         )
         text = quantity_parts["text"]
         if not text:
@@ -5966,6 +6034,8 @@ def normalize_basis_lines(value: Any) -> list[dict[str, Any]]:
             estimate = normalized_quantity_estimate(value.get("quantity_estimate"))
             if estimate and "quantity" in line:
                 line["quantity_estimate"] = estimate
+            if value.get("booth_profile") is True:
+                line["booth_profile"] = True
             pricing_keyword = clean_text(value.get("pricing_keyword"))
             if pricing_keyword:
                 line["pricing_keyword"] = pricing_keyword
@@ -6765,6 +6835,13 @@ QUANTITY_ESTIMATED_RULE = (
     "(from the booth size, drawing scale or grid, or typical sizes) rather than read from a stated dimension, "
     "quantity or visible count, and to false when the evidence gives it. "
 )
+# #334: the booth profile is never a quote line.
+BOOTH_PROFILE_RULE = (
+    "The booth itself is never a quote line: give its size in project only, and never add a line or a line_items row that "
+    "describes, reviews or asks staff to confirm its size, floor area, shape, open sides, height or layout, a default size included. "
+    "If such a line is unavoidable, set booth_profile to true on it with no quantity, unit or line_items row; "
+    "otherwise set booth_profile to false. Flooring, platforms, walls and everything else that is built, supplied or done stays a quote line. "
+)
 LINEAR_TAKEOFF_UNITS = {"m", "m length", "m run"}
 PIECE_DIMENSION_DESCRIPTION_RE = re.compile(
     r"(?i)^(?:nos\.?\s+of\s+1m\s+length\s+x|m\.?\s*length\s*x)\b"
@@ -7180,7 +7257,11 @@ def sanitize_pricing_reference_item(
     raw: dict[str, Any],
     index: int = 0,
     apply_import_text_fixes: bool = False,
+    *,
+    allow_unpriced: bool = False,
 ) -> dict[str, Any] | None:
+    """A catalogue row, or None when it cannot be one. allow_unpriced keeps a row without a usable cost or
+    markup, with the missing number empty, for an import preview only: it is never a saved price."""
     raw_description = sanitize_formula_text(raw.get("description"))
     description = apply_pricing_workbook_text_fixes(raw_description) if apply_import_text_fixes else clean_text(raw_description)
     raw_reference_section = sanitize_formula_text(raw.get("reference_section") or raw.get("section"))
@@ -7195,7 +7276,8 @@ def sanitize_pricing_reference_item(
         unit_hint = "nos"
     internal_cost = parse_pricing_number(raw.get("internal_cost") or raw.get("cost"))
     markup = parse_pricing_number(raw.get("markup_multiplier") or raw.get("markup"))
-    if not description or internal_cost is None or internal_cost <= 0 or markup is None or markup <= 0:
+    unpriced = internal_cost is None or internal_cost <= 0 or markup is None or markup <= 0
+    if not description or (unpriced and not allow_unpriced):
         return None
     default_quantity = parse_pricing_number(raw.get("default_quantity"))
     default_quote_amount = parse_pricing_number(raw.get("default_quote_amount") or raw.get("default_estimate"))
@@ -7236,7 +7318,7 @@ def sanitize_pricing_reference_item(
         "unit_hint": unit_hint,
         "internal_cost": internal_cost,
         "markup_multiplier": markup,
-        "sale_unit_price": round_commercial_cents(internal_cost * markup),
+        **({} if unpriced else {"sale_unit_price": round_commercial_cents(internal_cost * markup)}),
         "remarks": remarks,
         "aliases": aliases,
     }
@@ -7326,7 +7408,7 @@ def pricing_reference_required_field_errors(items: list[dict[str, Any]]) -> list
         return []
     preview = ", ".join(missing_units[:5])
     suffix = f" and {len(missing_units) - 5} more" if len(missing_units) > 5 else ""
-    return [f"Pricing unit_hint is missing for pricing rows: {preview}{suffix}."]
+    return [f"Unit is missing for pricing rows: {preview}{suffix}."]
 
 
 
@@ -7390,12 +7472,18 @@ def validate_pricing_reference_rows(
     source_name: str = "",
 ) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
-    skipped = 0
+    skipped_rows: list[dict[str, Any]] = []
+    unpriced = 0
     seen_ids: set[str] = set()
-    rows = stitch_pricing_reference_continuation_rows(rows)
+    # Rows are counted as read, before continuation rows join the row they belong to.
+    rows = stitch_pricing_reference_continuation_rows(
+        [{**raw, "_import_row": raw.get("_source_row") or position} for position, raw in enumerate(rows, start=1)])
     for index, raw in enumerate(rows[:MAX_PRICING_REFERENCE_ROWS]):
-        item = sanitize_pricing_reference_item(raw, index, apply_import_text_fixes=True)
+        # Invalid rows stay visible for correction where possible (docs/pricing-catalog-import.md): a row
+        # without a usable cost or markup is kept for staff to complete, and no price is made up for it.
+        item = sanitize_pricing_reference_item(raw, index, apply_import_text_fixes=True, allow_unpriced=True)
         if item:
+            unpriced += "sale_unit_price" not in item
             base_id = safe_catalog_item_id(item.get("id"), f"item-{index + 1}")
             candidate_id = base_id
             suffix = 2
@@ -7407,10 +7495,13 @@ def validate_pricing_reference_rows(
             item["item_order"] = catalogue_order_number(item.get("item_order")) or pricing_reference_order_from_raw(raw, PRICING_REFERENCE_ITEM_ORDER_KEYS) or index + 1
             items.append(item)
         else:
-            skipped += 1
+            skipped_rows.append(skipped_pricing_reference_row(raw, "no description"))
     ensure_pricing_reference_order_fields(items)
-    if len(rows) > MAX_PRICING_REFERENCE_ROWS:
-        skipped += len(rows) - MAX_PRICING_REFERENCE_ROWS
+    skipped_rows.extend(
+        skipped_pricing_reference_row(raw, f"over the limit of {MAX_PRICING_REFERENCE_ROWS} rows")
+        for raw in rows[MAX_PRICING_REFERENCE_ROWS:]
+    )
+    skipped = len(skipped_rows)
     empty_is_error = bool(rows and skipped)
     empty_message = "Add at least one pricing row before saving."
     result = pricing_reference_validation_result(
@@ -7423,7 +7514,20 @@ def validate_pricing_reference_rows(
     )
     if len(rows) > MAX_PRICING_REFERENCE_ROWS:
         result["warnings"].append(f"Only the first {MAX_PRICING_REFERENCE_ROWS} rows were validated.")
+    result["skippedRows"] = skipped_rows
+    result["unpricedRowCount"] = unpriced
+    result["canSave"] = result["canSave"] and not unpriced
     return result
+
+
+def skipped_pricing_reference_row(raw: dict[str, Any], reason: str) -> dict[str, Any]:
+    """Which row an import left out, in words staff can find it by, and why."""
+    details = [
+        clean_text(sanitize_formula_text(value))[:60]
+        for value in (raw.get("section"), raw.get("description"), raw.get("unit_hint") or raw.get("unit"))
+        if clean_text(value)
+    ]
+    return {"row": raw["_import_row"], "label": ", ".join(details), "reason": reason}
 
 
 def first_xlsx_worksheet_name(zf: zipfile.ZipFile) -> str:
@@ -10403,7 +10507,7 @@ def pricing_reference_import_preview(payload: dict[str, Any]) -> dict[str, Any]:
             detected_currency = clean_text(result.get("currency"))
             if result.get("canSave"):
                 result["layout"] = "normalized-pricing-reference"
-            elif result.get("missing") or int(result.get("rowCount") or 0) == 0:
+            elif result.get("missing") or int(result.get("rowCount") or 0) <= int(result.get("unpricedRowCount") or 0):
                 try:
                     decode_started_at = time.perf_counter()
                     raw = decode_data_url_bytes(payload.get("data_url"), MAX_PRICING_REFERENCE_BYTES)
@@ -10413,7 +10517,8 @@ def pricing_reference_import_preview(payload: dict[str, Any]) -> dict[str, Any]:
                         sectioned_started_at = time.perf_counter()
                         sectioned_workbook_result = pricing_reference_import_preview_from_sectioned_workbook(raw, filename)
                         timings_ms["sectioned_workbook_parse"] = elapsed_milliseconds(sectioned_started_at)
-                        if sectioned_workbook_result.get("canSave") or (sectioned_workbook_result.get("rowCount") and not sectioned_workbook_result.get("missing")):
+                        priced_rows = int(sectioned_workbook_result.get("rowCount") or 0) - int(sectioned_workbook_result.get("unpricedRowCount") or 0)
+                        if sectioned_workbook_result.get("canSave") or (priced_rows and not sectioned_workbook_result.get("missing")):
                             route = "sectioned_workbook"
                             result = sectioned_workbook_result
                             if clean_text(detected_metadata.get("label")):
@@ -22587,7 +22692,7 @@ def build_quote_draft_prompt(
         "instead of inventing booth_width and booth_depth. "
         "Do not derive booth dimensions from the quotation title. Use explicit booth-size fields in Quote context JSON when supplied; otherwise infer booth_width and booth_depth from the uploaded images or reference PDFs. "
         "If dimensions are still unclear, use a reasonable default booth size instead of leaving dimensions empty. "
-        "When dimensions use a default booth size, that default must appear as a Confirm line in quote_basis_sections, never as Include. "
+        + BOOTH_PROFILE_RULE +
         "Use those dimensions for area-based quantities and quote-basis wording. "
         "Use the same depth as a quote-basis review takeoff: describe visible materials, "
         "finishes, structures, platform/flooring, graphics/signage, furniture/plants/AV, "
@@ -22599,7 +22704,7 @@ def build_quote_draft_prompt(
         "Do not collapse a full section into a single subtotal unless that item is genuinely sold as one lump-sum service. "
         "Do not put clarification questions into line_items. Do not put generic review questions into quote_basis_sections. "
         "Quote Basis lines represent included, excluded, confirm, or custom scope; unresolved but quoteable uncertainty belongs in Confirm lines, while missing usable evidence belongs in empty quote_basis_sections and line_items. "
-        "Each line item must include section, quantity, unit, description, pricing_keyword, and source_basis_line_id linked to exactly one physical basis line. Quantities must be positive JSON numbers, not locale-formatted or percent strings. Repeated measurements in text, structured fields and linked rows must agree; never choose one contradictory value. Use sqm for square-metre quantities. Do not create ordinary quotation rows with missing quantity or unit. Keep pure informational booth-size lines in Quote Basis only unless they are explicitly included as 1 lot with display_price Included. "
+        "Each line item must include section, quantity, unit, description, pricing_keyword, and source_basis_line_id linked to exactly one physical basis line. Quantities must be positive JSON numbers, not locale-formatted or percent strings. Repeated measurements in text, structured fields and linked rows must agree; never choose one contradictory value. Use sqm for square-metre quantities. Do not create ordinary quotation rows with missing quantity or unit. "
         "Use the pricing_catalog choices in Quote context JSON. When a catalog item applies, set "
         "pricing_keyword exactly to that catalog id from pricing_catalog, not an invented keyword. "
         "Do not include pricing amounts or internal costs. If no catalog item fits and the item should be customer-visible, keep pricing_keyword empty and let the Custom basis line flag it for manual pricing. "
@@ -26559,11 +26664,99 @@ def footprint_quantity_matches(value: Any, area: float) -> bool:
 
 
 def rescaled_footprint_text(value: Any, old_area: float, new_area: float) -> Any:
-    # Keep a repeated measurement in the row text in step with its quantity.
+    """The text of a row resized to new_area: a leading count and unit follows, a bracketed catalogue reference stays."""
     if not isinstance(value, str):
         return value
+    reference = bracketed_catalog_reference_parts(value)
+    if reference:
+        name, detail = reference
+        return f"[ {name} ] - {rescaled_footprint_text(detail, old_area, new_area)}" if detail else value
+    prefix = leading_quantity_prefix(value)
+    prefix = prefix if prefix and footprint_quantity_matches(prefix["quantity"], old_area) else None
     pattern = rf"(?<![\d.]){re.escape(format_dimension(old_area))}(?:\.0+)?(\s*(?:sqm|sq\.?\s*m\b|m2|m\u00b2))"
-    return re.sub(pattern, lambda match: f"{format_dimension(new_area)}{match.group(1)}", value, flags=re.IGNORECASE)
+    text = re.sub(pattern, lambda match: f"{format_dimension(new_area)}{match.group(1)}", prefix["text"] if prefix else value, flags=re.IGNORECASE)
+    return f"{format_dimension(new_area)} {prefix['unit']} {text}" if prefix else text
+
+
+def row_text_measurement(value: Any) -> dict[str, Any] | None:
+    """The count and unit the server can read from a row's text, also once a bracketed reference is unwrapped."""
+    reference = bracketed_catalog_reference_parts(value)
+    return leading_quantity_prefix((reference[1] or reference[0]) if reference else value)
+
+
+BOOTH_STATED_PAIR_RE = re.compile(
+    rf"(?:\b[wdl]\s*)?(?<![\d.]){BOOTH_SIZE_NUMBER}(?:\s*{BOOTH_SIZE_LENGTH_UNIT})?(?:\s*\(?(?:w|d|l|wide|width|deep|depth|long|length)\b\)?)?"
+    rf"\s*(?:x|\u00d7|\*|by)\s*(?:[wdl]\s*)?"
+    rf"{BOOTH_SIZE_NUMBER}(?:\s*{BOOTH_SIZE_LENGTH_UNIT})?(?:\s*\(?(?:w|d|l|wide|width|deep|depth|long|length)\b\)?)?(?!\d|\.\d)",
+    flags=re.IGNORECASE,
+)
+# "booth footprint of 6m x 6m" and "6m x 6m booth" state the booth's size; "6m x 6m truss" states the truss.
+BOOTH_SIZE_STATED_BEFORE_RE = re.compile(
+    r"(?:\bfootprint|\b(?:booth|stand|space|floor)(?:\s+(?:size|area|dimensions?|footprint|space))?)(?:\s+(?:of|is|at))?\W*$")
+BOOTH_SIZE_STATED_AFTER_RE = re.compile(r"^\W*(?:booth|stand|space|footprint)\b")
+
+
+def applied_booth_profile_text(value: Any, staff: dict[str, Any], ai_area: float | None) -> Any:
+    """Replace a booth size in a booth profile line that contradicts the size staff applied."""
+    if not isinstance(value, str):
+        return value
+    staff_area = parse_float_or_none(staff.get("booth_area_sqm"))
+    label = booth_size_label(staff.get("booth_width"), staff.get("booth_depth"), staff_area)
+    if not label or not staff_area:
+        return value
+    only_booth = names_only_the_booth(value)
+
+    def contradicts(area: float | None, text: str, start: int, end: int) -> bool:
+        if not area or footprint_quantity_matches(area, staff_area):
+            return False
+        if ai_area and footprint_quantity_matches(area, ai_area):
+            return True
+        # Another size may be another object's, unless the line or its words say it is the booth's.
+        return area >= BOOTH_AREA_MIN_SQM and bool(
+            only_booth
+            or BOOTH_SIZE_STATED_BEFORE_RE.search(text[max(0, start - 60):start].lower())
+            or BOOTH_SIZE_STATED_AFTER_RE.match(text[end:end + 30].lower()))
+
+    pieces: list[str] = []
+    position = 0
+    for match in BOOTH_STATED_PAIR_RE.finditer(value):
+        if booth_size_pair_continues_earlier(value, match.start()):
+            continue
+        unit = match.group(4) or match.group(2) or ""
+        width = booth_length_in_metres(match.group(1), match.group(2) or unit)
+        depth = booth_length_in_metres(match.group(3), match.group(4) or unit)
+        if width is None or depth is None or not contradicts(width * depth, value, match.start(), match.end()):
+            continue
+        pieces.extend((value[position:match.start()], label))
+        position = match.end()
+        # "6m x 6m x 4m H" keeps its height.
+        height = re.match(r"\s*(?:x|\u00d7|\*|by)\s*(?=\d)", value[position:], re.IGNORECASE)
+        if height:
+            pieces.append(" x " if staff.get("booth_width") else ", ")
+            position += height.end()
+    text = "".join((*pieces, value[position:]))
+    pieces, position = [], 0
+    for match in BOOTH_SIZE_AREA_RE.finditer(text):
+        if contradicts(parse_float_or_none(match.group(1).replace(",", "")), text, match.start(), match.end()):
+            pieces.extend((text[position:match.start(1)], format_dimension(round(staff_area, 2))))
+            position = match.end(1)
+    return "".join((*pieces, text[position:]))
+
+
+def with_applied_booth_profile(parsed: dict[str, Any], staff: dict[str, Any], ai: dict[str, Any]) -> dict[str, Any]:
+    """After a Known details size is applied, no booth profile line states another booth size.
+
+    Only these lines: they are never quote lines, so no quantity, unit, match or price is read from their text.
+    """
+    ai_area = parse_float_or_none(ai.get("booth_area_sqm")) if clean_text(ai.get("dimension_source")) != "default" else None
+    result = copy.deepcopy(parsed)
+    for section in result.get("quote_basis_sections") or []:
+        for line in (section.get("lines") or []) if isinstance(section, dict) else []:
+            if isinstance(line, dict) and line.get("booth_profile") is True:
+                for key in ("text", "description"):
+                    if key in line:
+                        line[key] = applied_booth_profile_text(line[key], staff, ai_area)
+    return result
 
 
 def staff_footprint_rescale(
@@ -26580,13 +26773,15 @@ def staff_footprint_rescale(
         return parsed, None
     staff_area = parse_float_or_none(payload_dimensions.get("booth_area_sqm"))
     ai_area = parse_float_or_none(ai_dimensions.get("booth_area_sqm"))
-    if not staff_area or not ai_area or clean_text(ai_dimensions.get("dimension_source")) == "default":
+    if not staff_area:
         return parsed, None
+    result = with_applied_booth_profile(parsed, payload_dimensions, ai_dimensions)
+    if not ai_area or clean_text(ai_dimensions.get("dimension_source")) == "default":
+        return result, None
     if footprint_quantity_matches(ai_area, staff_area):
-        return parsed, None
+        return result, None
     staff_area = round(staff_area, 2)
     staff_quantity = int(staff_area) if float(staff_area).is_integer() else staff_area
-    result = copy.deepcopy(parsed)
     resized = 0
 
     def resize(row: Any) -> bool:
@@ -26594,14 +26789,15 @@ def staff_footprint_rescale(
             return False
         if not footprint_quantity_matches(row.get("quantity"), ai_area):
             return False
+        texts = {key: rescaled_footprint_text(row[key], ai_area, staff_area) for key in ("text", "description") if key in row}
+        # The server reads a row's leading count from its text: where that would still be the old size, the row stays as drafted.
+        if any(read and footprint_quantity_matches(read["quantity"], ai_area) for read in map(row_text_measurement, texts.values())):
+            return False
         # A predicted size keeps its Est. mark at the new size (owner: predicted quantities always show Est.).
         estimate = normalized_quantity_estimate(row.get("quantity_estimate"))
         if estimate and footprint_quantity_matches(estimate["quantity"], ai_area):
             row["quantity_estimate"] = {"quantity": staff_quantity, "unit": row.get("unit")}
-        row["quantity"] = staff_quantity
-        for key in ("text", "description"):
-            if key in row:
-                row[key] = rescaled_footprint_text(row[key], ai_area, staff_area)
+        row.update(texts, quantity=staff_quantity)
         return True
 
     for row in result.get("line_items") or []:
@@ -26674,6 +26870,7 @@ def normalize_ai_draft(
     auth_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     parsed = admit_provider_quote_draft(parsed, require_confidence=require_confidence)
+    parsed = separate_booth_profile_lines(copy.deepcopy(parsed))
     has_payload_context = payload is not None
     payload = copy.deepcopy(payload) if isinstance(payload, dict) else {}
     if has_payload_context and pricing_reference_snapshot_for_payload(payload) is None:
@@ -27671,6 +27868,7 @@ def mark_ai_estimated_quantities(parsed: dict[str, Any]) -> None:
 
 def complete_predicted_quantities(parsed, payload, auth_session, quantity_repair=None, *, precheck=None):
     """Sizing guarantee: one AI re-ask for the missing sizes only, then the booth-size rule."""
+    separate_booth_profile_lines(parsed)
     mark_ai_estimated_quantities(parsed)
     catalog = raw_draft_catalog_entries(payload, auth_session)
     missing = raw_draft_lines_missing_quantity(parsed, catalog)

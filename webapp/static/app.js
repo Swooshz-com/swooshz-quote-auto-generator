@@ -355,6 +355,7 @@ const state = {
   pdfFileRevision: -1,
   pricingMatches: [],
   pricingIssues: [],
+  savedExclusions: null,
   activeJob: null,
   quoteCommercialTouched: {
     quoteCurrency: false,
@@ -1713,13 +1714,13 @@ function showAiFailureBanner(message = GENERIC_FAILURE_MESSAGE) {
   setAiStatusBanner("failure", "AI analysis failed.", detail);
 }
 
-function showAiBlockedBanner(message = "Complete the required details, then retry analysis.") {
+function showAiBlockedBanner(message = "Complete the required details, then retry analysis.", title = "AI analysis blocked.") {
   const detail = String(message || "").replace(/^AI analysis blocked\.?\s*/i, "").trim() || "Complete the required details, then retry analysis.";
-  setAiStatusBanner("failure", "AI analysis blocked.", detail);
+  setAiStatusBanner("failure", title, detail);
 }
 
 function showBlockedAction(message = "Complete the required details, then try again.", options = {}) {
-  showAiBlockedBanner(message);
+  showAiBlockedBanner(message, options.title);
   if (options.details !== false && missingDetailFields().length) setDetailsDrawer(true);
 }
 
@@ -4481,7 +4482,7 @@ function buildSessionSnapshot() {
     workflowStage: state.workflowStage,
     quoteBasis: persistedBasis.quote_basis,
     quoteBasisSections: persistedBasis.quote_basis_sections,
-    lineItems: state.lineItems,
+    lineItems: currentReinclusionRows(),
     outputRows: state.outputRows,
     originalOutputRows: state.originalOutputRows,
     outputErrors: state.outputErrors,
@@ -5085,6 +5086,8 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.lineItems = Array.isArray(restoredState.lineItems)
     ? restoredState.lineItems.map((row) => normalizeRestoredPricingRow(row, normalizeLineItem))
     : [];
+  recordSavedExclusions(targetSessionId, state.quoteBasisSections, { reset: true, rows: state.lineItems });
+  restorePendingReinclusions();
   state.outputRows = Array.isArray(restoredState.outputRows)
     ? restoredState.outputRows.map((row) => normalizeRestoredPricingRow(row, normalizeOutputRow))
     : [];
@@ -7392,11 +7395,11 @@ function basisQuantityIsEstimate(line = {}) {
 function normalizeBasisLines(line = "") {
   if (line && typeof line === "object" && !Array.isArray(line) && typeof canonicalizePrimaryOrderFields === "function") line = canonicalizePrimaryOrderFields(line);
   if (line && typeof line === "object") {
-    const quantityParts = normalizedLineTextQuantityParts(
-      line.text || line.line || line.description || "",
-      line.quantity,
-      line.unit
-    );
+    const lineText = line.text || line.line || line.description || "";
+    // The booth profile has no quantity: "93 sqm booth, corner" is its wording.
+    const quantityParts = line.booth_profile === true
+      ? { text: cleanCustomerQuoteLineText(lineText) }
+      : normalizedLineTextQuantityParts(lineText, line.quantity, line.unit);
     const text = quantityParts.text;
     if (!text) return [];
     const confidence = normalizeConfidence(line.confidence ?? line.confidence_pct);
@@ -7415,6 +7418,7 @@ function normalizeBasisLines(line = "") {
       if (quantityParts.unit) next.unit = quantityParts.unit;
       const estimate = normalizedQuantityEstimate(line.quantity_estimate);
       if (estimate && next.quantity !== undefined) next.quantity_estimate = estimate;
+      if (line.booth_profile === true) next.booth_profile = true;
       if (confidence !== null) next.confidence = confidence;
       if (hasCustomPricing || normalizeBasisTag(parsed.tag) === "Custom") next.custom_pricing = true;
       if (line.custom_confirmed) next.custom_confirmed = true;
@@ -8133,11 +8137,13 @@ function pricingReferenceRowStatus(row = {}) {
   const warnings = [];
   if (!String(row.section || "").trim()) warnings.push("section required");
   if (!String(row.description || "").trim()) warnings.push("description required");
-  if (!String(row.unit_hint || "").trim()) warnings.push("unit_hint required");
+  if (!String(row.unit_hint || "").trim()) warnings.push("unit required");
   const cost = numberOrNull(row.internal_cost);
   const markup = numberOrNull(row.markup_multiplier);
-  if (cost === null || cost <= 0) warnings.push("internal_cost must be positive");
-  if (markup === null || markup <= 0) warnings.push("markup_multiplier must be positive");
+  if (cost === null) warnings.push("cost required");
+  else if (cost <= 0) warnings.push("cost must be above 0");
+  if (markup === null) warnings.push("markup required");
+  else if (markup <= 0) warnings.push("markup must be above 0");
   return warnings;
 }
 
@@ -8159,6 +8165,12 @@ function pricingReferenceSaveBlockReason(result = state.pendingPricingReference)
   if (mode === PRICING_REFERENCE_SETTINGS_MODE_MANAGE && !pricingReferenceHasPendingChanges(result)) {
     return state.pricingReferenceSavedNotice ? "Saved." : "No changes to save.";
   }
+  const errors = Array.isArray(result.errors) ? result.errors.filter(Boolean) : [];
+  const rowsReason = errors.length ? errors.join(" ")
+    : !(result.items || []).length ? "Add at least one valid pricing row before saving."
+      : result.canSave ? "" : "Fix the highlighted pricing-reference rows before saving.";
+  // An import asks for its name and tax only once its rows are ready, so it asks for the rows first.
+  if (rowsReason && mode === PRICING_REFERENCE_SETTINGS_MODE_IMPORT) return rowsReason;
   if (!String(elements.pricingReferenceName?.value || "").trim()) {
     return "Enter a pricing reference name before saving.";
   }
@@ -8180,11 +8192,7 @@ function pricingReferenceSaveBlockReason(result = state.pendingPricingReference)
   if (elements.pricingReferenceCurrency?.value === CUSTOM_CURRENCY_VALUE && !customCurrencyInputIsValid()) {
     return "Enter a 3-letter currency code before saving.";
   }
-  const errors = Array.isArray(result.errors) ? result.errors.filter(Boolean) : [];
-  if (errors.length) return errors.join(" ");
-  if (!(result.items || []).length) return "Add at least one valid pricing row before saving.";
-  if (!result.canSave) return "Fix the highlighted pricing-reference rows before saving.";
-  return "";
+  return rowsReason;
 }
 
 function pricingReferenceSaveBlockReasonIsRequiredDetails(reason = "") {
@@ -8478,6 +8486,26 @@ function compactPreviewList(values = [], limit = 3) {
   return `${visible.join("; ")}${hidden ? `; +${hidden} more` : ""}`;
 }
 
+function pricingReferenceColumnLabel(column = "") {
+  const label = { section: "Section", description: "Description", unit_hint: "Unit", internal_cost: "Cost", markup_multiplier: "Markup" }[column];
+  return label && label.toLowerCase() !== column ? `${label} (${column})` : label || column;
+}
+
+function pricingReferenceSkippedRowsText(result = {}, skipped = 0) {
+  const rows = Array.isArray(result.skippedRows) ? result.skippedRows : [];
+  if (!rows.length) return `${skipped} row${skipped === 1 ? " was" : "s were"} skipped. Check the workbook if this is unexpected.`;
+  const byReason = new Map();
+  rows.forEach((row) => {
+    const name = `${row.row}${row.label ? ` (${row.label})` : ""}`;
+    byReason.set(row.reason, [...(byReason.get(row.reason) || []), name]);
+  });
+  return [...byReason].map(([reason, names]) => {
+    const shown = names.slice(0, 20).join("; ");
+    const more = names.length > 20 ? `; and ${names.length - 20} more` : "";
+    return `Row${names.length === 1 ? "" : "s"} ${shown}${more} left out: ${reason}.`;
+  }).join(" ");
+}
+
 function pricingReferencePreviewAttention(result = {}, context = {}) {
   const items = Array.isArray(result.items) ? result.items : [];
   const missing = Array.isArray(result.missing) ? result.missing.filter(Boolean) : [];
@@ -8494,7 +8522,7 @@ function pricingReferencePreviewAttention(result = {}, context = {}) {
     attention.push({
       tone: "error",
       label: "Missing required columns",
-      text: missing.join(", "),
+      text: missing.map(pricingReferenceColumnLabel).join(", "),
     });
   }
   if (rowIssues.length) {
@@ -8539,7 +8567,7 @@ function pricingReferencePreviewAttention(result = {}, context = {}) {
     attention.push({
       tone: "warn",
       label: "Skipped rows",
-      text: `${skipped} row${skipped === 1 ? "" : "s"} were skipped. Check the workbook if this is unexpected.`,
+      text: pricingReferenceSkippedRowsText(result, skipped),
     });
   }
   if (!items.length && !errors.length) {
@@ -8660,6 +8688,14 @@ function handlePricingReferencePreviewInput(event) {
     status.textContent = statusText;
     status.className = `pricing-preview-status ${pricingReferenceStatusClass(statusText)}`;
   }
+  // An edit can settle another row too, such as its duplicate.
+  elements.pricingReferenceTableBody?.querySelectorAll("tr[data-preview-row]").forEach((other) => {
+    const cell = other === row ? null : other.querySelector(".pricing-preview-status");
+    if (!cell) return;
+    const text = state.pendingPricingReference.items[Number(other.dataset.previewRow)]?.warning || "OK";
+    cell.textContent = text;
+    cell.className = `pricing-preview-status ${pricingReferenceStatusClass(text)}`;
+  });
   updatePricingReferenceGuidanceDisplays(state.pendingPricingReference);
   renderPricingReferenceManageStatus(state.pendingPricingReference);
 }
@@ -9725,7 +9761,7 @@ function buildPayload(options = {}) {
   };
 }
 
-function buildLineItemNormalizePayload() {
+function buildLineItemNormalizePayload({ admitReinclusions = false } = {}) {
   const pricingReference = currentPricingReference();
   const pricingReferenceId = pricingReference?.id || state.pricingReferenceId || "";
   const pricingReferenceSource = pricingReference?.source || state.pricingReferenceSource || "";
@@ -9752,6 +9788,7 @@ function buildLineItemNormalizePayload() {
       quoteGenerated: Boolean(state.basisConfirmed || state.outputRows.length),
       includeDraftState: true,
       includeDraftFiles: false,
+      ...(admitReinclusions ? { draftState: currentQuoteSessionDraftState({ admitReinclusions }) } : {}),
     }),
     project: {
       booth_width: state.boothDimensions.booth_width,
@@ -10305,7 +10342,8 @@ function isInformationalDimensionText(value = "") {
 
 function basisLineIsInformationalDimension(line = {}) {
   if (line.pricing_keyword || line.pricing_reference_description || line.catalog_description) return false;
-  return isInformationalDimensionText(line.text || line.description || "");
+  // The server marks the booth profile (#334): it shows under Detected booth and is never a quote line.
+  return line.booth_profile === true || isInformationalDimensionText(line.text || line.description || "");
 }
 
 function outputRowIsInformationalDimension(row = {}) {
@@ -10987,7 +11025,7 @@ function snapshotOutputRows(rows = state.outputRows) {
   return rows.map((row) => normalizeOutputRow({ ...row }));
 }
 
-function retainExcludedBasisPricingRows(rows) {
+function retainExcludedBasisPricingRows(rows, { confirmed = false } = {}) {
   const excluded = new Set();
   const active = new Set();
   for (const section of state.quoteBasisSections || []) {
@@ -10997,20 +11035,25 @@ function retainExcludedBasisPricingRows(rows) {
       if (line.source_line_item_id) ids.add(line.source_line_item_id);
     }
   }
-  const currentRows = state.lineItems || [];
+  const currentRows = currentReinclusionRows(state.lineItems || []);
   const pendingReincludes = new Map(currentRows.filter((row) => row.reincluded_catalog_selection)
     .map((row) => [row.source_basis_line_id, row.reincluded_catalog_selection]));
-  // Keep a refused re-inclusion distinct from a new Possible Match on subsequent Confirms.
+  // Only Confirm ends a waiting tick: rows rebuilt from Output keep it, whatever their price, and the
+  // rows Confirm answers with lose it unless their price was refused.
   const projected = pendingReincludes.size ? rows.map((row) => {
     const selection = pendingReincludes.get(row.source_basis_line_id);
-    return selection && ["none", "historical"].includes(row.pricing_authority?.variant)
+    return selection && (!confirmed || ["none", "historical"].includes(row.pricing_authority?.variant))
       ? { ...row, reincluded_catalog_selection: selection }
       : row;
   }) : rows;
-  const retained = currentRows.filter((row) =>
-    excluded.has(row.source_basis_line_id) && !active.has(row.source_basis_line_id)
-  ).map(({ deferred_pricing, reincluded_catalog_selection, ...row }) => ({
+  // A line ticked back in is not in Output until Confirm, so rows rebuilt from Output must not drop it.
+  const rebuiltIds = new Set(rows.map((row) => row.source_basis_line_id));
+  const retained = currentRows.filter((row) => (active.has(row.source_basis_line_id)
+    ? row.reincluded_catalog_selection && !rebuiltIds.has(row.source_basis_line_id)
+    : excluded.has(row.source_basis_line_id)
+  )).map(({ deferred_pricing, reincluded_catalog_selection, ...row }) => ({
     ...row,
+    ...(active.has(row.source_basis_line_id) ? { reincluded_catalog_selection } : {}),
     ...(deferred_pricing && !row.unmatched_pricing_offer ? { unmatched_pricing_offer: deferred_pricing } : {}),
   }));
   if (!retained.length) return projected;
@@ -11786,6 +11829,10 @@ function basisSections(sections = state.quoteBasisSections) {
     : [{ id: "draft", title: "Quote Basis", lines: [{ tag: "Confirm", text: "No detail generated yet." }] }];
 }
 
+const UNRESOLVED_BASIS_LINES_MESSAGE = "Resolve all review lines before confirming quotation basis.";
+// Confirm stopped by rows staff still have to settle, not by the AI analysis. The wording waits for the owner.
+const BASIS_ROWS_NEED_DECISION_TITLE = "Rows need a decision.";
+
 function unresolvedConfirmLines(sections = state.quoteBasisSections) {
   return basisSections(sections)
     .flatMap((section) => (section.lines || [])
@@ -11800,7 +11847,7 @@ function basisConfirmBlockReason(sections = state.quoteBasisSections) {
   if ((state.blockingClarificationQuestions || []).some((question) => question.status !== "answered" && !String(question.answer || "").trim())) {
     return "Answer all clarification questions before confirming quotation basis.";
   }
-  if (unresolvedConfirmLines(sections).length) return "Resolve all review lines before confirming quotation basis.";
+  if (unresolvedConfirmLines(sections).length) return UNRESOLVED_BASIS_LINES_MESSAGE;
   // Confirm fills a blank line with its shown rule size; only a line it cannot fill (more than one output row) blocks.
   return basisSections(sections).some((section) => (section.lines || []).some((line) => basisLineNeedsQuantity(line) && !basisLineQuantityFillable(line)))
     ? "Enter a quantity for every line before confirming quotation basis."
@@ -11851,8 +11898,8 @@ function revealBlockedBasisAction() {
   }
 }
 
-function showBlockedBasisAction(message = "Resolve the quotation basis before continuing.") {
-  showBlockedAction(message, { details: false });
+function showBlockedBasisAction(message = "Resolve the quotation basis before continuing.", title = undefined) {
+  showBlockedAction(message, { details: false, title: message === UNRESOLVED_BASIS_LINES_MESSAGE ? BASIS_ROWS_NEED_DECISION_TITLE : title });
   revealBlockedBasisAction();
 }
 
@@ -11903,7 +11950,9 @@ function basisLinePillLabel(line = {}, pricingRow = basisPricingRow(line)) {
   const tag = normalizeBasisTag(line.tag);
   const variant = pricingRow?.pricing_authority?.variant;
   if (tag !== "Exclude" && variant === "manual") return "Manual price";
-  if (tag !== "Exclude" && variant === "included") return "Included";
+  // An undecided standard row asks for a decision (owner, 25 Nov 2026); a tick makes it Included.
+  if (tag !== "Exclude" && variant === "included"
+    && (tag !== "Confirm" || !STANDARD_SERVICE_ROWS.some((row) => row.id === line.id))) return "Included";
   if (isPendingAiProposalLine(line)) return "AI Confirm";
   return basisTagLabel(tag);
 }
@@ -12312,7 +12361,10 @@ function applyBasisFreeQuantity(sectionId, lineIndex, value) {
     const previous = linked[0];
     const unitChanged = normalizeUnit(previous.unit || "") !== parsed.unit;
     const { pricing_authority, ...rest } = previous;
-    const nextRow = normalizeLineItem({ ...(unitChanged ? rest : previous), quantity: parsed.quantity, unit: parsed.unit });
+    const nextRow = {
+      ...normalizeLineItem({ ...(unitChanged ? rest : previous), quantity: parsed.quantity, unit: parsed.unit }),
+      ...(!unitChanged && previous.reincluded_catalog_selection ? { reincluded_catalog_selection: previous.reincluded_catalog_selection } : {}),
+    };
     state.lineItems = state.lineItems.map((row) => (row === previous ? nextRow : row));
   }
   const outputsCleared = Boolean(state.outputRows.length || state.originalOutputRows.length);
@@ -12702,7 +12754,10 @@ function knownDetailsMergedRows(currentRows = [], baseRows = [], appliedRows = [
     if (!before) return [row];
     const after = applied.get(key);
     if (after === undefined) return JSON.stringify(row) === JSON.stringify(before) ? [] : [row];
-    return after ? [normalizeLineItem(knownDetailsMergedFields(row, before, after))] : [row];
+    return after ? [{
+      ...normalizeLineItem(knownDetailsMergedFields(row, before, after)),
+      ...(row.reincluded_catalog_selection ? { reincluded_catalog_selection: row.reincluded_catalog_selection } : {}),
+    }] : [row];
   });
   appliedRows.forEach((row) => {
     const key = knownDetailsRowKey(row);
@@ -13057,18 +13112,103 @@ function applyPossiblePricingMatch(sectionId, lineIndex, matchIndex) {
 }
 
 function reincludedCatalogueSelectionKey(line, section, row) {
-  const authority = outputPriceAuthority(row);
+  // Read as saved: a tick can mark a whole block, so the price itself is checked once, at Confirm.
+  const authority = row.pricing_authority;
   if (authority?.variant !== "catalog" || authority.catalog_item_id !== line.pricing_keyword) return "";
-  return JSON.stringify([
-    section.id, section.title, line.id, line.source_line_item_id || "", line.text, line.quantity, line.unit,
-    authority.context, row.quantity, currentPricingReference()?.id, authority.catalog_source, authority.catalog_digest,
-  ]);
+  // A typed quantity keeps the selection, like a quantity edit on a priced line; Confirm saves it first.
+  return shortTextKey([
+    section.id, section.title, line.id, line.source_line_item_id || "", line.text, line.unit,
+    ...Object.entries(authority.context || {}).flat(), currentPricingReference()?.id, authority.catalog_source, authority.catalog_digest,
+  ].join("\u001f"));
+}
+
+// Saved on every row ticked back in and in each copy of the draft, so it is kept short. It only tells
+// whether the line changed since the tick; the server proves the selection itself.
+function shortTextKey(text) {
+  let low = 0x811c9dc5;
+  let high = 0x9e3779b9;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    low = Math.imul(low ^ code, 0x01000193);
+    high = Math.imul(high ^ code, 0x85ebca6b);
+  }
+  return (low >>> 0).toString(36) + (high >>> 0).toString(36);
+}
+
+// A re-include mark counts only while its line is ticked on screen. Every save (browser copy and server
+// draft) and Output rebuild reads the rows through here, so a mark left behind by any other decision on
+// the line (X, a block X, Re) is never written, restored or priced.
+function currentReinclusionRows(rows = state.lineItems, sections = state.quoteBasisSections) {
+  if (!rows.some((row) => row?.reincluded_catalog_selection)) return rows;
+  const ticked = new Set();
+  (sections || []).forEach((section) => (section.lines || []).forEach((line) => {
+    if (normalizeBasisTag(line.tag) === "Include") [line.id, line.source_line_item_id].filter(Boolean).forEach((id) => ticked.add(id));
+  }));
+  const counts = (row) => !row?.reincluded_catalog_selection || ticked.has(row.source_basis_line_id);
+  return rows.every(counts) ? rows : rows.map((row) => (counts(row) ? row : withoutReincludedSelection(row)));
+}
+
+// Saved drafts keep a line ticked back in as excluded, with its tick recorded on the row, until Confirm
+// has the server price it. The server proves the price against that saved excluded row, so a draft can
+// always be saved and no unconfirmed line is ever saved as included.
+function pendingReinclusionTagged(sections, rows, fromTag, toTag, changed = () => {}) {
+  const ids = new Set((rows || []).filter((row) => row?.reincluded_catalog_selection).map((row) => row.source_basis_line_id));
+  if (!ids.size) return sections;
+  return sections.map((section) => ({
+    ...section,
+    lines: (section.lines || []).map((line) => {
+      const id = [line.id, line.source_line_item_id].find((value) => value && ids.has(value));
+      if (!id || normalizeBasisTag(line.tag) !== fromTag) return line;
+      changed(id, line, section);
+      return { ...line, tag: toTag };
+    }),
+  }));
+}
+
+function pendingReinclusionDraftBasis(snapshot) {
+  const quoteBasisSections = pendingReinclusionTagged(snapshot.quoteBasisSections, snapshot.lineItems, "Include", "Exclude");
+  return quoteBasisSections === snapshot.quoteBasisSections
+    ? { quoteBasis: snapshot.quoteBasis, quoteBasisSections }
+    : { quoteBasis: canonicalQuoteBasis(quoteBasisFromSections(quoteBasisSections)), quoteBasisSections };
+}
+
+function restorePendingReinclusions() {
+  const keys = new Map();
+  const sections = pendingReinclusionTagged(state.quoteBasisSections, state.lineItems, "Exclude", "Include", (id, line, section) => {
+    const row = state.lineItems.find((entry) => entry.source_basis_line_id === id);
+    // Without a catalogue price there is nothing to restore: Confirm treats it as an ordinary line.
+    keys.set(id, reincludedCatalogueSelectionKey(line, section, row) || row.reincluded_catalog_selection);
+  });
+  if (!keys.size) return;
+  state.quoteBasisSections = sections;
+  state.quoteBasis = canonicalQuoteBasis(quoteBasisFromSections(sections));
+  state.lineItems = state.lineItems.map((row) => (keys.has(row.source_basis_line_id)
+    ? { ...row, reincluded_catalog_selection: keys.get(row.source_basis_line_id) } : row));
+}
+
+function withoutReincludedSelection({ reincluded_catalog_selection, ...row }) {
+  return row;
+}
+
+// Saving a line as excluded ends its price on the server, so ticking it back in has to ask for the
+// price again at Confirm. A line X'd and ticked back before any save still has its price.
+function recordSavedExclusions(sessionId, sections, { reset = false, rows = [] } = {}) {
+  const saved = !reset && state.savedExclusions?.sessionId === sessionId ? state.savedExclusions.ids : new Set();
+  (sections || []).forEach((section) => (section.lines || []).forEach((line) => {
+    if (normalizeBasisTag(line.tag) === "Exclude") [line.id, line.source_line_item_id].filter(Boolean).forEach((id) => saved.add(id));
+  }));
+  // A line still waiting for Confirm reads Include in the browser copy; the saved draft holds it as excluded.
+  rows.forEach((row) => { if (row.reincluded_catalog_selection) saved.add(row.source_basis_line_id); });
+  state.savedExclusions = { sessionId, ids: saved };
+}
+
+function basisLineIsSavedExcluded(line) {
+  return state.savedExclusions?.sessionId === safeQuoteSessionId(state.quoteSessionId || "")
+    && [line.id, line.source_line_item_id].some((id) => state.savedExclusions.ids.has(id));
 }
 
 function rememberReincludedCatalogueSelection(line, section, nextTag, row) {
-  if (normalizeBasisTag(line.tag) !== "Exclude" || nextTag !== "Include" || state.workflowStage !== "completed") return;
-  const ids = new Set([line.id, line.source_line_item_id].filter(Boolean));
-  if (state.originalOutputRows.some((row) => ids.has(row.source_basis_line_id))) return;
+  if (normalizeBasisTag(line.tag) !== "Exclude" || nextTag !== "Include" || !basisLineIsSavedExcluded(line)) return;
   if (!row) return;
   const key = reincludedCatalogueSelectionKey(line, section, row);
   // This is draft intent. The server checks the saved binding and revision before pricing.
@@ -13104,13 +13244,16 @@ function applyBasisTag(sectionId, nextTag, lineIndex = null, group = null) {
   }
   state.quoteBasisSections = sections;
   state.quoteBasis = quoteBasisFromSections(sections);
+  const rows = currentReinclusionRows();
+  const reinclusionChanged = plan.reinclusionChanged || rows !== state.lineItems;
+  state.lineItems = rows;
   state.basisConfirmed = false;
   markOutputRowsDirty();
   // Clearing Output can move other lines between groups, so that redraws the whole card.
   if (outputsCleared) updateQuoteBasisCard("edited");
   else updateBasisLines([...changedLineIds, ...pricingChanges.keys()], "edited");
   syncControlStates();
-  if (deferralChanged && !state.lineItems.some((row) => row.reincluded_catalog_selection)) {
+  if (deferralChanged || reinclusionChanged) {
     // syncControlStates has just written the browser copy.
     queueQuoteSessionDraftStateSave({ quoteGenerated: false, sessionStateSaved: true });
   }
@@ -13122,6 +13265,7 @@ function planBasisTagChanges(sectionId, nextTag, lineIndex = null, group = null)
   if (!section) return null;
   let changed = false;
   let deferralChanged = false;
+  let reinclusionChanged = false;
   const pricingChanges = new Map();
   const changedLineIds = [];
   section.lines = (section.lines || []).map((line, index) => {
@@ -13140,10 +13284,9 @@ function planBasisTagChanges(sectionId, nextTag, lineIndex = null, group = null)
     const acceptsCustom = Boolean(offer) || (nextTag === "Include" && basisLineAcceptsAsAiProposal(line));
     const resolvedTag = acceptsCustom ? "Custom" : nextTag;
     const reincluded = rememberReincludedCatalogueSelection(line, section, resolvedTag, row);
-    if (reincluded) pricingChanges.set(reincluded.source_basis_line_id, reincluded);
-    if (nextTag === "Exclude" && row?.reincluded_catalog_selection) {
-      const { reincluded_catalog_selection, ...retained } = row;
-      pricingChanges.set(row.source_basis_line_id, retained);
+    if (reincluded) {
+      reinclusionChanged = true;
+      pricingChanges.set(reincluded.source_basis_line_id, reincluded);
     }
     const customPricing = isCustomPricingBasisLine(line) || resolvedTag === "Custom";
     const customConfirmed = customPricing && nextTag !== "Exclude";
@@ -13158,7 +13301,7 @@ function planBasisTagChanges(sectionId, nextTag, lineIndex = null, group = null)
     };
   });
   if (!changed && !pricingChanges.size) return null;
-  return { sections, deferralChanged, pricingChanges, changedLineIds };
+  return { sections, deferralChanged, reinclusionChanged, pricingChanges, changedLineIds };
 }
 
 function basisChatIntroMessage() {
@@ -14689,6 +14832,7 @@ async function refreshLineItemsFromServer({ waitForPaint = false } = {}) {
     state.pricingIssues = [];
     return { ok: true, data: { status: "normalized", line_items: [] } };
   }
+  if (quoteSessionDraftStateCanSave()) dropUnusableReinclusions();
   let selections = quoteSessionDraftStateCanSave() ? pendingPricingSelections() : [];
   const reinclusions = state.lineItems.filter((row) => row.reincluded_catalog_selection).length;
   const reinclusionsReady = () => selections.filter((entry) => entry.reinclude).length === reinclusions;
@@ -14702,6 +14846,21 @@ async function refreshLineItemsFromServer({ waitForPaint = false } = {}) {
   const recoveryEpoch = browserRecoveryEpoch;
   const isSessionCurrent = () => browserRecoveryEpoch === recoveryEpoch
     && safeQuoteSessionId(state.quoteSessionId || "") === sessionId;
+  if (reinclusions) {
+    // The server proves each line ticked back in against its saved excluded row, so the draft on
+    // screen (a typed quantity included) is saved before the selection is sent.
+    const saveFailure = {};
+    const saved = await saveQuoteSessionDraftState({ quoteGenerated: false, saveFailure });
+    if (!isSessionCurrent()) return conflict(true);
+    if (state.pricingDraftVersion === false) return { ...conflict(), status: saveFailure.failure?.status || 409 };
+    if (!saved) {
+      return { ok: false, status: saveFailure.failure?.status ?? 0, data: {
+        status: "failed", page_unloading: saveFailure.failure?.page_unloading === true, quote_session_save_failure: saveFailure.failure || null,
+      } };
+    }
+    selections = pendingPricingSelections();
+    if (!reinclusionsReady()) return requireReopen();
+  }
   // Selection checks revisions before saving its draft. Let it carry any queued draft,
   // and read the revisions from saves already sent before building the selection request.
   const hold = selections.length && sessionId
@@ -14723,9 +14882,11 @@ async function refreshLineItemsFromServer({ waitForPaint = false } = {}) {
         if (!validQuoteDraftVersion(expectedVersion)) return requireReopen();
         // A reload during the request cannot tell whether it committed.
         requireQuoteDraftReopen();
-        const payload = buildLineItemNormalizePayload();
+        // Confirm is the one request that saves a line ticked back in as included, with its price.
+        const payload = buildLineItemNormalizePayload({ admitReinclusions: true });
         const selectionDraft = payload.quote_session?.draft_state;
         const draftKey = selectionDraft ? quoteSessionDraftComparisonKey(selectionDraft) : "";
+        if (selectionDraft) recordSavedExclusions(sessionId, selectionDraft.quoteBasisSections);
         result = await postJson("/api/quote-sessions/pricing-selections", {
           ...payload,
           pricing_selections: selections,
@@ -14739,6 +14900,18 @@ async function refreshLineItemsFromServer({ waitForPaint = false } = {}) {
           const acknowledgement = pricingSelectionAcknowledgement(result.data, sessionId, expectedVersion, selections, acknowledgedRows);
           if (!acknowledgement) return conflict();
           rememberPricingSelectionAcknowledgement(acknowledgement, draftKey);
+        } else {
+          const refused = refusedReinclusions(result, selections);
+          if (refused.length) {
+            // Refused before anything was saved: the draft is still the one on the server, so staff
+            // go on editing it. The refused lines stay ticked without a price for Output to ask for.
+            state.pricingDraftVersion = expectedVersion;
+            const ids = new Set(refused.map((entry) => entry.source_basis_line_id));
+            state.lineItems = state.lineItems.map((row) => (ids.has(row.source_basis_line_id) ? withoutReincludedSelection(row) : row));
+            state.pricingIssues = refused;
+            saveSessionState();
+            return { ...result, data: { ...result.data, refused_reinclusions: refused } };
+          }
         }
       }
     }
@@ -14762,7 +14935,7 @@ async function refreshLineItemsFromServer({ waitForPaint = false } = {}) {
   state.pricingIssues = (Array.isArray(result.data.selections) ? result.data.selections : [])
     .filter((entry) => entry?.status === "refused" && typeof entry.source_basis_line_id === "string" && pricingSelectionRefusalReason(entry.reason))
     .map((entry) => ({ source_basis_line_id: entry.source_basis_line_id, reason: entry.reason }));
-  state.lineItems = retainExcludedBasisPricingRows(acknowledgedRows || result.data.line_items.map(normalizeLineItem));
+  state.lineItems = retainExcludedBasisPricingRows(acknowledgedRows || result.data.line_items.map(normalizeLineItem), { confirmed: true });
   state.outputRows = [];
   state.outputErrors = [];
   if (hold) saveSessionState();
@@ -14805,6 +14978,7 @@ function pendingPricingSelections() {
     const revision = revisions[rowId];
     const reinclude = Boolean(row.reincluded_catalog_selection) || row.pricing_authority?.variant === "catalog";
     if (reinclude && (!row.reincluded_catalog_selection || (revision !== undefined && (!Number.isSafeInteger(revision) || revision < 0))
+      || outputPriceAuthority(row)?.variant !== "catalog"
       || row.reincluded_catalog_selection !== reincludedCatalogueSelectionKey(line, section, row))) return;
     selections.set(rowId, { source_basis_line_id: rowId, catalog_item_id: itemId,
       expected_revision: Number.isInteger(revision) && revision >= 0 ? revision : 0,
@@ -14813,6 +14987,25 @@ function pendingPricingSelections() {
   }));
   let ordinaryCount = 0;
   return [...selections.values()].filter((entry) => entry.reinclude || ordinaryCount++ < 100);
+}
+
+// A line ticked back in, then changed beyond its quantity, no longer matches the selection it recorded.
+// It goes to Confirm as an ordinary line: the server gives it no old price, and Output asks for one.
+function dropUnusableReinclusions() {
+  const ready = new Set(pendingPricingSelections().filter((entry) => entry.reinclude).map((entry) => entry.source_basis_line_id));
+  if (!state.lineItems.some((row) => row.reincluded_catalog_selection && !ready.has(row.source_basis_line_id))) return;
+  state.lineItems = state.lineItems.map((row) => (row.reincluded_catalog_selection && !ready.has(row.source_basis_line_id)
+    ? withoutReincludedSelection(row) : row));
+}
+
+// The re-included lines the server refused before saving anything; a stale or unclear answer is none of these.
+function refusedReinclusions(result, selections) {
+  const refused = result?.data?.selections;
+  if (result?.status !== 409 || result.data.status !== "conflict" || !Array.isArray(refused)) return [];
+  const requested = new Set(selections.filter((entry) => entry.reinclude).map((entry) => entry.source_basis_line_id));
+  return refused.every((entry) => isPlainObject(entry) && entry.status === "refused"
+    && requested.has(entry.source_basis_line_id) && pricingSelectionRefusalReason(entry.reason))
+    ? refused.map(({ source_basis_line_id, reason }) => ({ source_basis_line_id, reason })) : [];
 }
 
 function openBlockingClarifications(questions = [], findings = [], project = {}) {
@@ -15585,8 +15778,9 @@ function quoteDraftShouldPersistToDashboard() {
   return quoteSessionDraftStateCanSave() && (quoteDraftHasReferenceFiles() || quoteDraftHasAiAnalysis() || quoteDraftHasOutputState());
 }
 
-function currentQuoteSessionDraftState() {
+function currentQuoteSessionDraftState({ admitReinclusions = false } = {}) {
   const snapshot = buildSessionSnapshot();
+  const savedBasis = admitReinclusions ? snapshot : pendingReinclusionDraftBasis(snapshot);
   return {
     version: snapshot.version,
     savedAt: snapshot.savedAt,
@@ -15603,8 +15797,8 @@ function currentQuoteSessionDraftState() {
     images: snapshot.images,
     quoteDetails: snapshot.quoteDetails,
     workflowStage: snapshot.workflowStage,
-    quoteBasis: snapshot.quoteBasis,
-    quoteBasisSections: snapshot.quoteBasisSections,
+    quoteBasis: savedBasis.quoteBasis,
+    quoteBasisSections: savedBasis.quoteBasisSections,
     lineItems: snapshot.lineItems,
     outputRows: snapshot.outputRows,
     originalOutputRows: snapshot.originalOutputRows,
@@ -15777,6 +15971,7 @@ async function saveCurrentQuoteSession(options = {}) {
   }
   payload.expected_draft_version = expectedVersion === "create" ? "" : expectedVersion;
   state.quoteSessionLoadError = "";
+  if (payload.draft_state) recordSavedExclusions(payload.session_id, payload.draft_state.quoteBasisSections);
   const payloadDraftKey = payload.draft_state
     ? quoteSessionDraftComparisonKey(payload.draft_state)
     : "";
@@ -15880,10 +16075,8 @@ async function saveQuoteSessionDraftState(options = {}) {
   if (options.saveFailure) options.saveFailure.failure = null;
   if (!quoteSessionDraftStateCanSave()) return null;
   if (options.sessionStateSaved !== true) saveSessionState();
-  // The selection request owns saving this draft until the server admits the re-inclusion.
-  const hasPendingReinclusion = () => state.lineItems?.some((row) => row.reincluded_catalog_selection);
   const draftSaveBlocked = () => {
-    if (state.pricingDraftVersion !== false) return hasPendingReinclusion();
+    if (state.pricingDraftVersion !== false) return false;
     if (options.saveFailure) options.saveFailure.failure = { draft_stale: true };
     return true;
   };
@@ -16212,8 +16405,11 @@ async function returnToDashboard() {
       saveFailure,
     });
     if (!saved) {
-      renderMessages([quoteSessionDraftSynchronizationFailureMessage(saveFailure.failure)], "error");
+      const message = quoteSessionDraftSynchronizationFailureMessage(saveFailure.failure);
+      renderMessages([message], "error");
       syncControlStates();
+      // The message list belongs to Output; staff leave from any step.
+      if (!saveFailure.failure?.page_unloading && !authenticationRecoveryNavigating()) showQuoteNotSavedModal(message);
       return;
     }
     dashboardLoadStarted = true;
@@ -16905,8 +17101,10 @@ async function modifyDashboardQuote(sessionId, options = {}) {
   }
 }
 
-function copiedQuotePricingRow(row, normalizer = normalizeLineItem) {
-  if (row?.pricing_authority?.variant !== "catalog") {
+function copiedQuotePricingRow(sourceRow, normalizer = normalizeLineItem) {
+  // The copy has no saved price to restore, so a line still waiting for Confirm stays excluded in it.
+  const row = withoutReincludedSelection(sourceRow);
+  if (row.pricing_authority?.variant !== "catalog") {
     const copied = { ...row };
     delete copied.unmatched_pricing_offer;
     delete copied.deferred_pricing;
@@ -18227,14 +18425,20 @@ async function confirmBasis(options = {}) {
       setResultStatus("Failed", "is-bad");
       const refused = refreshed.data?.selections;
       let message = genericFailureMessage(refreshed.data);
-      if (refreshed.data?.reason_code === "pricing_selection_invalid") {
+      let title;
+      if (refreshed.data?.quote_session_save_failure !== undefined) {
+        message = quoteSessionDraftSynchronizationFailureMessage(refreshed.data.quote_session_save_failure);
+      } else if (refreshed.data?.refused_reinclusions?.length) {
+        message = refusedReinclusionsMessage(refreshed.data.refused_reinclusions);
+        title = BASIS_ROWS_NEED_DECISION_TITLE;
+      } else if (refreshed.data?.reason_code === "pricing_selection_invalid") {
         message = "The pricing selection could not be saved. A quote can contain up to 200 selections, including up to 100 new matches.";
       } else if (refreshed.data?.status === "conflict") {
         message = Array.isArray(refused) && refused.some((entry) => entry?.status === "refused" && entry.reason !== "stale")
           ? "Some prices could not be confirmed. Reopen the saved quote and review those matches before trying again."
           : PRICING_SELECTION_STALE_MESSAGE;
       }
-      showBlockedBasisAction(message);
+      showBlockedBasisAction(message, title);
       return;
     }
     state.basisConfirmed = true;
@@ -18256,6 +18460,14 @@ async function confirmBasis(options = {}) {
     if (!state.isPageUnloading) hideExcelGeneratingModal();
     syncControlStates();
   }
+}
+
+function refusedReinclusionsMessage(refused) {
+  const ids = new Set(refused.map((entry) => entry.source_basis_line_id));
+  const names = (state.quoteBasisSections || []).flatMap((section) => (section.lines || [])
+    .filter((line) => ids.has(line.id) || ids.has(line.source_line_item_id))
+    .map((line) => `"${cleanCustomerQuoteLineText(line.catalog_description || line.text)}"`));
+  return `The old price could not be restored for ${names.join(", ")}. Exclude the line, or confirm again and enter its price in Output.`;
 }
 
 function sameLineItemSourceIdentities(rows, inputRows) {
@@ -19177,7 +19389,9 @@ async function withQuoteStepLoading(operation) {
     state.isPreparingOutput = false;
     if (!state.isPageUnloading) {
       hideExcelGeneratingModal();
-      if (result === false && state.quoteSessionLoadError) showQuoteNotSavedModal(state.quoteSessionLoadError);
+      const notSaved = state.quoteSessionLoadError
+        || (state.pricingDraftVersion === false ? quoteSessionDraftSynchronizationFailureMessage({ draft_stale: true }) : "");
+      if (result === false && notSaved) showQuoteNotSavedModal(notSaved);
     }
     syncControlStates();
   }

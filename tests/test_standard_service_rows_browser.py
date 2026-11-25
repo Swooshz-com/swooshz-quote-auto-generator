@@ -27,6 +27,14 @@ class StandardServiceRowsBrowserTest(unittest.TestCase):
         self.assertEqual(evidence['status'], 'PASS')
         self.assertEqual(evidence['standardServiceRows'],
                          {'newQuote': 'PASS', 'tickAndX': 'PASS', 'dashboardModifyReset': 'PASS', 'reset': 'PASS', 'reAnalyse': 'PASS'})
+        # Undecided rows say Confirm wherever they show; ticked say Included and X'd say Exclude.
+        badges = {}
+        for where, (text, _colour, _mark) in evidence['standardServiceBadges'].items():
+            badges.setdefault(where.rsplit(':', 1)[0], []).append(text)
+        self.assertEqual(badges['new quote'], ['Confirm', 'Confirm'])
+        self.assertEqual(badges['reopened undecided'], ['Confirm', 'Confirm'])
+        self.assertEqual(badges['reopened decided'], ['Included', 'Exclude'])
+        self.assertEqual(badges['Re-Analyse'], ['Included', 'Exclude'])
         self.assertEqual(evidence['standardServiceRowsReopen'], {
             'decisions': [['standard-project-management-fee', 'Include'], ['standard-waste-disposal', 'Exclude']],
             'output': 'included',

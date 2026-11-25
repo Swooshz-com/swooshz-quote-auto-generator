@@ -40,10 +40,13 @@ await fs.writeFile(scenarioPath, JSON.stringify({ raw: {
   quote_basis_sections: [{ id: "synthetic-floors", title: "Synthetic Floors", lines: [
     { id: "kd-carpet", tag: "Confirm", text: "sqm synthetic carpet tile", quantity: 36, unit: "sqm", confidence_pct: 90, pricing_keyword: carpet },
     { id: "kd-graphic", tag: "Confirm", text: "sqm synthetic printed wall graphic", quantity: 12, unit: "sqm", confidence_pct: 80, pricing_keyword: graphic },
+    // The booth profile as an AI draft once offered it: a sized line with its own row (#334, #385).
+    { id: "kd-profile", tag: "Confirm", text: "Provisional booth footprint 6m W x 6m D, totalling 36 sqm", quantity: 36, unit: "sqm", confidence_pct: 70, pricing_keyword: "" },
   ] }],
   line_items: [
     { source_basis_line_id: "kd-carpet", section: "Synthetic Floors", description: "sqm synthetic carpet tile", quantity: 36, unit: "sqm", pricing_keyword: carpet },
     { source_basis_line_id: "kd-graphic", section: "Synthetic Floors", description: "sqm synthetic printed wall graphic", quantity: 12, unit: "sqm", pricing_keyword: graphic },
+    { source_basis_line_id: "kd-profile", section: "Synthetic Floors", description: "Provisional booth footprint 6m W x 6m D, totalling 36 sqm", quantity: 36, unit: "sqm", pricing_keyword: "" },
   ],
 } }, null, 2));
 const fixtureDir = path.join(dirs.pricing, fixtureId);
@@ -210,6 +213,20 @@ try {
       return draftBodies[draftBodies.length - 1];
     };
 
+    // The booth profile is under Detected booth, never a quote line: no row, no tick or X, nothing in Output.
+    const profileOffered = async () => ({
+      quoteLine: (await page.locator("#basisReviewSurface .basis-line-row").allInnerTexts()).some((text) => text.includes("Provisional booth footprint")),
+      row: await page.evaluate(() => state.lineItems.some((row) => row.source_basis_line_id === "kd-profile")),
+      detected: (await booth.allInnerTexts()).join(" "),
+    });
+    const assertProfile = async (stage, sizeText) => {
+      const profile = await profileOffered();
+      assert(!profile.quoteLine && !profile.row, "the booth profile is offered as a quote line after " + stage, profile);
+      assert(profile.detected.includes(sizeText), "Detected booth does not state " + sizeText + " after " + stage, profile.detected);
+      return profile.detected;
+    };
+    await assertProfile("analysis", "Provisional booth footprint 6m W x 6m D, totalling 36 sqm");
+
     // 1. The AI's reading is offered with the Re proposal controls; nothing applies yet.
     await card.waitFor({ state: "visible" });
     result.proposal = (await card.innerText()).replace(/\s+/g, " ").trim();
@@ -238,6 +255,9 @@ try {
     result.detectedBooth = (await booth.allInnerTexts()).join(" | ");
     assert(result.detectedBooth.includes("Booth size 93 sqm (from Known details)") && !result.detectedBooth.includes("defaults to"),
       "Detected booth does not show only the Known details size", result.detectedBooth);
+    // No line contradicts the applied size.
+    assert(!(await assertProfile("Apply", "Provisional booth footprint 93 sqm, totalling 93 sqm")).includes("6m W x 6m D"), "a line contradicts the applied size");
+    assert(!(await page.locator("#basisReviewSurface").innerText()).includes("6m W x 6m D"), "Quote Basis still shows the size that was replaced");
     draft = await readDraft();
     assertApplied(draft, 93, { tag: "Include", line: 12, row: 12 });
     result.resizeNote = draft.lines.find((text) => text.includes("but the AI analysis used 36 sqm"));
@@ -252,6 +272,7 @@ try {
     assert(body.known_details === knownDetails && body.known_details_size_decision?.decision === "applied", "re-analysis did not send the Known details text and decision", body);
     draft = await readDraft();
     assert(!(await card.count()) && draft.booth.dimension_source === "staff" && Number(draft.carpet) === 93, "applied size not kept after Re-Analyse", draft);
+    result.reanalysedBooth = await assertProfile("Re-Analyse", "Provisional booth footprint 93 sqm, totalling 93 sqm");
 
     // 5. Staff type a new size: it is offered again. Apply after a quantity edit on another line.
     await editKnownDetails("Booth is 120 sqm, 2 open sides\nMax height 4 m", 120);
