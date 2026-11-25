@@ -461,7 +461,11 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      the step records: a click may serialise the quote's browser copy once
      (on a reopened quote that copy also holds the restore key, so it is
      about twice the draft) and a save the draft six times and the copy once,
-     so a second copy fails. A click on a line already in that state is
+     so a second copy fails. Those sizes have limits of their own: the draft at
+     most 1.75 times the quote as the server holds it (`saved_quote_bytes`),
+     the copy and the restore key that draft once each, the workspace view 4
+     KiB. A quote save must be sent within 1.5 s of the last click; only its
+     answer may be later. A click on a line already in that state is
      recorded in `clicks_with_nothing_to_change`; one that changes nothing
      although a line was not in that state fails. Both quotes are probed even
      when the first fails, and a failed step keeps all its facts in its

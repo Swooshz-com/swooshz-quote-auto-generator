@@ -697,7 +697,9 @@ the owner-approved CI lane.
   Unmatched lines with server pricing offers, AI proposals, estimated sizes) and
   about 16 MB of reference files uploaded through the real intake. At 4x CPU
   slowdown it ticks, crosses and block-ticks every group, then sends a burst of
-  five Unmatched clicks, and watches 1.5 s after each. Each click may write the
+  five Unmatched clicks. It watches each for 1.5 s, in which the deferred quote
+  save must be sent (a save sent later fails), and then until that save is
+  answered, however slow the server is. Each click may write the
   browser copy of the quote once, never rewrite unchanged files to IndexedDB,
   never fully re-render the list, keep every unchanged row's DOM node, and leave
   exactly the DOM a full render gives. A burst saves the quote once, without
@@ -707,12 +709,18 @@ the owner-approved CI lane.
   probes a real one (`probeOpenQuote`): at least 440,528 characters of browser
   copy, the largest real quote's, with byte budgets from its own sizes measured
   before the clicks (the browser copy once per click, the draft six times and the
-  copy once per save). Last, faults put into that page must each fail their own
+  copy once per save). Each size a budget adds is bounded by something the page
+  does not set (`judgeQuoteSizes`): the draft by a constant here and by the quote
+  as the server holds it in Pass A, the rest by that draft or a constant. Last,
+  faults put into that page before its sizes are read must each fail their own
   check: a second copy of the quote or of the draft in a click, a second browser
-  copy written, a second copy of the draft in a save, a change never written, and
-  a click the app ignores; a second X on an excluded line must be recorded as a
-  click with nothing to change. `tests/test_live_e2e.mjs` judges the sizes and
-  clicks of the two largest real quotes (counts only) the same way.
+  copy written, a second copy of the draft in a save, a change never written or
+  written only by its save, a click the app ignores, a plan that finds nothing to
+  change, a save sent late, and quote data held twice in the browser copy, the
+  restore key, the workspace view or the draft; a second X on an excluded line
+  must be recorded as a click with nothing to change. `tests/test_live_e2e.mjs`
+  judges the sizes and clicks of the two largest real quotes (counts only) the
+  same way.
 - The analysis seal attests only rows derived from the provider's result, in
   the unit the provider measured each row in (carried internally from the first
   normalisation, before rows re-unit to their catalogue items). Request or

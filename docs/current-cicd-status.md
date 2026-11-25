@@ -193,7 +193,7 @@ or deployment behaviour changes accompany this test.
   in `scripts/lib/basis-click-probe.mjs`, shared with Pass A of the live-data test). It
   fails when a Quote Basis tick or X writes the browser copy more than once,
   rewrites unchanged reference files, re-renders or rebuilds the list, saves the
-  quote more than once per burst, sends files the server already has, or goes
+  quote more than once per burst or later than 1.5 s after the click, sends files the server already has, or goes
   over its byte, long-frame or input-to-paint budget. It does the same on that
   quote reopened at the largest real quote's size, where the byte budgets come
   from the quote's own browser copy. It is a required check on
