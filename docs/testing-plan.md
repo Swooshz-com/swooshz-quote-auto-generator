@@ -94,7 +94,8 @@ inventory, mapping, cutover or rollback requires separate exact owner approval.
 
 ## Programme sweep and gate
 
-Use the Toolkit revision pinned in both managed workflows. Keep the Toolkit
+Use the Toolkit revision both managed workflows check out (`main`, or the ref in
+the `TOOLKIT_REF` repository variable). Keep the Toolkit
 repository as the disposable Git checkout's origin. Install the lockfile
 dependencies with `npm ci --ignore-scripts --no-audit --no-fund`. Run each named
 `repo/tests/<suite>.test.cjs` with `node --test` from that checkout. On Windows,
@@ -119,7 +120,7 @@ the generator fixture uses its synthetic Git history.
   Check main-only activity and CI dispatch, the issue-close path, a verified
   save and graph redraw, and suppression of the refresh signal on an unsaved
   hold, failed state read-back or a board rendered by a newer Toolkit. Exercise
-  the pinned worker's parent, child and sweep-history validators offline. For
+  the checked-out worker's parent, child and sweep-history validators offline. For
   a compatibility check against private snapshots, keep all data in the
   local evidence store and report only document and result counts.
 - **Replacement pull requests**. Run programme-graph-state and the focused
@@ -148,15 +149,15 @@ the generator fixture uses its synthetic Git history.
 The offline suites use a synthetic GitHub transport. After an approved merge,
 the controller records the current graph revision and hash, then observes a
 real App-backed sweep on `main`. Record the run and attempt, repository commit,
-Toolkit pin, both App token step outcomes, and the footer cleanup counts or skip
-reason. Independently read the landed private store commit. For the replacement
+Toolkit revision, both App token step outcomes, and the footer cleanup counts or
+skip reason. Independently read the landed private store commit. For the replacement
 case, record the eligible claiming pull request and its head and state at the
 time of the sweep. Confirm that the saved child and published board follow that
 pull request. If no eligible claimant exists, replacement verification stays
 pending. Verify that the saved graph revision advances and that the published
-board shows the same graph revision and hash. Use a run at the newly installed
-pin. Record a queued run or a held run without a verified save as pending,
-even if the workflow is green. A hold with a partial save still requires
+board shows the same graph revision and hash. Use a run at the Toolkit
+revision under check. Record a queued run or a held run without a verified save
+as pending, even if the workflow is green. A hold with a partial save still requires
 the graph and board read-back. Confirm the order above on a
 real task with a builder at work and an earlier owner test still owed. If no
 such task exists during the sweep, keep the board-order check pending until a
@@ -188,8 +189,10 @@ npm run playwright:smoke
 ```
 
 After a change to Python code or backend behaviour, restart the local webapp
-server and check `http://127.0.0.1:8765/api/health` before browser testing it by
-hand or reporting it ready. The browser suites above start their own server.
+server and check `http://127.0.0.1:8765/api/health` before browser testing or
+reporting it ready. For their main run, `playwright:ai-stress` and
+`playwright:smoke` use a server already answering on their port (8765 by default)
+and start their own only when none does.
 
 ## Button sizing and placement checks
 

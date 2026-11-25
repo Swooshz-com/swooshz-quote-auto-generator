@@ -68,8 +68,8 @@ After an approved merge, verify the first eligible App-backed sweep on
 Read back an actual graph advance from the saved state and match its revision and
 hash to the published board. To verify replacement, record an eligible claimant
 at the time of the sweep and confirm the saved child follows it. Verify the
-installed worker with a run at the new pin. A queued or held run stays pending
-until the save and redraw are verified.
+installed worker with a run at the Toolkit revision under check. A queued or held
+run stays pending until the save and redraw are verified.
 
 Python discovery includes `tests.test_quote_api_auth` and
 `tests.test_quote_api_tenancy` for the disabled admission boundary.
