@@ -7395,11 +7395,11 @@ function basisQuantityIsEstimate(line = {}) {
 function normalizeBasisLines(line = "") {
   if (line && typeof line === "object" && !Array.isArray(line) && typeof canonicalizePrimaryOrderFields === "function") line = canonicalizePrimaryOrderFields(line);
   if (line && typeof line === "object") {
-    const quantityParts = normalizedLineTextQuantityParts(
-      line.text || line.line || line.description || "",
-      line.quantity,
-      line.unit
-    );
+    const lineText = line.text || line.line || line.description || "";
+    // The booth profile has no quantity: "93 sqm booth, corner" is its wording.
+    const quantityParts = line.booth_profile === true
+      ? { text: cleanCustomerQuoteLineText(lineText) }
+      : normalizedLineTextQuantityParts(lineText, line.quantity, line.unit);
     const text = quantityParts.text;
     if (!text) return [];
     const confidence = normalizeConfidence(line.confidence ?? line.confidence_pct);
@@ -11830,7 +11830,7 @@ function basisSections(sections = state.quoteBasisSections) {
 }
 
 const UNRESOLVED_BASIS_LINES_MESSAGE = "Resolve all review lines before confirming quotation basis.";
-// Confirm stopped by rows staff still have to settle, not by the AI analysis (owner, 25 Nov 2026).
+// Confirm stopped by rows staff still have to settle, not by the AI analysis. The wording waits for the owner.
 const BASIS_ROWS_NEED_DECISION_TITLE = "Rows need a decision.";
 
 function unresolvedConfirmLines(sections = state.quoteBasisSections) {

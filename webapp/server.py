@@ -136,7 +136,6 @@ from webapp.quote_engine import (
     catalog_item_identity_key,
     catalog_item_unit_hint,
     catalog_line_contradicts_item,
-    catalog_reference_values,
     catalog_spatial_context_parts,
     clean_basis_section_title,
     clean_customer_quote_line_text,
@@ -6002,10 +6001,12 @@ def normalized_quantity_estimate(value: Any) -> dict[str, Any] | None:
 def normalize_basis_lines(value: Any) -> list[dict[str, Any]]:
     if isinstance(value, dict):
         value = canonicalize_primary_order_fields(value)
-        quantity_parts = normalized_line_text_quantity_parts(
-            value.get("text") or value.get("line") or value.get("description"),
-            value.get("quantity"),
-            value.get("unit"),
+        line_text = value.get("text") or value.get("line") or value.get("description")
+        quantity_parts = (
+            # The booth profile has no quantity: "93 sqm booth, corner" is its wording.
+            {"text": clean_customer_quote_line_text(line_text), "quantity": "", "unit": ""}
+            if value.get("booth_profile") is True
+            else normalized_line_text_quantity_parts(line_text, value.get("quantity"), value.get("unit"))
         )
         text = quantity_parts["text"]
         if not text:
@@ -26662,70 +26663,24 @@ def footprint_quantity_matches(value: Any, area: float) -> bool:
     return quantity is not None and area > 0 and abs(quantity - area) <= BOOTH_FOOTPRINT_MATCH_TOLERANCE * area
 
 
-def booth_sizes_stated(value: Any) -> set[Any]:
-    """The floor sizes a text states: width x depth as a sorted pair, and floor areas, in metres."""
-    text = str(value or "")
-    sizes: set[Any] = set()
-    for match in BOOTH_STATED_PAIR_RE.finditer(text):
-        pair = booth_stated_pair_in_metres(match)
-        if pair:
-            sizes.add(tuple(sorted(pair)))
-    for match in BOOTH_SIZE_AREA_RE.finditer(text):
-        sizes.add(parse_float_or_none(match.group(1).replace(",", "")))
-    return sizes
-
-
-class CatalogueOwnedSizes:
-    """What an applied booth size may never rewrite in a draft line: the catalogue's own wording.
-
-    That is a leading `[ catalogue reference ]`, a catalogue name that states a size, wherever a line repeats it, and,
-    on a line matched to a catalogue item without repeating its name, a size that name states.
-    """
-
-    def __init__(self, parsed: dict[str, Any], catalogue: dict[str, dict[str, Any]]) -> None:
-        self.catalogue = catalogue
-        self.keywords: dict[str, set[str]] = {}
-        for row in self.rows(parsed):
-            for row_id in self.row_ids(row):
-                if clean_text(row.get("pricing_keyword")):
-                    self.keywords.setdefault(row_id, set()).add(clean_text(row["pricing_keyword"]))
-        names = {value for item in catalogue.values() for value in catalog_reference_values(item) if booth_sizes_stated(value)}
-        names_pattern = "|".join(r"\s+".join(re.escape(word) for word in name.split()) for name in sorted(names, key=len, reverse=True))
-        self.names = re.compile(rf"(?<!\w)({names_pattern})(?!\w)", re.IGNORECASE) if names else None
-
-    @staticmethod
-    def rows(parsed: dict[str, Any]) -> list[dict[str, Any]]:
-        lines = [line for section in parsed.get("quote_basis_sections") or [] if isinstance(section, dict)
-                 for line in section.get("lines") or [] if isinstance(line, dict)]
-        return [*lines, *(row for row in parsed.get("line_items") or [] if isinstance(row, dict))]
-
-    @staticmethod
-    def row_ids(row: dict[str, Any]) -> set[str]:
-        return {clean_text(row.get(key)) for key in ("id", "source_basis_line_id")} - {""}
-
-    def sizes_of(self, row: dict[str, Any]) -> set[Any]:
-        keywords = {clean_text(row.get("pricing_keyword"))}.union(*(self.keywords.get(row_id, set()) for row_id in self.row_ids(row)))
-        return {size for keyword in keywords for value in catalog_reference_values(self.catalogue.get(keyword) or {})
-                for size in booth_sizes_stated(value)}
-
-    def rewrite(self, row: dict[str, Any], change: Callable[[str, set[Any]], str]) -> None:
-        for key in ("text", "description"):
-            value = row.get(key)
-            if not isinstance(value, str):
-                continue
-            reference, detail = "", value
-            if bracketed_catalog_reference_parts(value):
-                reference, detail = value[:value.index("]") + 1], value[value.index("]") + 1:]
-            # Split with one group: a catalogue name is every second piece.
-            pieces = self.names.split(detail) if self.names else [detail]
-            own_sizes = set() if reference or len(pieces) > 1 else self.sizes_of(row)
-            row[key] = reference + "".join(piece if index % 2 else change(piece, own_sizes) for index, piece in enumerate(pieces))
-
-
-def rescaled_footprint_text(value: str, old_area: float, new_area: float) -> str:
-    # Keep a repeated measurement in the row text in step with its quantity.
+def rescaled_footprint_text(value: Any, old_area: float, new_area: float) -> Any:
+    """The text of a row resized to new_area: a leading count and unit follows, a bracketed catalogue reference stays."""
+    if not isinstance(value, str):
+        return value
+    reference = bracketed_catalog_reference_parts(value)
+    if reference:
+        name, detail = reference
+        return f"[ {name} ] - {rescaled_footprint_text(detail, old_area, new_area)}" if detail else value
+    prefix = leading_quantity_prefix(value)
     pattern = rf"(?<![\d.]){re.escape(format_dimension(old_area))}(?:\.0+)?(\s*(?:sqm|sq\.?\s*m\b|m2|m\u00b2))"
-    return re.sub(pattern, lambda match: f"{format_dimension(new_area)}{match.group(1)}", value, flags=re.IGNORECASE)
+    text = re.sub(pattern, lambda match: f"{format_dimension(new_area)}{match.group(1)}", prefix["text"] if prefix else value, flags=re.IGNORECASE)
+    return f"{format_dimension(new_area)} {prefix['unit']} {text}" if prefix else text
+
+
+def row_text_measurement(value: Any) -> dict[str, Any] | None:
+    """The count and unit the server can read from a row's text, also once a bracketed reference is unwrapped."""
+    reference = bracketed_catalog_reference_parts(value)
+    return leading_quantity_prefix((reference[1] or reference[0]) if reference else value)
 
 
 BOOTH_STATED_PAIR_RE = re.compile(
@@ -26740,44 +26695,36 @@ BOOTH_SIZE_STATED_BEFORE_RE = re.compile(
 BOOTH_SIZE_STATED_AFTER_RE = re.compile(r"^\W*(?:booth|stand|space|footprint)\b")
 
 
-def booth_stated_pair_in_metres(match: re.Match[str]) -> tuple[float, float] | None:
-    unit = match.group(4) or match.group(2) or ""
-    width = booth_length_in_metres(match.group(1), match.group(2) or unit)
-    depth = booth_length_in_metres(match.group(3), match.group(4) or unit)
-    return None if width is None or depth is None else (width, depth)
-
-
-def staff_sized_booth_text(
-    value: str, staff: dict[str, Any], ai_area: float | None, *, whole_floor: bool, informational: bool, own_sizes: set[Any],
-) -> str:
-    """Replace a booth size in a draft line that contradicts the size staff applied.
-
-    The AI's own booth size is replaced on a full-floor or informational line, and elsewhere where the words
-    say it is the booth's. Any other booth size is replaced only where the line is about nothing but the booth.
-    A size in own_sizes is the line's catalogue item's and is left alone.
-    """
+def applied_booth_profile_text(value: Any, staff: dict[str, Any], ai_area: float | None) -> Any:
+    """Replace a booth size in a booth profile line that contradicts the size staff applied."""
+    if not isinstance(value, str):
+        return value
     staff_area = parse_float_or_none(staff.get("booth_area_sqm"))
     label = booth_size_label(staff.get("booth_width"), staff.get("booth_depth"), staff_area)
     if not label or not staff_area:
         return value
-    only_booth = informational and names_only_the_booth(value)
+    only_booth = names_only_the_booth(value)
 
     def contradicts(area: float | None, text: str, start: int, end: int) -> bool:
         if not area or footprint_quantity_matches(area, staff_area):
             return False
-        stated = bool(BOOTH_SIZE_STATED_BEFORE_RE.search(text[max(0, start - 60):start].lower())
-                      or BOOTH_SIZE_STATED_AFTER_RE.match(text[end:end + 30].lower()))
         if ai_area and footprint_quantity_matches(area, ai_area):
-            return whole_floor or informational or stated
-        return area >= BOOTH_AREA_MIN_SQM and (only_booth or (informational and stated))
+            return True
+        # Another size may be another object's, unless the line or its words say it is the booth's.
+        return area >= BOOTH_AREA_MIN_SQM and bool(
+            only_booth
+            or BOOTH_SIZE_STATED_BEFORE_RE.search(text[max(0, start - 60):start].lower())
+            or BOOTH_SIZE_STATED_AFTER_RE.match(text[end:end + 30].lower()))
 
     pieces: list[str] = []
     position = 0
     for match in BOOTH_STATED_PAIR_RE.finditer(value):
         if booth_size_pair_continues_earlier(value, match.start()):
             continue
-        pair = booth_stated_pair_in_metres(match)
-        if not pair or tuple(sorted(pair)) in own_sizes or not contradicts(pair[0] * pair[1], value, match.start(), match.end()):
+        unit = match.group(4) or match.group(2) or ""
+        width = booth_length_in_metres(match.group(1), match.group(2) or unit)
+        depth = booth_length_in_metres(match.group(3), match.group(4) or unit)
+        if width is None or depth is None or not contradicts(width * depth, value, match.start(), match.end()):
             continue
         pieces.extend((value[position:match.start()], label))
         position = match.end()
@@ -26789,30 +26736,32 @@ def staff_sized_booth_text(
     text = "".join((*pieces, value[position:]))
     pieces, position = [], 0
     for match in BOOTH_SIZE_AREA_RE.finditer(text):
-        area = parse_float_or_none(match.group(1).replace(",", ""))
-        if area not in own_sizes and contradicts(area, text, match.start(), match.end()):
+        if contradicts(parse_float_or_none(match.group(1).replace(",", "")), text, match.start(), match.end()):
             pieces.extend((text[position:match.start(1)], format_dimension(round(staff_area, 2))))
             position = match.end(1)
     return "".join((*pieces, text[position:]))
 
 
-def with_staff_booth_size_stated(
-    parsed: dict[str, Any], staff: dict[str, Any], ai: dict[str, Any], whole_floor_rows: list[dict[str, Any]], owned: CatalogueOwnedSizes,
-) -> None:
-    """After a Known details size is applied, no draft line states another booth size."""
+def with_applied_booth_profile(parsed: dict[str, Any], staff: dict[str, Any], ai: dict[str, Any]) -> dict[str, Any]:
+    """After a Known details size is applied, no booth profile line states another booth size.
+
+    Only these lines: they are never quote lines, so no quantity, unit, match or price is read from their text.
+    """
     ai_area = parse_float_or_none(ai.get("booth_area_sqm")) if clean_text(ai.get("dimension_source")) != "default" else None
-    whole_floor = {id(row) for row in whole_floor_rows}
-    for row in owned.rows(parsed):
-        informational = is_informational_dimension_basis_line(row)
-        owned.rewrite(row, lambda text, own_sizes: staff_sized_booth_text(
-            text, staff, ai_area, whole_floor=id(row) in whole_floor, informational=informational, own_sizes=own_sizes))
+    result = copy.deepcopy(parsed)
+    for section in result.get("quote_basis_sections") or []:
+        for line in (section.get("lines") or []) if isinstance(section, dict) else []:
+            if isinstance(line, dict) and line.get("booth_profile") is True:
+                for key in ("text", "description"):
+                    if key in line:
+                        line[key] = applied_booth_profile_text(line[key], staff, ai_area)
+    return result
 
 
 def staff_footprint_rescale(
     parsed: dict[str, Any],
     payload_dimensions: dict[str, Any],
     ai_dimensions: dict[str, Any],
-    catalogue: dict[str, dict[str, Any]],
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Resize full-footprint sqm rows the AI sized on another booth than Known details.
 
@@ -26825,14 +26774,13 @@ def staff_footprint_rescale(
     ai_area = parse_float_or_none(ai_dimensions.get("booth_area_sqm"))
     if not staff_area:
         return parsed, None
-    result = copy.deepcopy(parsed)
-    owned = CatalogueOwnedSizes(result, catalogue)
-    if not ai_area or clean_text(ai_dimensions.get("dimension_source")) == "default" or footprint_quantity_matches(ai_area, staff_area):
-        with_staff_booth_size_stated(result, payload_dimensions, ai_dimensions, [], owned)
+    result = with_applied_booth_profile(parsed, payload_dimensions, ai_dimensions)
+    if not ai_area or clean_text(ai_dimensions.get("dimension_source")) == "default":
+        return result, None
+    if footprint_quantity_matches(ai_area, staff_area):
         return result, None
     staff_area = round(staff_area, 2)
     staff_quantity = int(staff_area) if float(staff_area).is_integer() else staff_area
-    whole_floor_rows: list[dict[str, Any]] = []
     resized = 0
 
     def resize(row: Any) -> bool:
@@ -26840,13 +26788,15 @@ def staff_footprint_rescale(
             return False
         if not footprint_quantity_matches(row.get("quantity"), ai_area):
             return False
+        texts = {key: rescaled_footprint_text(row[key], ai_area, staff_area) for key in ("text", "description") if key in row}
+        # The server reads a row's leading count from its text: where that cannot be the new size, the row stays as drafted.
+        if any(read and read["quantity"] != staff_quantity for read in map(row_text_measurement, texts.values())):
+            return False
         # A predicted size keeps its Est. mark at the new size (owner: predicted quantities always show Est.).
         estimate = normalized_quantity_estimate(row.get("quantity_estimate"))
         if estimate and footprint_quantity_matches(estimate["quantity"], ai_area):
             row["quantity_estimate"] = {"quantity": staff_quantity, "unit": row.get("unit")}
-        row["quantity"] = staff_quantity
-        owned.rewrite(row, lambda text, own_sizes: text if ai_area in own_sizes else rescaled_footprint_text(text, ai_area, staff_area))
-        whole_floor_rows.append(row)
+        row.update(texts, quantity=staff_quantity)
         return True
 
     for row in result.get("line_items") or []:
@@ -26854,7 +26804,6 @@ def staff_footprint_rescale(
     for section in result.get("quote_basis_sections") or []:
         for line in (section.get("lines") or []) if isinstance(section, dict) else []:
             resize(line)
-    with_staff_booth_size_stated(result, payload_dimensions, ai_dimensions, whole_floor_rows, owned)
     return result, {
         "ai_area_sqm": round(ai_area, 2),
         "staff_area_sqm": staff_area,
@@ -26927,15 +26876,6 @@ def normalize_ai_draft(
         snapshot = capture_pricing_reference_snapshot(payload, auth_session=auth_session)
         if snapshot is not None:
             payload["_pricing_reference_snapshot"] = snapshot
-    catalog_lookup = (
-        pricing_catalog_runtime_lookup_for_payload(
-            payload,
-            profile_id_from_payload(payload),
-            auth_session=auth_session,
-        )
-        if has_payload_context
-        else {}
-    )
     # The AI reports a size only; it can never claim a staff (Known details) source.
     raw_project = ai_project_size_fields(parsed.get("project"))
     dimensions = booth_dimensions_from_payload({"project": raw_project}) if raw_project else {}
@@ -26947,7 +26887,7 @@ def normalize_ai_draft(
             # The applied draft is normalised again from this reply with the size held (no AI call).
             staff_proposal = {"dimensions": staff_proposal, "parsed": copy.deepcopy(parsed)}
         parsed, staff_rescale = staff_footprint_rescale(
-            parsed, staff_dimensions or booth_dimensions_from_payload(payload), dimensions, catalog_lookup)
+            parsed, staff_dimensions or booth_dimensions_from_payload(payload), dimensions)
     raw_line_items = parsed.get("line_items") if isinstance(parsed.get("line_items"), list) else []
     pricing_reference_sections = (
         pricing_reference_section_names_for_payload(payload, auth_session=auth_session)
@@ -26965,6 +26905,15 @@ def normalize_ai_draft(
             auth_session=auth_session,
         )
         trusted_input_authorities = trusted_manual_included_input_authorities(trusted_input_items)
+    catalog_lookup = (
+        pricing_catalog_runtime_lookup_for_payload(
+            payload,
+            profile_id_from_payload(payload),
+            auth_session=auth_session,
+        )
+        if has_payload_context
+        else {}
+    )
     require_provider_amount_representable(raw_line_items, catalog_lookup, quote_exchange_rate_from_payload(payload))
     line_items = normalize_line_items(
         {**payload, "line_items": raw_line_items},
