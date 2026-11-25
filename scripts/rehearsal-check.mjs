@@ -47,7 +47,8 @@
 // (scripts/lib/basis-click-probe.mjs, the CI click-budget job's) on the largest
 // manifest quotes, in a separate browser where every save is answered locally
 // and counted, so the copy stays unchanged. Exact counts fail the walk;
-// timings are recorded only. Never on live: a click there would save.
+// timings are recorded only. Every quote is probed even when one fails, and a
+// failed step keeps its facts. Never on live: a click there would save.
 //
 // Credentials come from the environment only, never arguments:
 //   SQAG_REHEARSAL_LOGIN_EMAIL, SQAG_REHEARSAL_LOGIN_PASSWORD: the rehearsal app's
@@ -72,7 +73,7 @@ import { signIn } from "./internal-password-browser-test.mjs";
 import { pdfFontNames, unexpectedPdfFonts, validatePdf, validateXlsx } from "./lib/artifact-checks.mjs";
 import { AI_CAP_MAX_USD, AI_PRICING_ENRICHMENT_USD, AiCapError, loadBudget, reportedUsd, saveBudget } from "./lib/ai-budget.mjs";
 import { copyTargets, derivedReasons, ManifestError, MAX_CANDIDATES, targetsDocument, validateManifest, walkTargets } from "./lib/live-cases.mjs";
-import { byteBudget, CLICK_COUNT_BUDGET, CLICK_WINDOW_MS, groupActions, installClickProbe, judgeClickCounts, lineButton, linesIn, measureClicks } from "./lib/basis-click-probe.mjs";
+import { probeOpenQuote } from "./lib/basis-click-probe.mjs";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -129,13 +130,16 @@ function assert(condition, message) {
 }
 
 // Error text in the result never carries URLs, emails or long tokens.
-export function scrub(value) {
+function scrubText(value) {
   return String(value?.message || value || "unknown error")
     .replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, "<url>")
     .replace(/\S+@\S+/g, "<email>")
     .replace(/[A-Za-z0-9+/=_-]{32,}/g, "<token>")
-    .replace(/[\r\n]+/g, " ")
-    .slice(0, 400);
+    .replace(/[\r\n]+/g, " ");
+}
+
+export function scrub(value) {
+  return scrubText(value).slice(0, 400);
 }
 
 export function parseArgs(argv, env = process.env) {
@@ -436,6 +440,8 @@ class Run {
     } catch (error) {
       entry.status = "fail";
       entry.error = scrub(error);
+      // A step that fails with facts (the click probe) keeps them: the message is cut, they are not.
+      if (error?.stepFacts) entry.detail = error.stepFacts;
       throw error;
     } finally {
       entry.ms = Date.now() - started;
@@ -1057,6 +1063,8 @@ async function walkQuote(run, sessionId) {
   assert(page.bad_blocks === 0, `${page.bad_blocks} block(s) lack exactly one tick-all and one X.`);
   assert(page.empty_booth_boxes === 0, "A Detected booth box is empty.");
   assert(page.missing_quantity_boxes === 0, `${page.missing_quantity_boxes} line(s) with no quantity have no quantity box.`);
+  // Pass A: why each walked quote's Quote Basis is locked, so the agent UAT knows which locks to expect.
+  if (run.options.downloadFiles) detail.basis_lock = await basisLockFacts(run.page);
   return { ...detail, ...page };
 }
 
@@ -1132,9 +1140,12 @@ async function liveWalk(run, manifest) {
   if (run.options.clickBudget) {
     const largest = walked.filter((detail) => detail.lines > 0).sort((a, b) => b.lines - a.lines).slice(0, CLICK_BUDGET_QUOTES);
     if (!largest.length) await run.step("click budget", () => { throw new Error("No manifest quote has basis lines to click."); });
+    // Every quote is probed even when an earlier one fails, so one run shows all its facts.
+    const failed = [];
     for (const [index, detail] of largest.entries()) {
-      await run.step(`click budget on quote ${index + 1}`, () => clickBudgetOnQuote(run, detail.id));
+      await run.step(`click budget on quote ${index + 1}`, () => clickBudgetOnQuote(run, detail.id)).catch((error) => { failed.push(error); });
     }
+    if (failed.length) throw failed[0];
   }
 }
 
@@ -1179,8 +1190,8 @@ const CUSTOMER_NEXT_LOCK = "Click Next in Customer to save this step before cont
 
 // Why Quote Basis is locked on the reopened quote, read from the app's own checkpoint
 // functions: reason codes and checkpoint field names only, never their values.
-function basisLockFacts(page) {
-  return page.evaluate((customerNextLock) => {
+export async function basisLockFacts(page) {
+  const facts = await page.evaluate((customerNextLock) => {
     const button = document.querySelector("#quoteBasisButton");
     const saved = state.customerStepCheckpoint;
     const upgraded = customerStepCheckpointWithAddedFieldDefaults(saved);
@@ -1190,7 +1201,12 @@ function basisLockFacts(page) {
     const compare = (left, right, prefix, depth) => {
       if (quoteCommercialStrictDataEqual(left, right)) return;
       if (depth < 3 && isPlainObject(left) && isPlainObject(right)) {
-        for (const key of [...new Set([...Object.keys(left), ...Object.keys(right)])].sort()) compare(left[key], right[key], prefix ? `${prefix}.${key}` : key, depth + 1);
+        for (const key of [...new Set([...Object.keys(left), ...Object.keys(right)])].sort()) {
+          const at = prefix ? `${prefix}.${key}` : key;
+          // A key only one side has is a difference even when its value is undefined, as in the app.
+          if (Object.hasOwn(left, key) && Object.hasOwn(right, key)) compare(left[key], right[key], at, depth + 1);
+          else differs.push(at);
+        }
       } else differs.push(prefix);
     };
     if (isPlainObject(upgraded) && current) compare(upgraded, current, "", 0);
@@ -1198,6 +1214,7 @@ function basisLockFacts(page) {
       !safeQuoteSessionId(state.quoteSessionId) && "session_id",
       !currentBrowserRecoveryScope() && "recovery_scope",
       !currentPricingReference() && "pricing_reference",
+      Boolean(currentPricingReference()) && !PRICING_REFERENCE_DIGEST_RE.test(String(currentPricingReference().digest_sha256 || "")) && "reference_digest",
       Boolean(customerDetailsBlockReason()) && "customer_details",
       quoteCommercialReviewRequired() && "commercial_review",
     ].filter(Boolean);
@@ -1207,24 +1224,26 @@ function basisLockFacts(page) {
       saved_checkpoint: isPlainObject(saved),
       differs,
       current_unavailable: unavailable,
-      pricing_reference_change_pending: pendingPricingReferenceSelectionChanged(),
+      // Under 32 characters, so scrub keeps the name in a failure message.
+      reference_pending: pendingPricingReferenceSelectionChanged(),
       save_busy: Boolean(state.customerStepCheckpointSaveBusy),
     };
   }, CUSTOMER_NEXT_LOCK);
+  // Only the recovery scope differs: what the copy's own secret causes, not the quote.
+  const copyOnly = facts.customer_next && facts.saved_checkpoint && !facts.save_busy && !facts.reference_pending
+    && facts.current_unavailable.length === 0 && facts.differs.length === 1 && facts.differs[0] === "recoveryScope";
+  return { ...facts, copy_only: copyOnly };
 }
 
-// Opens Quote Basis on the reopened quote as a user would, and returns why it was locked.
+// Opens Quote Basis on the reopened quote as a user would, and records why it was locked.
 // The copy of live runs with its own session secret, so the browser recovery scope in every
 // saved Customer checkpoint differs there and Quote Basis opens locked: a user then presses
 // Next in Customer, whose save the probe's stub answers. The lock is recorded, never skipped.
 // Any other lock (a Customer field that also differs, a missing checkpoint, a pending pricing
 // reference) would lock the quote on live too, so it fails the probe with its facts.
-async function openQuoteBasis(page, stubbed) {
-  const facts = await basisLockFacts(page);
-  // Only the recovery scope differs: what the copy's own secret causes, not the quote.
-  const copyOnly = facts.customer_next && facts.saved_checkpoint && !facts.save_busy && !facts.pricing_reference_change_pending
-    && facts.current_unavailable.length === 0 && facts.differs.length === 1 && facts.differs[0] === "recoveryScope";
-  const lock = { ...facts, copy_only: copyOnly, unlocked_by: null, next_saves: 0 };
+// `facts.basis_lock` is filled before anything can fail, so a failed probe keeps the lock's facts.
+async function openQuoteBasis(page, stubbed, facts) {
+  const lock = facts.basis_lock = { ...(await basisLockFacts(page)), unlocked_by: null, next_saves: 0 };
   if (lock.locked) {
     // Worded so the facts never follow "secret:", which the sensitive-fixture scan blocks.
     assert(lock.copy_only, `Quote Basis is locked beyond what the copy's own session key causes, facts ${JSON.stringify(lock)}`);
@@ -1232,6 +1251,7 @@ async function openQuoteBasis(page, stubbed) {
     await page.waitForFunction(() => state.activeSidePanel === "customer", null, { timeout: 30000 });
     // Next would ask to confirm changed inputs and clear the quote's results: not what this measures.
     const changes = await page.evaluate(() => quoteDependencyChangesForNext());
+    if (changes.length) lock.next_would_confirm = changes;
     assert(changes.length === 0, `Next in Customer would ask to confirm changed ${changes.join(", ")}: ${JSON.stringify(lock)}`);
     // The quote saves the Next press itself caused, answered by the stub.
     const savesBefore = stubbedQuoteSaves(stubbed);
@@ -1239,20 +1259,25 @@ async function openQuoteBasis(page, stubbed) {
     const moved = await page.waitForFunction(() => state.activeSidePanel === "quote_company" && !state.customerStepCheckpointSaveBusy, null, { timeout: 30000 }).then(() => true, () => false);
     lock.next_saves = stubbedQuoteSaves(stubbed) - savesBefore;
     const after = await basisLockFacts(page);
-    assert(moved && !after.locked, `Next in Customer did not unlock Quote Basis: ${JSON.stringify({ before: lock, after })}`);
+    if (!moved || after.locked) lock.after_next = after;
+    assert(moved && !after.locked, `Next in Customer did not unlock Quote Basis: ${JSON.stringify(after)}`);
     lock.unlocked_by = "customer_next";
   }
   await page.locator("#quoteBasisButton").click();
-  return lock;
 }
 
 async function clickBudgetOnQuote(run, sessionId) {
-  const readback = await quoteSession(run, sessionId);
-  const { cookies } = await run.context.storageState();
-  const context = await run.browser.newContext({ storageState: { cookies, origins: [] } });
+  // Filled as the probe goes and kept in the result file whether the step passes or fails:
+  // sizes, counts, reason codes and checkpoint field names, never quote text.
+  const facts = { id: sessionId, failures: [] };
   const stubbed = [];
-  await context.route("**/*", saveStub(run, readback, stubbed));
+  let context;
   try {
+    const readback = await quoteSession(run, sessionId);
+    facts.lines = derivedReasons(readback).lines;
+    const { cookies } = await run.context.storageState();
+    context = await run.browser.newContext({ storageState: { cookies, origins: [] } });
+    await context.route("**/*", saveStub(run, readback, stubbed));
     const page = await context.newPage();
     const pageErrors = [];
     page.on("pageerror", (error) => pageErrors.push(error.name));
@@ -1266,56 +1291,20 @@ async function clickBudgetOnQuote(run, sessionId) {
     await page.goto(`${run.baseUrl}/`, { waitUntil: "domcontentloaded", timeout: 30000 });
     await waitForDashboardQuote(run, page, sessionId, "attached", 30000);
     assert(await page.evaluate((id) => modifyDashboardQuote(id), sessionId) === true, "The quote did not reopen for the click probe.");
-    // A reopened quote may open on another panel: open Quote Basis as a user would, then let
-    // any save the switch armed finish before the first measured click.
-    const basisLock = await openQuoteBasis(page, stubbed);
+    // A reopened quote may open on another panel: open Quote Basis as a user would.
+    await openQuoteBasis(page, stubbed, facts);
     await page.locator("#basisReviewSurface li[data-basis-key]").first().waitFor({ state: "visible", timeout: 30000 });
-    await page.waitForTimeout(CLICK_WINDOW_MS);
-    // The quote's own size sets the byte budgets (a click copies it once, a save about three times).
-    const quoteBytes = await page.evaluate(() => JSON.stringify(currentQuoteSessionDraftState()).length);
-    const budget = byteBudget(CLICK_COUNT_BUDGET, quoteBytes);
-    await installClickProbe(page);
-    const failures = [];
-    const check = (ok, message, detail) => { if (!ok) failures.push(message + (detail === undefined ? "" : ": " + JSON.stringify(detail))); };
-    const judge = (sample, posts) => judgeClickCounts(sample, posts, budget, check);
-    const samples = [];
-    const groups = {};
-    for (const group of ["Matched", "Review", "Unmatched"]) {
-      const lines = await linesIn(page, group);
-      groups[group] = lines.length;
-      if (!lines.length) continue;
-      for (const [action, click] of groupActions(page, lines[0])) samples.push(await measureClicks(page, { group, action, clicks: [click], quotePosts, judge }));
-    }
-    assert(samples.length > 0, "The quote shows no basis line to click.");
-    // Five fast clicks on three lines of the largest group arm one save, not five.
-    const burstGroup = Object.entries(groups).sort((a, b) => b[1] - a[1]).find(([, count]) => count >= 3)?.[0];
-    let burst = null;
-    if (burstGroup) {
-      const three = (await linesIn(page, burstGroup)).slice(0, 3);
-      burst = await measureClicks(page, {
-        group: burstGroup, action: "burst", expectedClicks: 5, touched: three, quotePosts, judge,
-        clicks: [() => lineButton(page, three[0], true), () => lineButton(page, three[1], true), () => lineButton(page, three[2], true),
-          () => lineButton(page, three[0], false), () => lineButton(page, three[1], false)],
-      });
-    }
+    const check = (ok, message, detail) => { if (!ok) facts.failures.push(scrubText(message + (detail === undefined ? "" : ": " + JSON.stringify(detail)))); };
+    await probeOpenQuote(page, { quotePosts, facts, check });
     check(pageErrors.length === 0, "the page threw errors", pageErrors);
-    const counts = (sample) => ({
-      group: sample.group, action: sample.action, clicks: sample.clicks, quote_local_storage_writes: sample.quoteLocalStorageWrites,
-      indexed_db_puts: sample.indexedDbPuts, basis_renders: sample.basisRenders, rebuilt_rows: sample.rebuiltRows, kept_rows: sample.keptRows,
-      serialised_bytes: sample.serialisedBytes, encoded_bytes: sample.encodedBytes, quote_saves: sample.quoteSaves,
-      // Timings vary with the laptop: recorded, never judged here.
-      input_to_paint_ms: Math.round(sample.inputToPaintMs), longest_frame_ms: Math.max(0, ...sample.clickFrames, ...sample.laterFrames),
-    });
-    const detail = {
-      id: sessionId, lines: derivedReasons(readback).lines, quote_bytes: quoteBytes, groups, basis_lock: basisLock,
-      samples: samples.map(counts), burst: burst && counts(burst),
-      stubbed_saves: stubbedQuoteSaves(stubbed),
-      stubbed_other: stubbed.length - stubbedQuoteSaves(stubbed),
-    };
-    assert(failures.length === 0, `Click budget: ${failures.join("; ")}`);
-    return detail;
+    assert(facts.failures.length === 0, `Click budget, ${facts.failures.length} failure(s): ${facts.failures.join("; ")}`);
+    return facts;
+  } catch (error) {
+    throw Object.assign(error, { stepFacts: facts });
   } finally {
-    await context.close().catch(() => {});
+    facts.stubbed_saves = stubbedQuoteSaves(stubbed);
+    facts.stubbed_other = stubbed.length - stubbedQuoteSaves(stubbed);
+    await context?.close().catch(() => {});
   }
 }
 

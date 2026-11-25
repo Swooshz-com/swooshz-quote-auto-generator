@@ -23,7 +23,7 @@ function replaceOnce(before, after) {
 const local = (file) => JSON.stringify(pathToFileURL(path.join(root, 'scripts', file)).href);
 replaceOnce('const sourceRoot = fileURLToPath(new URL("..", import.meta.url));', 'const sourceRoot = process.cwd();');
 replaceOnce('import { signIn } from "./internal-password-browser-test.mjs";', `import { signIn } from ${local('internal-password-browser-test.mjs')};
-import { CLICK_COUNT_BUDGET, groupActions, installClickProbe, judgeClickCounts, lineButton, linesIn, measureClicks } from ${local('lib/basis-click-probe.mjs')};`);
+import { CLICK_COUNT_BUDGET, groupActions, installClickProbe, judgeClickCounts, lineButton, linesIn, measureClicks, probeOpenQuote } from ${local('lib/basis-click-probe.mjs')};`);
 replaceOnce('import { SyntheticBrowserBoundary, freshBrowserRun } from "./synthetic-browser-boundary.mjs";',
   `import { SyntheticBrowserBoundary, freshBrowserRun } from ${local('synthetic-browser-boundary.mjs')};`);
 // Real-shaped fillers: lines with a possible catalogue match (Review), bespoke lines with no catalogue
@@ -125,6 +125,62 @@ replaceOnce('  result.basisLines = draftLines.length;', `  result.basisLines = d
     result.clickBudget.inputToPaint = { medianMs: paints[Math.floor(paints.length / 2)], maxMs: paints[paints.length - 1] };
     check(result.clickBudget.inputToPaint.medianMs <= budget.medianInputToPaintMs, "median click input-to-paint is over budget", result.clickBudget.inputToPaint);
     check(result.clickBudget.inputToPaint.maxMs <= budget.maxInputToPaintMs, "a click's input-to-paint is over budget", result.clickBudget.inputToPaint);
+
+    // 5. The same quote reopened from the dashboard, as Pass A opens a real one, and grown to the size of
+    // the largest real quote probed on the copy of live (#390 hold 8: 440,528 characters of browser copy).
+    // A reopened quote's browser copy also holds the restore key, which the steps above never have.
+    await finishPendingQuoteSaves(page, sessionId);
+    assert(await page.evaluate(async (id) => {
+      state.analysisFindings = Array.from({ length: 200 }, (_, index) => ({ text: "Synthetic finding " + (index + 1) + ": " + "the rear wall, the counter and the ceiling feature were read from the booth render. ".repeat(2), confidence_pct: 80 }));
+      return await ensureQuoteSession({ quoteGenerated: false, synchronizeDraft: true }) === id;
+    }, sessionId), "the grown quote was not saved");
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && !appIsBusy(), null, { timeout: 60000 });
+    await page.evaluate(() => showDashboard());
+    await page.locator('#dashboardSessionsList [data-quote-session-id="' + sessionId + '"]').waitFor({ state: "attached", timeout: 30000 });
+    assert(await page.evaluate((id) => modifyDashboardQuote(id), sessionId) === true, "the quote did not reopen");
+    await page.locator("#quoteBasisButton").click();
+    await page.locator("#basisReviewSurface li[data-basis-key]").first().waitFor({ state: "visible", timeout: 30000 });
+    const reopened = result.clickBudget.reopened = {};
+    const reopenedProbe = await probeOpenQuote(page, { quotePosts, facts: reopened, check: (ok, message, detail) => check(ok, "reopened quote: " + message, detail) });
+    assert(reopened.browser_copy_bytes >= 440528 && reopened.restored_key_bytes >= reopened.quote_bytes, "the reopened quote is smaller than the largest real one", reopened);
+    check([...reopened.samples, reopened.burst].some((sample) => sample.quote_saves > 0), "no click on the reopened quote took the deferred quote save path");
+
+    // 6. A click on a line already in that state changes and writes nothing, and the probe says so.
+    const faultLine = (await linesIn(page, "Unmatched"))[0];
+    assert(faultLine, "the reopened quote has no Unmatched line for the fault checks");
+    const clickOnce = (exclude, caught) => measureClicks(page, { group: "Unmatched", action: "fault", clicks: [() => lineButton(page, faultLine, exclude)], quotePosts,
+      judge: (sample, posts) => judgeClickCounts(sample, posts, reopenedProbe.budget, (ok, message) => { if (!ok) caught.push(message); }) });
+    const idleCaught = [];
+    const idle = [await clickOnce(true, idleCaught), await clickOnce(true, idleCaught)];
+    check(idleCaught.length === 0 && idle[0].changingClicks === 1 && idle[1].idleClicks === 1 && idle[1].changingClicks === 0 && idle[1].quoteLocalStorageWrites === 0,
+      "a second X on an excluded line is not recorded as a click with nothing to change", { idleCaught, idle: idle.map((sample) => [sample.changingClicks, sample.idleClicks, sample.quoteLocalStorageWrites]) });
+    await clickOnce(false, idleCaught);
+
+    // 7. The faults the checks exist for, put into the page on this quote: each fails its own checks only.
+    const faults = [
+      ["a second copy of the quote per click", "saveSessionState", "original(); JSON.stringify(buildSessionSnapshot());", ["serialised too much data"]],
+      ["a second copy of the draft per click", "saveSessionState", "original(); JSON.stringify(currentQuoteSessionDraftState());", ["serialised too much data"]],
+      ["a second browser copy written per click", "saveSessionState", "original(); original();", ["more than once per click", "outside the click and its save", "serialised too much data"]],
+      ["a second copy of the draft per save", "saveQuoteSessionDraftState", "JSON.stringify(currentQuoteSessionDraftState()); return original();", ["serialised too much data"]],
+      ["a changed quote never written to the browser copy", "saveSessionState", "", ["without writing it to browser storage"]],
+      ["a click the app ignores", "applyBasisTag", "", ["changed nothing although a line"]],
+    ];
+    reopened.faults = [];
+    for (const [fault, name, body, expected] of faults) {
+      await page.evaluate(({ name, body }) => {
+        const real = window[name];
+        const faulty = new Function("original", body);
+        window.__withoutFault = () => { window[name] = real; };
+        window[name] = function (...values) { return faulty(() => real.apply(this, values)); };
+      }, { name, body });
+      const caught = [];
+      for (const exclude of [true, false]) await clickOnce(exclude, caught);
+      await page.evaluate(() => window.__withoutFault());
+      reopened.faults.push({ fault, caught });
+      check(expected.every((text) => caught.some((message) => message.includes(text))) && caught.every((message) => expected.some((text) => message.includes(text))),
+        "the click budget did not catch " + fault, caught);
+    }
     result.clickBudget.failures = failures;
     assert(pageErrors.length === 0, "page errors", pageErrors);
     result.status = failures.length ? "FAIL" : "PASS";

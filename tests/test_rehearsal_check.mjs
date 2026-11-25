@@ -136,11 +136,16 @@ test("live-readonly API contexts refuse every write before it is sent", async ()
 // A logging reverse proxy in front of the harness: what the server actually received.
 // With failReadbacks set it answers each quote readback as a fresh copy of live
 // did before its files were copied (#390 run 2, hold 3), without reaching the app.
+// With secondCopy set it serves app.js with a fault: every browser copy of the quote is
+// serialised twice (#390 hold 8).
+const SECOND_COPY_FAULT = `
+;(() => { const real = saveSessionState; saveSessionState = function (...values) { real.apply(this, values); JSON.stringify(buildSessionSnapshot()); }; })();
+`;
 const QUOTE_READBACK = /^\/api\/quote-sessions\/quote-[0-9a-f]{24}$/;
 async function loggingProxy(upstream) {
   const target = new URL(upstream);
   const log = [];
-  const state = { failReadbacks: false };
+  const state = { failReadbacks: false, secondCopy: false };
   const proxy = http.createServer((request, response) => {
     const route = request.url.split("?")[0];
     log.push(`${request.method} ${route}`);
@@ -149,9 +154,21 @@ async function loggingProxy(upstream) {
       response.end(JSON.stringify({ status: "error", errors: ["object_artifact_storage_unavailable"] }));
       return;
     }
-    const forward = http.request({ host: target.hostname, port: target.port, method: request.method, path: request.url, headers: request.headers }, (reply) => {
-      response.writeHead(reply.statusCode, reply.headers);
-      reply.pipe(response);
+    const faulty = state.secondCopy && route.endsWith("/app.js");
+    const headers = faulty ? { ...request.headers, "accept-encoding": "identity", "if-none-match": "" } : request.headers;
+    const forward = http.request({ host: target.hostname, port: target.port, method: request.method, path: request.url, headers }, (reply) => {
+      if (!faulty) {
+        response.writeHead(reply.statusCode, reply.headers);
+        reply.pipe(response);
+        return;
+      }
+      const parts = [];
+      reply.on("data", (part) => { parts.push(part); });
+      reply.on("end", () => {
+        const body = Buffer.concat([...parts, Buffer.from(SECOND_COPY_FAULT)]);
+        response.writeHead(reply.statusCode, { ...reply.headers, "content-length": String(body.length) });
+        response.end(body);
+      });
     });
     forward.on("error", () => { response.statusCode = 502; response.end(); });
     request.pipe(forward);
@@ -405,14 +422,22 @@ async function runAllProfiles(t, storage) {
     assert.ok(probed.samples.length >= 4 && probed.samples.every((sample) => sample.clicks === 1 && sample.indexed_db_puts === 0 && sample.rebuilt_rows === 0), JSON.stringify(probed.samples));
     // On the copy Quote Basis opens locked: the probe records why (field names only) and
     // presses Next in Customer as a user there would, its save answered in the browser.
+    const copyLock = { locked: true, customer_next: true, saved_checkpoint: true, differs: ["recoveryScope"], current_unavailable: [], reference_pending: false, save_busy: false, copy_only: true };
     for (const entry of clickSteps) {
       const { next_saves: nextSaves, ...lock } = entry.detail.basis_lock;
-      assert.deepEqual(lock, {
-        locked: true, customer_next: true, saved_checkpoint: true, differs: ["recoveryScope"], current_unavailable: [],
-        pricing_reference_change_pending: false, save_busy: false, copy_only: true, unlocked_by: "customer_next",
-      }, JSON.stringify(entry.detail.basis_lock));
+      assert.deepEqual(lock, { ...copyLock, unlocked_by: "customer_next" }, JSON.stringify(entry.detail.basis_lock));
       // Counted around the Next press alone, so the measured clicks' saves are not in it.
       assert.ok(Number.isInteger(nextSaves) && nextSaves >= 1, `Next in Customer did not reach the probe's save stub: ${nextSaves}`);
+    }
+    // Every walked quote's lock is recorded, not only the probed ones'.
+    assert.deepEqual(published.basis_lock, copyLock);
+    for (const n of [2, 3]) assert.equal(typeof step(passA.parsed, `quote ${n} reopens read-only`).detail.basis_lock?.locked, "boolean");
+    // A reopened quote's browser copy holds the draft and its restore key; the budgets come from those sizes.
+    for (const { detail } of clickSteps) {
+      assert.deepEqual(detail.failures, []);
+      assert.ok(detail.restored_key_bytes > detail.quote_bytes && detail.browser_copy_bytes > detail.quote_bytes + detail.restored_key_bytes, JSON.stringify(detail));
+      assert.ok(detail.budget.serialisedBytesPerClick > detail.browser_copy_bytes && detail.budget.serialisedBytesPerClick < 2 * detail.browser_copy_bytes, JSON.stringify(detail.budget));
+      assert.ok(detail.samples.every((sample) => sample.clicks_that_changed + sample.clicks_with_nothing_to_change === 1 && sample.quote_local_storage_writes >= sample.clicks_that_changed), JSON.stringify(detail.samples));
     }
     // Whatever the clicks saved was answered in the browser: the proxy check above saw only the sign-in.
     assert.ok(Number.isInteger(probed.stubbed_saves) && Number.isInteger(probed.stubbed_other), JSON.stringify(probed));
@@ -451,26 +476,45 @@ async function runAllProfiles(t, storage) {
     await result("reopen", ["--seed-file", seed.file]);
     // A quote whose Customer step was changed after its last Next (show name, saved without Next)
     // locks on live too. On the copy that lock is more than the copy's own secret, so the click
-    // probe must fail with its facts, not press Next through it. Runs last: it changes the quote.
+    // probe must fail with its facts, not press Next through it. The other quote is probed all the
+    // same; the app serialises each browser copy twice there, which must fail every click that changes
+    // the quote, however small it is. Runs last: it changes the quote.
     const changed = seed.parsed.seed.excel_only_session_id;
     await changeShowNameWithoutNext(front.origin, changed);
     await fs.writeFile(manifestFile, JSON.stringify({
       ...committed,
       approval: { approved: true, approved_at: "2026-11-20", record: "0000000" },
       newest_own_quotes: 0,
-      cases: [{ id: changed, reasons: ["generated"] }],
+      cases: [{ id: changed, reasons: ["generated"] }, { id: seed.parsed.seed.published_session_id, reasons: ["generated"] }],
     }));
     front.log.length = 0;
+    front.state.secondCopy = true;
     await harnessSessionSecret(harness.origin, true);
     const lockedA = await result("live-readonly", ["--manifest", manifestFile, "--download-files", "--click-budget"], "pass-a-changed-customer", { code: 1 });
     await harnessSessionSecret(harness.origin, false);
+    front.state.secondCopy = false;
     assert.deepEqual(front.log.filter((line) => !/^(GET|HEAD) /.test(line)), ["POST /login"], "the failed probe sent a write to the server");
-    const lockedStep = step(lockedA.parsed, "click budget on quote 1");
-    assert.equal(lockedStep?.status, "fail", JSON.stringify(lockedStep));
+    const failedSteps = lockedA.parsed.steps.filter((entry) => /^click budget on quote [0-9]+$/.test(entry.name));
+    assert.deepEqual(failedSteps.map((entry) => entry.status), ["fail", "fail"], "both quotes are probed and fail");
+    const lockedStep = failedSteps.find((entry) => entry.detail?.id === changed);
+    assert.ok(lockedStep, JSON.stringify(failedSteps));
     assert.match(lockedStep.error, /locked beyond what the copy's own session key causes/);
     assert.match(lockedStep.error, /"differs":\["customer\.project\.show_name","recoveryScope"\]/);
+    assert.match(lockedStep.error, /"reference_pending":false/);
     assert.match(lockedStep.error, /"copy_only":false/);
-    assert.ok(!lockedStep.error.includes("Changed by the test"), "the failure holds the changed value");
+    assert.ok(!JSON.stringify(lockedStep).includes("Changed by the test"), "the failure holds the changed value");
+    // A failed step keeps its facts: the lock's, and for the other quote its sizes, samples and every failure, uncut.
+    assert.deepEqual(lockedStep.detail.basis_lock, { ...copyLock, differs: ["customer.project.show_name", "recoveryScope"], copy_only: false, unlocked_by: null, next_saves: 0 });
+    assert.deepEqual(lockedA.parsed.steps.find((entry) => entry.detail?.id === changed && /reopens/.test(entry.name)).detail.basis_lock.copy_only, false);
+    const doubled = failedSteps.find((entry) => entry !== lockedStep);
+    assert.equal(doubled.detail.id, seed.parsed.seed.published_session_id);
+    assert.equal(doubled.detail.basis_lock.unlocked_by, "customer_next");
+    assert.ok(doubled.detail.quote_bytes > 0 && doubled.detail.budget.serialisedBytesPerClick > 0 && doubled.detail.samples.length >= 4, JSON.stringify(doubled.detail));
+    const changing = [...doubled.detail.samples, doubled.detail.burst].filter((sample) => sample?.clicks_that_changed > 0);
+    assert.ok(changing.length >= 2, JSON.stringify(doubled.detail.samples));
+    assert.deepEqual(doubled.detail.failures.map((line) => line.replace(/: .*$/, "")), changing.map((sample) => `${sample.group}:${sample.action} serialised too much data`), JSON.stringify(doubled.detail));
+    assert.ok(doubled.detail.failures.every((line) => /"serialised":[0-9]+,"allowed":[0-9]+/.test(line)), JSON.stringify(doubled.detail.failures));
+    assert.ok(Number.isInteger(doubled.detail.stubbed_saves), JSON.stringify(doubled.detail));
     const exit = await harness.stop();
     stopped = true;
     assert.equal(exit.code, storage === "database" ? 0 : null, `harness did not stop cleanly: ${harness.stderr()}`);

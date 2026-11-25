@@ -16,6 +16,7 @@ import { assertNoWriteAttempted, basisPageChecks, browserGuard, compareWithPassA
 // this file still loads where those exports do not exist.
 import * as liveCases from "../scripts/lib/live-cases.mjs";
 import * as rehearsalCheck from "../scripts/rehearsal-check.mjs";
+import * as clickProbe from "../scripts/lib/basis-click-probe.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const script = path.join(root, "scripts", "rehearsal-check.mjs");
@@ -563,6 +564,124 @@ test("the page checks catch a block without its own tick and X, an empty booth b
     assert.deepEqual(await basisPageChecks(page), { blocks: 2, bad_blocks: 2, booth_boxes: 1, empty_booth_boxes: 1, blank_quantity_lines: 2, missing_quantity_boxes: 1 });
     await page.setContent("<main></main>");
     assert.deepEqual(await basisPageChecks(page), { blocks: 0, bad_blocks: 0, booth_boxes: 0, empty_booth_boxes: 0, blank_quantity_lines: 0, missing_quantity_boxes: 0 });
+  } finally {
+    await browser.close();
+  }
+});
+
+// The two largest real quotes' sizes and clicks on the copy of live (#390 hold 8): character counts only.
+const holdEight = [
+  { sizes: { quote_bytes: 145344, browser_copy_bytes: 305149, restored_key_bytes: 157538, sections_bytes: 26872, basis_bytes: 7860, view_bytes: 668 }, clicks: [350222, 350686, 351609, 352076, 352073], idle: 27336, burst: [4, 1, 1431126] },
+  { sizes: { quote_bytes: 209210, browser_copy_bytes: 440527, restored_key_bytes: 229332, sections_bytes: 29071, basis_bytes: 8248, view_bytes: 668 }, clicks: [486763], idle: 29071, burst: [5, 0, 2435538] },
+];
+function judged(sample, saves, budget) {
+  const failures = [];
+  const changing = sample.changingClicks ?? 1;
+  const clicks = sample.clicks ?? 1;
+  clickProbe.judgeClickCounts({
+    group: "Review", action: "click", clicks, expectedClicks: clicks, changingClicks: changing, idleClicks: clicks - changing, ignoredClicks: 0,
+    clickQuoteLocalStorageWrites: changing, quoteLocalStorageWrites: changing + saves, writers: [], indexedDbPuts: 0, basisRenders: 0, matchesFullRender: true,
+    rebuiltRows: 0, keptRows: 40, serialisedBytes: 0, encodedBytes: 0, ...sample,
+  }, Array.from({ length: saves }, () => ({ files: 0 })), budget, (ok, message) => { if (!ok) failures.push(message.replace("Review:click ", "")); });
+  return failures;
+}
+
+test("the click budget follows the browser copy a click writes, and fails on a second copy of the quote", () => {
+  const tooMuch = ["serialised too much data"];
+  for (const { sizes, clicks, idle, burst } of holdEight) {
+    const budget = clickProbe.quoteClickBudget(sizes);
+    for (const serialisedBytes of clicks) {
+      // The old budget followed the draft state, which is half of what one click writes on a reopened quote.
+      assert.ok(serialisedBytes > Math.max(256 * 1024, Math.ceil(1.25 * sizes.quote_bytes)));
+      assert.deepEqual(judged({ serialisedBytes }, 0, budget), [], "one copy of the quote");
+      assert.deepEqual(judged({ serialisedBytes: serialisedBytes + sizes.browser_copy_bytes }, 0, budget), tooMuch, "a second browser copy");
+      assert.deepEqual(judged({ serialisedBytes: serialisedBytes + sizes.quote_bytes }, 0, budget), tooMuch, "a second draft copy");
+    }
+    // A click with nothing to change writes nothing; it may not copy the quote either.
+    assert.deepEqual(judged({ changingClicks: 0, serialisedBytes: idle }, 0, budget), []);
+    assert.deepEqual(judged({ changingClicks: 0, serialisedBytes: idle + sizes.browser_copy_bytes }, 0, budget), tooMuch);
+    // A burst: one copy for each click that changed something, however many clicks there were.
+    const [changing, idleClicks, serialisedBytes] = burst;
+    const fast = { clicks: changing + idleClicks, changingClicks: changing };
+    assert.deepEqual(judged({ ...fast, serialisedBytes }, 0, budget), []);
+    assert.deepEqual(judged({ ...fast, serialisedBytes: serialisedBytes + sizes.quote_bytes }, 0, budget), tooMuch);
+    // A save copies, compares and posts the draft and writes the browser copy once.
+    const save = clicks[0] + 6 * sizes.quote_bytes + sizes.browser_copy_bytes + 4 * sizes.basis_bytes;
+    assert.deepEqual(judged({ serialisedBytes: save }, 1, budget), []);
+    assert.deepEqual(judged({ serialisedBytes: save + sizes.quote_bytes }, 1, budget), tooMuch, "a seventh draft copy in a save");
+    // More saves than a burst may make never raise the budget.
+    assert.deepEqual(judged({ serialisedBytes: save + (save - clicks[0]) }, 2, budget), [...tooMuch, "saved the quote more than once"]);
+  }
+});
+
+test("a click that changed nothing must have had nothing to change, and a change must be written", () => {
+  const budget = clickProbe.quoteClickBudget(holdEight[0].sizes);
+  const idle = { changingClicks: 0, serialisedBytes: 1 };
+  assert.deepEqual(judged(idle, 0, budget), []);
+  assert.deepEqual(judged({ ...idle, idleClicks: 0, ignoredClicks: 1 }, 0, budget), ["changed nothing although a line it acts on was not in that state yet"]);
+  assert.deepEqual(judged({ ...idle, clickQuoteLocalStorageWrites: 1, quoteLocalStorageWrites: 1 }, 0, budget), ["wrote the quote to browser storage more than once per click that changed it"]);
+  assert.deepEqual(judged({ clickQuoteLocalStorageWrites: 0, quoteLocalStorageWrites: 0 }, 0, budget), ["changed the quote without writing it to browser storage"]);
+  assert.deepEqual(judged({ clickQuoteLocalStorageWrites: 2, quoteLocalStorageWrites: 2 }, 0, budget), ["wrote the quote to browser storage more than once per click that changed it", "wrote the quote to browser storage outside the click and its save"]);
+});
+
+test("the browser copy the budgets follow holds the quote once and its restore key once", () => {
+  const copyFailures = (sizes) => {
+    const failures = [];
+    clickProbe.judgeBrowserCopy(sizes, (ok, message) => { if (!ok) failures.push(message); });
+    return failures;
+  };
+  for (const { sizes } of holdEight) {
+    assert.deepEqual(copyFailures(sizes), []);
+    assert.deepEqual(copyFailures({ ...sizes, browser_copy_bytes: sizes.browser_copy_bytes + sizes.quote_bytes }), ["the browser copy holds the quote more than once beside its restore key"]);
+    assert.deepEqual(copyFailures({ ...sizes, browser_copy_bytes: sizes.browser_copy_bytes + sizes.restored_key_bytes, restored_key_bytes: 2 * sizes.restored_key_bytes }), ["the browser copy's restore key is larger than one copy of the quote"]);
+  }
+});
+
+// The lock facts on a page with the app's own names (webapp/static/app.js) and its strict compare.
+test("the Quote Basis lock facts name every checkpoint difference and why the current checkpoint is unavailable", async () => {
+  const { chromium } = await import("playwright");
+  const source = await fs.readFile(path.join(root, "webapp", "static", "app.js"), "utf8");
+  const cut = (from) => source.slice(source.indexOf(from), source.indexOf("\n}\n", source.indexOf(from)) + 3);
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    const digest = `sha256:${"a".repeat(64)}`;
+    const facts = async (saved, current, reference = { digest_sha256: digest }) => {
+      await page.setContent(`<button id="quoteBasisButton" class="is-locked"></button><script>
+        window.isPlainObject = (value) => Boolean(value) && typeof value === "object" && !Array.isArray(value);
+        ${cut("function quoteCommercialStrictDataEqual(")}
+        window.state = { quoteSessionId: "quote-1", customerStepCheckpoint: ${saved}, customerStepCheckpointSaveBusy: false };
+        window.PRICING_REFERENCE_DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
+        window.customerStepCheckpointWithAddedFieldDefaults = (value) => value;
+        window.customerStepCheckpointForCurrent = () => (${current});
+        window.safeQuoteSessionId = (value) => value;
+        window.currentBrowserRecoveryScope = () => "scope";
+        window.currentPricingReference = () => (${JSON.stringify(reference)});
+        window.customerDetailsBlockReason = () => "";
+        window.quoteCommercialReviewRequired = () => false;
+        window.pendingPricingReferenceSelectionChanged = () => false;
+        window.sidePanelBlockReason = () => "Click Next in Customer to save this step before continuing.";
+      </script>`);
+      return rehearsalCheck.basisLockFacts(page);
+    };
+    const saved = '{ recoveryScope: "a", customer: { project: { title: "t" } } }';
+    const copyOnly = await facts(saved, '{ recoveryScope: "b", customer: { project: { title: "t" } } }');
+    assert.deepEqual([copyOnly.differs, copyOnly.copy_only], [["recoveryScope"], true]);
+    // A field only the current checkpoint has locks the quote in the app even when its value is
+    // undefined, at any level, so it is never the copy's own secret alone.
+    for (const [current, field] of [
+      ['{ recoveryScope: "b", customer: { project: { title: "t", added: undefined } } }', "customer.project.added"],
+      ['{ recoveryScope: "b", added: undefined, customer: { project: { title: "t" } } }', "added"],
+    ]) {
+      const extra = await facts(saved, current);
+      assert.deepEqual([extra.differs.includes(field), extra.copy_only], [true, false], `${field}: ${extra.differs}`);
+    }
+    // No current checkpoint because the reference's digest is malformed: the facts say so.
+    const malformed = await facts(saved, "null", { digest_sha256: "sha256:bad" });
+    assert.deepEqual([malformed.current_unavailable, malformed.copy_only], [["reference_digest"], false]);
+    assert.deepEqual((await facts(saved, "null", null)).current_unavailable, ["pricing_reference"]);
+    // Every fact's name survives scrub, so a failure message names it.
+    for (const name of Object.keys(copyOnly)) assert.ok(rehearsalCheck.scrub(`facts {"${name}":true}`).includes(`"${name}"`), name);
   } finally {
     await browser.close();
   }
