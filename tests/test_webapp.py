@@ -27911,6 +27911,7 @@ eval(extractFunction("validPricingLedgerReceipt"));
 eval(extractFunction("unchangedDraftLedgerMatches"));
 eval(extractFunction("isPlainObject"));
 eval(extractFunction("normalizeStandardServiceDecisions"));
+for (const name of ["recordSavedExclusions", "pendingReinclusionTagged", "restorePendingReinclusions"]) eval(extractFunction(name));
 eval(extractFunction("applyQuoteSessionSnapshot", true));
 
 const savedBasis = { currency: "SGD", source: "local", id: "saved-reference", digest: savedDigest };
@@ -28205,6 +28206,7 @@ eval([
   "validQuoteDraftVersion",
   "validPricingLedgerReceipt", "unchangedDraftLedgerMatches",
   "isPlainObject", "normalizeStandardServiceDecisions",
+  "recordSavedExclusions", "pendingReinclusionTagged", "restorePendingReinclusions",
   "applyQuoteSessionSnapshot",
   "applyPendingPricingReferenceSelection",
 ].map((name) => extractFunction(name)).join("\n"));
@@ -28458,6 +28460,7 @@ eval([
   "validQuoteDraftVersion",
   "validPricingLedgerReceipt", "unchangedDraftLedgerMatches",
   "isPlainObject", "normalizeStandardServiceDecisions",
+  "recordSavedExclusions", "pendingReinclusionTagged", "restorePendingReinclusions",
   "applyQuoteSessionSnapshot",
   "mergeDashboardDraftSummaryDetails",
 ].map((name) => extractFunction(name)).join("\n"));
@@ -28744,9 +28747,9 @@ assert.ok(!saveBody.includes("persistLastPricingReferenceSelection(savedReferenc
 
     def test_static_quote_commercial_payload_and_draft_paths_use_quote_controls(self):
         js = (ROOT / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
-        build_payload_body = js.split("function buildPayload(options = {})", 1)[1].split("function buildLineItemNormalizePayload()", 1)[0]
+        build_payload_body = js.split("function buildPayload(options = {})", 1)[1].split("function buildLineItemNormalizePayload(", 1)[0]
         snapshot_body = js.split("function buildSessionSnapshot()", 1)[1].split("function clearSessionState()", 1)[0]
-        draft_state_body = js.split("function currentQuoteSessionDraftState()", 1)[1].split("function quoteSessionDraftComparisonKey", 1)[0]
+        draft_state_body = js.split("function currentQuoteSessionDraftState(", 1)[1].split("function quoteSessionDraftComparisonKey", 1)[0]
         restore_body = js.split("async function applyQuoteSessionSnapshot", 1)[1].split("function quoteOutputProgressForNavigation", 1)[0]
         current_session_body = js.split("function currentQuoteSessionPayload(options = {})", 1)[1].split("async function saveCurrentQuoteSession", 1)[0]
 
@@ -29041,6 +29044,8 @@ const updateDownloadButton = () => {};
 const restoredWorkflowStage = saved => saved.workflowStage || "basis";
 const restoredQuoteSessionSidePanel = () => "basis";
 const dashboardRestoreError = message => messages.push(message);
+const notSavedDialogs = [];
+const showQuoteNotSavedModal = message => notSavedDialogs.push(message);
 const clearDashboardOperation = () => { state.dashboardOperation = null; };
 const renderQuoteDashboard = () => {};
 const scrollDashboardSessionIntoView = () => {};
@@ -29051,6 +29056,7 @@ const required = ["isPlainObject", "objectHasExactKeys", "safeQuoteSessionId", "
   "refreshSessionToken", "postJson", "logClientEvent", "ensureClientQuoteSessionId", "mergeDashboardQuoteSession",
   "quoteAiSpendText", "renderQuoteAiSpend", "refreshQuoteAiSpend",
   "currentQuoteSessionPayload", "currentQuoteSessionDraftState", "quoteSessionDraftComparisonKey",
+  "recordSavedExclusions", "pendingReinclusionTagged", "pendingReinclusionDraftBasis", "restorePendingReinclusions",
   "quoteSessionDraftFileComparisonKey", "rememberConfirmedQuoteSessionDraft", "quoteSessionDraftFilesAreConfirmed",
   "quoteSessionDraftIsConfirmed", "currentQuoteSessionIsRestoredFromDashboard", "quoteSessionDraftStateCanSave",
   "clearQuoteSessionDraftSaveTimer", "saveCurrentQuoteSession", "saveQuoteSessionDraftState", "ensureQuoteSession",
@@ -31428,6 +31434,9 @@ eval([
             "catalogBackedPossibleMatchText",
   "applyPossiblePricingMatch",
   "reincludedCatalogueSelectionKey",
+  "withoutReincludedSelection",
+  "recordSavedExclusions",
+  "basisLineIsSavedExcluded",
   "rememberReincludedCatalogueSelection",
   "pendingPricingSelections",
   "retagBasisLine",
@@ -31893,27 +31902,37 @@ for (const tick of [
   () => retagBasisLine("objects", 0, "Include"),
   () => retagBasisSectionConfirmLines("objects", "Include"),
 ]) {
-  resetUnmatched();
-  state.quoteSessionId = "quote-synthetic";
-  state.pricingLedgerRevisions = { "quote-synthetic": { [catalogLine.id]: 3 } };
-  state.workflowStage = "completed";
-  state.quoteBasisSections = [sectionWith({ ...catalogLine, tag: "Exclude" })];
-  state.originalAnalysisSnapshot.quote_basis_sections = [sectionWith(catalogLine)];
-  state.originalAnalysisSnapshot.line_items = [catalogRow];
-  state.originalOutputRows = [];
-  state.lineItems = [];
-  assert.equal(basisPricingGroup(state.quoteBasisSections[0].lines[0], state.quoteBasisSections[0]), "Matched");
-  tick();
-  assert.deepStrictEqual(pendingPricingSelections(), [{ source_basis_line_id: catalogLine.id,
-    catalog_item_id: catalogLine.pricing_keyword, expected_revision: 3, reinclude: true }]);
-  assert.equal(queuedDraftSaves, 0);
+  // The mark follows the saved quote: only a line the server holds as excluded has lost its price.
+  for (const savedExcluded of [false, true]) {
+    resetUnmatched();
+    queuedDraftSaves = 0;
+    state.quoteSessionId = "quote-synthetic";
+    state.pricingLedgerRevisions = { "quote-synthetic": { [catalogLine.id]: 3 } };
+    state.quoteBasisSections = [sectionWith({ ...catalogLine, tag: "Exclude" })];
+    state.originalAnalysisSnapshot.quote_basis_sections = [sectionWith(catalogLine)];
+    state.originalAnalysisSnapshot.line_items = [catalogRow];
+    state.originalOutputRows = [];
+    state.lineItems = [];
+    recordSavedExclusions("quote-other", state.quoteBasisSections);
+    if (savedExcluded) recordSavedExclusions("quote-synthetic", state.quoteBasisSections);
+    assert.equal(basisPricingGroup(state.quoteBasisSections[0].lines[0], state.quoteBasisSections[0]), "Matched");
+    tick();
+    assert.deepStrictEqual(pendingPricingSelections(), savedExcluded ? [{ source_basis_line_id: catalogLine.id,
+      catalog_item_id: catalogLine.pricing_keyword, expected_revision: 3, reinclude: true }] : []);
+    assert.equal(queuedDraftSaves, savedExcluded ? 1 : 0, "the tick is saved with the quote");
+    retagBasisLine("objects", 0, "Exclude");
+    assert.ok(!state.lineItems.some((row) => row.reincluded_catalog_selection), "X kept the selection");
+    assert.equal(queuedDraftSaves, savedExcluded ? 2 : 0, "the X is saved over the saved tick");
+  }
 }
 assert.ok(rendered >= 3);
 assert.ok(synced >= 3);
 """
         script = script.replace("__DEFAULT_DIMENSION_NOTE__", json.dumps(webapp.default_booth_dimension_confirmation_line({})))
+        # On standard input: the script is past the Windows command line limit.
         completed = subprocess.run(
-            [node, "-e", script],
+            [node, "-"],
+            input=script,
             cwd=str(ROOT),
             text=True,
             capture_output=True,
@@ -40781,7 +40800,7 @@ main().catch((error) => {
         js = (ROOT / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
         merge_references_body = js.split("function mergePricingReferences(bundled = [])", 1)[1].split("function sortedPricingReferencesForDisplay", 1)[0]
         render_options_body = js.split("function renderProfileOptions()", 1)[1].split("function canManagePricingReferences()", 1)[0]
-        build_payload_body = js.split("function buildPayload(options = {})", 1)[1].split("function buildLineItemNormalizePayload()", 1)[0]
+        build_payload_body = js.split("function buildPayload(options = {})", 1)[1].split("function buildLineItemNormalizePayload(", 1)[0]
 
         self.assertNotIn('filter((reference) => String(reference?.source || "bundled") === "bundled")', render_options_body)
         self.assertIn('PRICING_REFERENCE_SOURCES.has(source)', merge_references_body)

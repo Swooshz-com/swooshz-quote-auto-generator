@@ -103,6 +103,8 @@ AI should preserve short technical catalog rows, include aliases/remarks useful 
 
 The preview table exposes section, description, unit hint, internal cost, markup multiplier, remarks, aliases, and warning/status. Invalid rows remain visible for correction where possible. Save is disabled until required fields are valid, duplicate IDs are handled, and AI metadata enrichment succeeds.
 
+A row with a description but no usable cost or markup, such as a file that gives only a unit price, is an invalid row: it stays in the table with the missing number empty for the admin to enter. The import never derives a cost or markup from another number. Only a row without a description, or over the row limit, is left out, and the preview names each such row and why.
+
 ## User confirmation before save
 
 Preview generation is not persistence. The company pricing reference is written only after the admin clicks Save Reference.
