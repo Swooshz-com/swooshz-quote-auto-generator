@@ -48,7 +48,8 @@ The programme board lists unblocked assigned or active work first in
 Waiting on and In progress. If an owner test is still owed on an earlier
 pull request, the board lists it after that gate.
 
-Both managed workflows pin Toolkit 3.145.0 (`d667ad5`). When an unfinished task
+Both managed workflows check out Toolkit `main` unless the `TOOLKIT_REF`
+repository variable names another ref. When an unfinished task
 records no pull request or branch and exactly one open pull request from a
 branch of this repository claims it, the sweep records that pull request, its
 branch and head, and moves the task from planned to active. Several claimants,
@@ -298,6 +299,11 @@ or deployment behaviour changes accompany this test.
   - Three browser scripts no test reaches (`playwright-dashboard-auth-recovery`,
     `playwright-forensics-feedback`, `playwright-live-seeded-ai-check`): run by hand,
     not package scripts, and too large to test or retire in passing.
+  - No concurrency group on `ci.yml`: `Validate app` and its browser steps keep
+    `always()`, so GitHub does not cancel that job while it runs. A group would
+    make a new push wait for the old job instead of replacing it. Dropping
+    `always()` for speed alone would loosen the gate: a cancelled run could skip
+    `Validate app`.
   - No concurrency group on the plain-text check: the workflow follows Toolkit's
     template, which has none, and it takes seconds.
   - `continue-on-error` on the sweep's two token steps: Toolkit-managed workflow.
