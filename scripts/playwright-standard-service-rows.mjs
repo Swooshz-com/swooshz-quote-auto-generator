@@ -49,11 +49,30 @@ replaceOnce('  result.basisLines = draftLines.length;', `  result.basisLines = d
       }
     };
     const rowOf = async (id) => (await basisControl(page, id, '[data-basis-tag="Exclude"]')).locator("xpath=ancestor::li[1]");
+    // The badge is the decision (owner, 25 Nov 2026): Confirm with the amber ? while undecided, then
+    // Included in green or Exclude in red. The colour and the mark come from the row's own class.
+    const badges = { Confirm: ["Confirm", "rgb(180, 83, 9)", "?"], Include: ["Included", "rgb(13, 105, 68)", "\u2713"], Exclude: ["Exclude", "rgb(161, 56, 47)", "X"] };
+    const expectBadges = async (tags, label) => {
+      for (const [id, tag] of Object.entries(tags)) {
+        const seen = await (await rowOf(id)).evaluate((row) => {
+          const pill = row.querySelector(".basis-line-pill");
+          return [pill.innerText.trim(), getComputedStyle(pill).color, getComputedStyle(row.querySelector(".basis-line-icon"), "::before").content.replaceAll('"', "").trim()];
+        });
+        assert(seen[0] === badges[tag][0] && seen[1] === badges[tag][1], label + ": wrong badge", { id, tag, seen });
+        badgeSeen[label + ":" + id] = seen;
+      }
+    };
+    const badgeSeen = {};
     const idle = () => page.waitForFunction(() => !appIsBusy() && !state.isPreparingOutput, null, { timeout: 90000 });
 
     // 1. A new quote offers both rows once, unresolved, with the existing tick and X; the suggestions
     // offering the same services are not added again.
     await expectRows("Confirm", "Confirm", "new quote does not offer both standard rows once");
+    await expectBadges({ [PM]: "Confirm", [WASTE]: "Confirm" }, "new quote");
+    // Confirm pressed with undecided rows says what is needed, not that the AI analysis is blocked.
+    await page.locator("#sideNextButton").click({ force: true }); // greyed, but it answers a press with the reason
+    const banner = (await page.locator("#aiFailureBanner").innerText()).replace(/\\s+/g, " ").trim();
+    assert(banner === "Rows need a decision. Resolve all review lines before confirming quotation basis.", "Confirm with undecided rows shows the wrong message", banner);
     for (const id of [PM, WASTE]) {
       const row = await rowOf(id);
       assert(await row.locator("[data-basis-tag='Include']").count() === 1 && await row.locator("[data-basis-tag='Exclude']").count() === 1,
@@ -66,27 +85,35 @@ replaceOnce('  result.basisLines = draftLines.length;', `  result.basisLines = d
       await (await basisControl(page, PM, "[data-basis-tag='Include']")).click();
       await (await basisControl(page, WASTE, '[data-basis-tag="Exclude"]')).click();
       await expectRows("Include", "Exclude", label);
+      await expectBadges({ [PM]: "Include", [WASTE]: "Exclude" }, label);
     };
     await tickAndX("tick or X did not apply");
-    assert(/Included/.test(await (await rowOf(PM)).innerText()), "ticked standard row is not shown as Included", await (await rowOf(PM)).innerText());
     const resetDraft = async (label) => {
       await page.locator("#resetQuoteBasisButton").click();
       await idle();
       await expectRows("Confirm", "Confirm", label);
+      await expectBadges({ [PM]: "Confirm", [WASTE]: "Confirm" }, label);
+    };
+    const reopen = async () => {
+      const id = await page.evaluate(() => state.quoteSessionId);
+      await page.locator("#backToDashboardButton").click();
+      await page.waitForFunction(() => !appIsBusy() && state.activeAppView === "dashboard", null, { timeout: 30000 });
+      await page.locator('[data-quote-session-id="' + id + '"]').first().click();
+      await page.locator('[data-dashboard-panel-action="modify-session"]').click();
+      await page.waitForFunction((id) => !appIsBusy() && state.activeAppView === "quote" && state.quoteSessionId === id, id, { timeout: 30000 });
+      if (!(await page.locator("#quoteBasisPanel").isVisible())) await page.locator('button[data-side-panel="basis"]').click();
+      await page.locator("#quoteBasisPanel").waitFor({ state: "visible", timeout: 30000 });
     };
 
     // 3. The owner's path (INT-SQAG-202611200003): Dashboard, back with Modify, then Reset Draft without
     // Re-Analyse returns both rows to Confirm, as it does every other line.
-    const roundTripId = await page.evaluate(() => state.quoteSessionId);
-    await page.locator("#backToDashboardButton").click();
-    await page.waitForFunction(() => !appIsBusy() && state.activeAppView === "dashboard", null, { timeout: 30000 });
-    await page.locator('[data-quote-session-id="' + roundTripId + '"]').first().click();
-    await page.locator('[data-dashboard-panel-action="modify-session"]').click();
-    await page.waitForFunction((id) => !appIsBusy() && state.activeAppView === "quote" && state.quoteSessionId === id, roundTripId, { timeout: 30000 });
-    if (!(await page.locator("#quoteBasisPanel").isVisible())) await page.locator('button[data-side-panel="basis"]').click();
-    await page.locator("#quoteBasisPanel").waitFor({ state: "visible", timeout: 30000 });
+    await reopen();
     await expectRows("Include", "Exclude", "Modify did not reopen the standard row decisions");
+    await expectBadges({ [PM]: "Include", [WASTE]: "Exclude" }, "reopened decided");
     await resetDraft("Reset Draft after Dashboard and Modify did not return the standard rows to Confirm");
+
+    await reopen();
+    await expectBadges({ [PM]: "Confirm", [WASTE]: "Confirm" }, "reopened undecided");
 
     // 4. The same without leaving the quote; then Re-Analyse keeps both decisions.
     await tickAndX("tick or X did not apply after Reset");
@@ -100,6 +127,8 @@ replaceOnce('  result.basisLines = draftLines.length;', `  result.basisLines = d
     await confirmStart.click();
     await page.waitForFunction(() => state.originalAnalysisSnapshot && state.originalAnalysisSnapshot !== window.__standardRowsSnapshot && !appIsBusy(), null, { timeout: 90000 });
     await expectRows("Include", "Exclude", "Re-Analyse lost the standard row decisions or duplicated a row");
+    await expectBadges({ [PM]: "Include", [WASTE]: "Exclude" }, "Re-Analyse");
+    result.standardServiceBadges = badgeSeen;
     result.standardServiceRows = { newQuote: "PASS", tickAndX: "PASS", dashboardModifyReset: "PASS", reset: "PASS", reAnalyse: "PASS" };
   }`);
 // Reload restores the saved decisions, and the generated workbook carries the ticked row at zero only.

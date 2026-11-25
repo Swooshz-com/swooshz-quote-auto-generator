@@ -33384,7 +33384,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertIn("state.basisConfirmed = false;", confirm_body)
         self.assertIn('refreshed.data?.status === "conflict"', confirm_body)
         self.assertIn("PRICING_SELECTION_STALE_MESSAGE", confirm_body)
-        self.assertIn("showBlockedBasisAction(message);", confirm_body)
+        self.assertIn("showBlockedBasisAction(message, title);", confirm_body)
         self.assertNotIn("Pricing refresh unavailable", confirm_body)
         missing_branch = confirm_body.split("if (missing.length)", 1)[1].split("state.isPreparingOutput", 1)[0]
         confirm_block_branch = confirm_body.split("if (confirmBlockReason)", 1)[1].split("if (state.aiFailed)", 1)[0]

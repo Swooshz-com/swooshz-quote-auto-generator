@@ -1714,13 +1714,13 @@ function showAiFailureBanner(message = GENERIC_FAILURE_MESSAGE) {
   setAiStatusBanner("failure", "AI analysis failed.", detail);
 }
 
-function showAiBlockedBanner(message = "Complete the required details, then retry analysis.") {
+function showAiBlockedBanner(message = "Complete the required details, then retry analysis.", title = "AI analysis blocked.") {
   const detail = String(message || "").replace(/^AI analysis blocked\.?\s*/i, "").trim() || "Complete the required details, then retry analysis.";
-  setAiStatusBanner("failure", "AI analysis blocked.", detail);
+  setAiStatusBanner("failure", title, detail);
 }
 
 function showBlockedAction(message = "Complete the required details, then try again.", options = {}) {
-  showAiBlockedBanner(message);
+  showAiBlockedBanner(message, options.title);
   if (options.details !== false && missingDetailFields().length) setDetailsDrawer(true);
 }
 
@@ -11828,6 +11828,10 @@ function basisSections(sections = state.quoteBasisSections) {
     : [{ id: "draft", title: "Quote Basis", lines: [{ tag: "Confirm", text: "No detail generated yet." }] }];
 }
 
+const UNRESOLVED_BASIS_LINES_MESSAGE = "Resolve all review lines before confirming quotation basis.";
+// Confirm stopped by rows staff still have to settle, not by the AI analysis (owner, 25 Nov 2026).
+const BASIS_ROWS_NEED_DECISION_TITLE = "Rows need a decision.";
+
 function unresolvedConfirmLines(sections = state.quoteBasisSections) {
   return basisSections(sections)
     .flatMap((section) => (section.lines || [])
@@ -11842,7 +11846,7 @@ function basisConfirmBlockReason(sections = state.quoteBasisSections) {
   if ((state.blockingClarificationQuestions || []).some((question) => question.status !== "answered" && !String(question.answer || "").trim())) {
     return "Answer all clarification questions before confirming quotation basis.";
   }
-  if (unresolvedConfirmLines(sections).length) return "Resolve all review lines before confirming quotation basis.";
+  if (unresolvedConfirmLines(sections).length) return UNRESOLVED_BASIS_LINES_MESSAGE;
   // Confirm fills a blank line with its shown rule size; only a line it cannot fill (more than one output row) blocks.
   return basisSections(sections).some((section) => (section.lines || []).some((line) => basisLineNeedsQuantity(line) && !basisLineQuantityFillable(line)))
     ? "Enter a quantity for every line before confirming quotation basis."
@@ -11893,8 +11897,8 @@ function revealBlockedBasisAction() {
   }
 }
 
-function showBlockedBasisAction(message = "Resolve the quotation basis before continuing.") {
-  showBlockedAction(message, { details: false });
+function showBlockedBasisAction(message = "Resolve the quotation basis before continuing.", title = undefined) {
+  showBlockedAction(message, { details: false, title: message === UNRESOLVED_BASIS_LINES_MESSAGE ? BASIS_ROWS_NEED_DECISION_TITLE : title });
   revealBlockedBasisAction();
 }
 
@@ -11945,7 +11949,9 @@ function basisLinePillLabel(line = {}, pricingRow = basisPricingRow(line)) {
   const tag = normalizeBasisTag(line.tag);
   const variant = pricingRow?.pricing_authority?.variant;
   if (tag !== "Exclude" && variant === "manual") return "Manual price";
-  if (tag !== "Exclude" && variant === "included") return "Included";
+  // An undecided standard row asks for a decision (owner, 25 Nov 2026); a tick makes it Included.
+  if (tag !== "Exclude" && variant === "included"
+    && (tag !== "Confirm" || !STANDARD_SERVICE_ROWS.some((row) => row.id === line.id))) return "Included";
   if (isPendingAiProposalLine(line)) return "AI Confirm";
   return basisTagLabel(tag);
 }
@@ -18404,10 +18410,12 @@ async function confirmBasis(options = {}) {
       setResultStatus("Failed", "is-bad");
       const refused = refreshed.data?.selections;
       let message = genericFailureMessage(refreshed.data);
+      let title;
       if (refreshed.data?.quote_session_save_failure !== undefined) {
         message = quoteSessionDraftSynchronizationFailureMessage(refreshed.data.quote_session_save_failure);
       } else if (refreshed.data?.refused_reinclusions?.length) {
         message = refusedReinclusionsMessage(refreshed.data.refused_reinclusions);
+        title = BASIS_ROWS_NEED_DECISION_TITLE;
       } else if (refreshed.data?.reason_code === "pricing_selection_invalid") {
         message = "The pricing selection could not be saved. A quote can contain up to 200 selections, including up to 100 new matches.";
       } else if (refreshed.data?.status === "conflict") {
@@ -18415,7 +18423,7 @@ async function confirmBasis(options = {}) {
           ? "Some prices could not be confirmed. Reopen the saved quote and review those matches before trying again."
           : PRICING_SELECTION_STALE_MESSAGE;
       }
-      showBlockedBasisAction(message);
+      showBlockedBasisAction(message, title);
       return;
     }
     state.basisConfirmed = true;

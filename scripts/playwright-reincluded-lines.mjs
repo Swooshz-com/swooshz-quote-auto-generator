@@ -186,7 +186,7 @@ try {
   const banner = page.locator("#aiFailureBanner");
   assert(await banner.isVisible(), "the refusal is not visible on Quote Basis");
   result.refusal = (await banner.innerText()).replace(/\s+/g, " ").trim();
-  assert(result.refusal.includes("synthetic printed wall graphic") && !result.refusal.includes("hanging banner"), "the refusal does not name its line", result.refusal);
+  assert(result.refusal.startsWith("Rows need a decision.") && result.refusal.includes("synthetic printed wall graphic") && !result.refusal.includes("hanging banner"), "the refusal does not name its line", result.refusal);
   assert((await tagsOf(page))["re-graphic"] === "Include", "the refused line lost its tick");
   await toDashboard(page);
   await run.openDashboardQuote(page, sessionId);
