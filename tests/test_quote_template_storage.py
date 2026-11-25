@@ -197,6 +197,39 @@ class QuoteTemplateStoreContract:
         with mock.patch.dict(os.environ, {s.QUOTE_TEMPLATE_LIMIT_ENV_NAME: "1"}):
             self.assertEqual(theirs.create(definition("Their one"))["name"], "Their one")
 
+    def test_names_and_defaults_stay_in_their_workspace(self):
+        mine, theirs = self.store(), self.store("workspace-other")
+        saved, other = mine.create(definition("Mine")), theirs.create(definition("Theirs"))
+
+        def names(store):
+            return [(item["name"], item["is_default"]) for item in store.names()]
+
+        self.assertEqual((names(mine), names(theirs)), ([("Mine", False)], [("Theirs", False)]))
+        # Making one template the default neither marks nor clears anything in the other workspace.
+        mine.set_default(saved["id"])
+        self.assertEqual((names(mine), names(theirs)), ([("Mine", True)], [("Theirs", False)]))
+        theirs.set_default(other["id"])
+        self.assertEqual((names(mine), names(theirs)), ([("Mine", True)], [("Theirs", True)]))
+        theirs.set_default(s.STANDARD_QUOTE_TEMPLATE_ID)
+        self.assertEqual((names(mine), names(theirs)), ([("Mine", True)], [("Theirs", False)]))
+        # The primary key is workspace and id together, so even the same id in both stays apart.
+        with self.storage().connection() as connection:
+            connection.execute(
+                "insert into sqag_quote_templates (workspace_id, template_id, name, definition_json, fingerprint, "
+                "save_number, is_default, created_at, updated_at) select 'workspace-other', template_id, 'Same id', "
+                "definition_json, fingerprint, 1, 0, created_at, updated_at from sqag_quote_templates "
+                "where workspace_id = ? and template_id = ?", (WORKSPACE, saved["id"]),
+            )
+            connection.commit()
+        before = theirs.list()
+        mine.set_default(s.STANDARD_QUOTE_TEMPLATE_ID)
+        mine.set_default(saved["id"])
+        self.assertEqual(theirs.list(), before)
+        mine.update(saved["id"], definition("Mine v2"), 1)
+        self.assertEqual((mine.get(saved["id"])["name"], theirs.get(saved["id"])["name"]), ("Mine v2", "Same id"))
+        mine.delete(saved["id"], 2)
+        self.assertEqual((names(mine), [name for name, _ in names(theirs)]), ([], [record["name"] for record in before]))
+
 
 class SqliteQuoteTemplateStoreTest(QuoteTemplateStoreContract, unittest.TestCase):
     def setUp(self):
@@ -210,6 +243,14 @@ class SqliteQuoteTemplateStoreTest(QuoteTemplateStoreContract, unittest.TestCase
 
     def storage(self, workspace=WORKSPACE):
         return s.DatabaseSqagStorage(self.url, workspace, "admin", "admin-user")
+
+    # SQLite only: in the PostgreSQL fixture the runtime role holds migration 013's grants, not those on profiles.
+    def test_profile_counts_stay_in_their_workspace(self):
+        mine, theirs = self.store(), self.store("workspace-other")
+        saved = mine.create(definition("Mine"))
+        self.storage("workspace-other")._upsert_payload("sqag_profiles", "profile_id", "synthetic-theirs", {
+            "id": "synthetic-theirs", "quote_template_id": saved["id"]})
+        self.assertEqual((mine.usage("standard"), theirs.usage("standard")), ({}, {saved["id"]: 1}))
 
     def test_before_migration_013_templates_are_off_and_quotes_fall_back(self):
         with self.storage().connection() as connection:

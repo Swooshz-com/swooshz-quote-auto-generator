@@ -21052,6 +21052,12 @@ class QuoteTemplatesSettings {
     const editor = this.editor;
     if (!editor || this.saveBusy) return;
     const name = this.el("qtNameInput").value.trim();
+    if (this.nameTaken(name, editor.id)) {
+      // The list may be out of date: the template with this name may be renamed or deleted by now.
+      this.setSaveBusy(true);
+      await this.loadList();
+      this.setSaveBusy(false);
+    }
     const nameProblem = this.nameProblem(name, editor.id);
     if (nameProblem) {
       this.setNotice(this.el("qtNameError"), nameProblem);
@@ -21065,7 +21071,7 @@ class QuoteTemplatesSettings {
       this.flashNote(`Fix the ${problems.length === 1 ? "item" : `${problems.length} items`} marked in red, then save.`);
       return;
     }
-    if (editor.mode !== "edit" && this.atLimit()) { this.showSaveError(this.limitText()); return; }
+    // Whether there is room is the server's answer: the count read with the list may be out of date.
     this.resetCancel();
     this.setSaveBusy(true);
     this.el("qtSaveError").hidden = true;

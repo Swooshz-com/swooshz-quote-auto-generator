@@ -13247,7 +13247,10 @@ class DatabaseSqagStorage:
         result = copy.deepcopy(profile)
         result["permissions"] = self.profile_policy.capabilities(profile)
         result["revision"] = profile.get("_revision", 0)
-        result["own_layout"] = profile_has_own_layout(profile)
+        # Without artifact storage no layout workbook can be read, so there is nothing to go back to.
+        result["own_layout"] = (
+            profile_has_own_layout(profile) and configured_artifact_storage_mode() in {"database", "object"}
+        )
         result.pop("_access", None)
         result.pop("_revision", None)
         result.pop("_own_layout", None)

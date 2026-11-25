@@ -398,6 +398,48 @@ class DatabaseProfileTemplateTest(unittest.TestCase):
         self.storage.change_profile_quote_template(created["id"], s.OWN_LAYOUT_CHOICE, revision=2)
         self.assertNotIn("quote_template", self.generate_for_real(created["id"])[0])
 
+    def test_the_same_profile_id_in_two_workspaces_stays_apart(self):
+        others = s.DatabaseSqagStorage(self.storage.database_url, "workspace-another", "admin", "another-admin")
+        for storage, label in ((self.storage, "Ours"), (others, "Theirs")):
+            storage.save_profile({**tw.workspace_profile_with_layout("same-profile"), "label": label})
+        for storage, label, choice in ((self.storage, "Ours", "standard"), (others, "Theirs", "default")):
+            before = others._read_payload("sqag_profiles", "profile_id", "same-profile")
+            changed = storage.change_profile_quote_template("same-profile", choice, revision=1)
+            self.assertEqual((changed["label"], changed["quote_template_id"], changed["revision"]), (label, choice, 2))
+            if storage is self.storage:
+                self.assertEqual(others._read_payload("sqag_profiles", "profile_id", "same-profile"), before)
+        self.assertEqual((self.stored("same-profile")["label"], self.stored("same-profile")["quote_template_id"]), ("Ours", "standard"))
+
+    def test_own_layout_is_offered_exactly_where_the_server_takes_it(self):
+        """Database storage without artifact storage keeps no layout workbook, so the way back is neither listed nor taken."""
+        self.storage.save_profile(tw.workspace_profile_with_layout("way-back-profile"))
+        changed = self.storage.change_profile_quote_template("way-back-profile", "standard", revision=1)
+
+        def listed():
+            detail = next(item for item in self.storage.list_company_profiles() if item["id"] == "way-back-profile")
+            summary = next(item for item in self.storage.list_profiles() if item["id"] == "way-back-profile")
+            return (detail["own_layout"], summary["own_layout"])
+
+        self.assertEqual((changed["own_layout"], listed()), (True, (True, True)))
+        for setting in ("", "local"):
+            with self.subTest(setting=setting), mock.patch.dict(os.environ, {"SQAG_ARTIFACT_STORAGE_MODE": setting}):
+                self.assertEqual(listed(), (False, False))
+                with self.assertRaisesRegex(ValueError, "no layout of its own"):
+                    self.storage.change_profile_quote_template("way-back-profile", s.OWN_LAYOUT_CHOICE, revision=2)
+        with mock.patch.dict(os.environ, {"SQAG_ARTIFACT_STORAGE_MODE": "local"}):
+            # A pick or a save made meanwhile keeps the way back for when artifact storage is there again.
+            picked = self.storage.change_profile_quote_template("way-back-profile", "default", revision=2)
+            self.assertIs(picked["own_layout"], False)
+            profile = tw.workspace_profile_with_layout("way-back-profile")
+            for key in ("_pack_assets", "pack", "profile_pack"):
+                profile.pop(key, None)
+            self.assertIs(self.storage.save_profile(profile, operation="update", revision=3)["own_layout"], False)
+        with mock.patch.dict(os.environ, {"SQAG_ARTIFACT_STORAGE_MODE": "object"}):
+            self.assertEqual(listed(), (True, True))
+        self.assertEqual(listed(), (True, True))
+        back = self.storage.change_profile_quote_template("way-back-profile", s.OWN_LAYOUT_CHOICE, revision=4)
+        self.assertEqual((back["own_layout"], "quote_template_id" in back), (True, False))
+
     def test_profiles_with_their_own_workbook_stay_legacy_and_new_ones_follow_the_default(self):
         self.storage.save_profile(tw.workspace_profile_with_layout("legacy-profile"))
         self.assertNotIn("quote_template_id", self.stored("legacy-profile"))

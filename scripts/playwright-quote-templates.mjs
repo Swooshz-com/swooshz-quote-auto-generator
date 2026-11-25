@@ -556,6 +556,22 @@ try {
   await page.keyboard.press("Tab");
   await page.waitForTimeout(300);
   assert.deepEqual(posts, ["standard", "default"]);
+  // A mouse press ends the looking even while a key is still held down, so the pick that follows saves at once.
+  await field.focus();
+  await page.keyboard.down("ArrowDown");
+  assert.deepEqual([await field.inputValue(), posts], ["standard", ["standard", "default"]]);
+  await field.evaluate((node) => node.addEventListener("mousedown", (event) => event.preventDefault(), { once: true })); // keeps the browser's own list closed
+  const place = await field.boundingBox();
+  await page.mouse.click(place.x + place.width / 2, place.y + place.height / 2);
+  await field.selectOption(templateId);
+  await page.locator("#presetStatus").getByText("will use Standard copy for new quotes").waitFor();
+  await settled();
+  await page.keyboard.up("ArrowDown");
+  assert.deepEqual(posts, ["standard", "default", templateId]);
+  await field.selectOption("default");
+  await page.locator("#presetStatus").getByText("will use the workspace default for new quotes").waitFor();
+  await settled();
+  posts.length = 2;
   assert.equal(await field.locator("option[value=own]").count(), 0, "a profile without a layout of its own is not offered one");
 
   step("Company Profile saved before templates existed: one key never changes it, and it can be switched back");
@@ -637,17 +653,60 @@ try {
     "1 company profile uses it. It will switch to the workspace default (Standard). It is the workspace default, so Standard becomes the default. Quotes already made keep their layout.");
   await page.locator("#qtDeleteCancel").click();
 
-  step("the last free place is taken meanwhile: the draft stays");
-  await startChangedCopy(page, "No room");
-  await otherAdmin("POST", API, { definition: { ...definition, name: "Took the place" } });
-  expectedFailures = [409];
-  for (let n = 0; n < 2; n += 1) { // the second time the page already knows there is no room
+  step("the last free place is taken meanwhile: the draft stays, and Save works once a place is free");
+  const answers = []; // the server's answer to each new template the page sends
+  page.on("response", (response) => { if (response.request().method() === "POST" && response.url() === base + API) answers.push(response.status()); });
+  const pressSave = async () => {
+    const before = answers.length;
     await page.locator("#qtSaveButton").click();
+    for (let n = 0; n < 40 && (answers.length === before || await page.evaluate(() => quoteTemplatesSettings.saveBusy)); n += 1) await page.waitForTimeout(50);
+    return answers.slice(before);
+  };
+  await startChangedCopy(page, "No room");
+  const took = (await otherAdmin("POST", API, { definition: { ...definition, name: "Took the place" } })).template;
+  expectedFailures = [409];
+  for (let n = 0; n < 2; n += 1) { // the second time the page's list says there is no room, but the server is still asked
+    assert.deepEqual(await pressSave(), [409], "the server says whether there is room");
     await page.locator("#qtSaveError").getByText("You have 10 saved templates, the most a workspace can keep.").waitFor();
     await listReady(page);
     assert.equal(await page.locator("#qtNameInput").inputValue(), "No room");
+    assert.deepEqual([await focusId(page), (await editorState(page)).editing], ["qtSaveButton", true]);
   }
-  await discard(page);
+  await otherAdmin("DELETE", `${API}/${took.id}?save_number=1`);
+  assert.deepEqual(await pressSave(), [200], "with a place free the same draft is saved");
+  await page.locator("#qtListStatus").getByText('"No room" is ready to pick in Company Profile.').waitFor();
+  assert.equal(await page.locator("#qtCounter").innerText(), "10 of 10 saved");
+
+  step("the last free place is taken under the draft's own name: Save works once that template is deleted");
+  const kept = await page.evaluate(() => quoteTemplatesSettings.savedTemplates().find((template) => template.name === "No room").id);
+  await otherAdmin("DELETE", `${API}/${kept}?save_number=1`);
+  await page.locator("#settingsPricingTab").click();
+  await openTemplates(page);
+  await listReady(page);
+  await startChangedCopy(page, "Same name");
+  const same = (await otherAdmin("POST", API, { definition: { ...definition, name: "Same name" } })).template;
+  assert.deepEqual(await pressSave(), [409]);
+  await listReady(page);
+  assert.deepEqual(await pressSave(), [], "a name that is taken is never sent");
+  assert.equal(await page.locator("#qtNameError").innerText(), "Another template already has this name.");
+  assert.deepEqual([await focusId(page), (await editorState(page)).editing], ["qtNameInput", true]);
+  await otherAdmin("DELETE", `${API}/${same.id}?save_number=1`);
+  // The list is read again first; until that is back nothing can be edited, left or saved a second time.
+  await page.route(`**${API}`, async (route) => {
+    if (route.request().method() === "GET") await new Promise((resolve) => setTimeout(resolve, 500));
+    await route.fallback();
+  });
+  const reading = await page.evaluate(() => {
+    document.querySelector("#qtSaveButton").click();
+    quoteTemplatesSettings.saveEditor();
+    document.querySelector("#qtCancelButton").click();
+    return { inert: document.querySelector("#qtEditorView").inert, saveOff: document.querySelector("#qtSaveButton").disabled, editing: Boolean(quoteTemplatesSettings.editor) };
+  });
+  assert.deepEqual(reading, { inert: true, saveOff: true, editing: true });
+  await page.locator("#qtListStatus").getByText('"Same name" is ready to pick in Company Profile.').waitFor();
+  await page.unroute(`**${API}`);
+  assert.deepEqual(answers.slice(-2), [409, 200], "the name is free again, so the same draft is saved, once");
+  assert.equal(await page.locator("#qtCounter").innerText(), "10 of 10 saved");
   expectedFailures = [];
 
   step("a workspace that may keep no templates: New template is off and the page says so");
