@@ -110,6 +110,10 @@
   --duration-base: 180ms;
   --duration-slow: 280ms;
 
+  /* Quote template page preview: the white of the printed page, and text on a blue or dark fill */
+  --paper: #ffffff;
+  --on-color: #ffffff;
+
   /* Layout */
   --topbar-height: 68px;
   --rail-width: 92px;
@@ -9188,4 +9192,279 @@ body.privacy-page {
   .basis-section-action-spacer {
     display: none;
   }
+}
+
+/* ============================================================
+   SETTINGS: QUOTE TEMPLATES (#167, owner-approved mockup S4 v3)
+   ============================================================ */
+/* The Settings window's sections (Pricing Reference, Quote Templates). The Pricing Reference
+   section keeps the window body's own grid gap, so it looks as it did before sections existed. */
+.settings-section-panel { display: grid; gap: 14px; grid-auto-rows: max-content; align-content: start; min-width: 0; }
+/* The same Settings window widens to the dashboard content width only while a template is open. */
+.pricing-reference-settings-panel { transition: width var(--duration-slow) var(--ease-out); }
+.pricing-reference-settings-panel.is-wide { width: var(--dashboard-content-width); }
+/* Owner-approved (INT-SQAG-202611220004): the Settings close X and the section and Manage/Import
+   tabs get the same teal focus outline as the new controls. */
+#pricingReferenceCloseButton:focus-visible, .pricing-reference-settings-tab:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
+
+/* ---------- Quote templates: shared ---------- */
+.qt-scope p { margin: 0; }
+.qt-scope h4 { margin: 0; color: var(--ink); font-size: 18px; font-weight: 850; }
+.qt-scope h5 { margin: 0; color: var(--ink); font-size: 18px; font-weight: 850; }
+.qt-scope h6 { margin: 0; color: var(--ink); font-size: 16px; font-weight: 700; }
+/* Standard action group: 40 px, min 96 px wide, 14 px, 8 px gap. The editor footer keeps the window's own 44 px buttons. */
+.qt-view .primary-button, .qt-view .secondary-button, .qt-editor .primary-button, .qt-editor .secondary-button { gap: 8px; min-width: 96px; min-height: 40px; padding: 0 16px; font-size: 14px; }
+.qt-scope .secondary-button.qt-icon-btn { width: 32px; min-width: 32px; min-height: 32px; padding: 0; }
+.qt-scope .secondary-button.qt-btn-quiet { border-color: transparent; background: transparent; box-shadow: none; color: var(--ink-secondary); }
+.qt-scope .secondary-button.qt-btn-quiet:hover:not(:disabled):not([aria-disabled="true"]) { border-color: transparent; background: var(--line-subtle); box-shadow: none; color: var(--ink); transform: none; }
+.qt-scope button:focus-visible, .qt-scope a:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
+.qt-scope button:disabled { opacity: 0.55; cursor: not-allowed; }
+/* Compact controls (dense panels): 36 px, 14 px. Focus is the app's blue border and glow. */
+.qt-scope input:not([type="checkbox"]):not([type="color"]), .qt-scope select { min-height: 36px; padding: 0 8px; font-size: 14px; }
+.qt-scope input, .qt-scope select { min-width: 0; }
+.qt-ico { display: inline-grid; flex: none; place-items: center; }
+.qt-ico svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.qt-field { display: grid; gap: 8px; min-width: 0; color: var(--ink-secondary); font-size: 12px; font-weight: 800; }
+.qt-help { color: var(--muted); font-size: 13px; font-weight: 400; line-height: 1.45; }
+.qt-field-error { color: var(--red); font-size: 13px; font-weight: 700; line-height: 1.45; }
+
+/* Banners (like .ai-failure-banner): soft fill, 5 px left border, bold lead-in, then what to do. */
+.qt-banner { display: block; padding: 12px 16px; border: 1px solid var(--red-border); border-left: 5px solid var(--red); border-radius: var(--radius-md); background: var(--red-soft); color: var(--red); font-size: 14px; line-height: 1.45; }
+.qt-banner strong { margin-right: 8px; font-weight: 900; }
+.qt-banner span { font-weight: 700; }
+.qt-banner.is-warning { border-color: var(--amber-border); border-left-color: var(--amber); background: var(--amber-soft); color: var(--amber); }
+.qt-banner.is-done { border-color: var(--line); border-left-color: var(--green); background: var(--green-soft); color: var(--green-dark); }
+.qt-banner-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+
+/* ---------- List ---------- */
+.qt-view { display: grid; gap: 12px; }
+.qt-list-head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 12px 16px; }
+.qt-list-title { display: grid; flex: 1 1 240px; gap: 4px; }
+.qt-list-tools { display: flex; align-items: center; gap: 16px; }
+.qt-meter { display: inline-flex; align-items: center; gap: 8px; color: var(--ink-secondary); font-size: 12px; font-weight: 800; white-space: nowrap; }
+.qt-meter-bar { position: relative; width: 56px; height: 6px; overflow: hidden; border-radius: var(--radius-pill); background: var(--line-subtle); }
+.qt-meter-bar > span { position: absolute; top: 0; bottom: 0; left: 0; border-radius: inherit; background: var(--green); }
+.qt-meter.is-full { color: var(--amber); }
+.qt-meter.is-full .qt-meter-bar > span { background: var(--amber); }
+/* Rows are white cards like .basis-review-item. */
+.qt-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.qt-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px 16px; padding: 12px 12px 12px 16px; border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--surface-elevated); transition: border-color var(--duration-fast) var(--ease-out), background-color var(--duration-fast) var(--ease-out); }
+.qt-row:hover { border-color: var(--line-strong); background: var(--surface-overlay); }
+.qt-row-info { display: grid; gap: 4px; min-width: 0; }
+.qt-row-title { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-width: 0; color: var(--ink); font-size: 15px; }
+.qt-row-title strong { overflow: hidden; font-weight: 800; text-overflow: ellipsis; white-space: nowrap; }
+.qt-row-meta { color: var(--muted); font-size: 13px; line-height: 1.45; }
+.qt-badge { display: inline-flex; align-items: center; min-height: 24px; padding: 0 8px; border-radius: var(--radius-pill); background: var(--green-soft); color: var(--green); font-size: 12px; font-weight: 800; white-space: nowrap; }
+.qt-badge.is-quiet { background: var(--line-subtle); color: var(--ink-secondary); }
+.qt-row-actions { display: flex; align-items: center; gap: 8px; }
+.qt-more { position: relative; }
+.qt-scope .qt-row-menu { top: calc(100% + 4px); right: 0; width: 240px; min-width: 0; padding: 8px 0; }
+.qt-scope .qt-row-menu .company-preset-menu-item { min-height: 40px; padding: 0 16px; font-size: 14px; }
+.qt-scope .qt-row-menu .company-preset-menu-item.danger-button { margin-top: 8px; }
+.qt-thumb { flex: none; width: 36px; height: 50px; padding: 4px; border: 1px solid var(--line); background: var(--paper); box-shadow: var(--shadow-xs); }
+.qt-thumb-inner { position: relative; width: 100%; height: 100%; }
+.qt-thumb-b { position: absolute; }
+.qt-thumb-text { background: repeating-linear-gradient(180deg, var(--line-strong) 0 1px, transparent 1px 3px); }
+.qt-thumb-logo { background: var(--muted-light); }
+.qt-thumb-table { border-top: 2px solid var(--qt-c, var(--ink)); background: repeating-linear-gradient(180deg, var(--line) 0 1px, transparent 1px 3px); }
+/* Empty and loading states. */
+.qt-empty { padding: 16px; border: 1px dashed var(--line-strong); border-radius: var(--radius-md); background: var(--blue-soft); color: var(--ink-secondary); font-size: 14px; line-height: 1.45; }
+.qt-empty strong { color: var(--ink); }
+.qt-loading { display: flex; align-items: center; gap: 12px; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--surface-elevated); color: var(--ink-secondary); font-size: 14px; font-weight: 700; }
+
+/* ---------- Editor ---------- */
+.qt-editor { display: grid; gap: 12px; }
+.qt-editor-top { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px 16px; }
+.qt-editor-title { display: grid; flex: 1 1 240px; gap: 4px; min-width: 0; }
+.qt-editor .secondary-button.qt-back { justify-self: start; min-width: 0; margin-left: -8px; padding: 0 12px 0 8px; }
+.qt-editor-top h4 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qt-name-field { flex: 0 1 300px; }
+.qt-editor-main { display: grid; grid-template-columns: minmax(0, 1fr) 296px; align-items: start; gap: 16px; }
+.qt-canvas { display: grid; gap: 12px; min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: var(--radius-lg); background: var(--line-subtle); }
+.qt-canvas-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; }
+.qt-canvas-hint { color: var(--ink-secondary); font-size: 13px; font-weight: 600; line-height: 1.45; }
+.qt-hint-narrow { display: none; }
+.qt-zoom-tools { display: flex; align-items: center; gap: 8px; }
+.qt-zoom-tools .secondary-button { white-space: nowrap; }
+.qt-zoom { display: inline-flex; overflow: hidden; border: 1px solid var(--line-strong); border-radius: var(--radius-md); background: var(--paper); }
+.qt-zoom button { min-width: 32px; min-height: 32px; padding: 0 12px; border: 0; background: transparent; color: var(--ink-secondary); font: inherit; font-size: 14px; font-weight: 750; font-variant-numeric: tabular-nums; cursor: pointer; }
+.qt-zoom button:hover { background: var(--bg); }
+.qt-scope .qt-zoom button:focus-visible { outline-offset: -2px; }
+.qt-zoom-value { display: grid; place-items: center; min-width: 56px; border-right: 1px solid var(--line); border-left: 1px solid var(--line); color: var(--ink-secondary); font-size: 13px; font-weight: 750; font-variant-numeric: tabular-nums; }
+.qt-stage { overflow-x: auto; overflow-y: hidden; }
+.qt-paper-wrap { --qt-z: 1; width: max-content; margin: 0 auto; padding-top: calc(4px / var(--qt-z)); }
+
+/* Ruler: one cell per page column, lettered like Excel. Edges are drag handles for the width. Sizes divide by the zoom so they stay screen-constant. */
+.qt-ruler { display: grid; height: calc(32px / var(--qt-z)); margin-bottom: calc(8px / var(--qt-z)); }
+.qt-ruler-slot { position: relative; min-width: 0; }
+.qt-ruler-cell { display: flex; align-items: center; justify-content: center; gap: calc(8px / var(--qt-z)); width: 100%; height: 100%; padding: 0; overflow: hidden; border: calc(1px / var(--qt-z)) solid var(--line-strong); border-right-width: 0; border-radius: 0; background: var(--bg); color: var(--ink-secondary); font: inherit; font-family: Inter, 'Inter Fallback', sans-serif; font-size: calc(12px / var(--qt-z)); font-weight: 800; white-space: nowrap; cursor: pointer; }
+.qt-ruler-slot:first-child .qt-ruler-cell { border-radius: calc(var(--radius-sm) / var(--qt-z)) 0 0 calc(var(--radius-sm) / var(--qt-z)); }
+.qt-ruler-slot:last-child .qt-ruler-cell { border-right-width: calc(1px / var(--qt-z)); border-radius: 0 calc(var(--radius-sm) / var(--qt-z)) calc(var(--radius-sm) / var(--qt-z)) 0; }
+.qt-ruler-width { color: var(--muted); font-weight: 600; font-variant-numeric: tabular-nums; }
+.qt-ruler-cell:hover { background: var(--blue-soft); }
+.qt-scope .qt-ruler-cell:focus-visible { position: relative; z-index: 1; outline: calc(2px / var(--qt-z)) solid var(--green); outline-offset: calc(-2px / var(--qt-z)); }
+.qt-ruler-cell.is-selected { border-color: var(--blue); background: var(--blue); color: var(--on-color); }
+.qt-ruler-cell.is-selected .qt-ruler-width { color: var(--on-color); }
+.qt-ruler-cell.is-hidden { background: repeating-linear-gradient(45deg, var(--line-subtle) 0 3px, var(--line) 3px 6px); color: var(--muted-light); }
+.qt-col-handle { position: absolute; top: 0; right: calc(-6px / var(--qt-z)); z-index: 2; width: calc(12px / var(--qt-z)); height: 100%; cursor: col-resize; touch-action: none; }
+.qt-col-handle::after { position: absolute; top: 18%; bottom: 18%; left: 50%; width: calc(3px / var(--qt-z)); border-radius: var(--radius-pill); background: transparent; content: ""; transform: translateX(-50%); }
+.qt-ruler:hover .qt-col-handle::after { background: var(--line-strong); }
+.qt-col-handle:hover::after, .qt-resizing .qt-col-handle.is-active::after { background: var(--blue); }
+.qt-resizing, .qt-resizing * { cursor: col-resize !important; user-select: none; }
+.qt-dragging, .qt-dragging * { cursor: grabbing !important; user-select: none; }
+
+/* Paper: real A4 proportions, real column widths, real row height, then zoomed. */
+.qt-paper { position: relative; box-sizing: border-box; background: var(--paper); box-shadow: var(--shadow-md); line-height: normal; }
+.qt-grid { position: relative; display: grid; }
+.qt-guides { position: absolute; top: 0; right: 0; bottom: 0; left: 0; display: grid; pointer-events: none; }
+.qt-guide { border-left: 1px dashed var(--line); }
+.qt-guide:last-child { border-right: 1px dashed var(--line); }
+.qt-guide.is-hidden { background: repeating-linear-gradient(45deg, var(--bg) 0 4px, var(--line-subtle) 4px 8px); }
+.qt-guide.is-selected { border-left: 1px solid var(--blue); background: var(--blue-soft); }
+.qt-guide.is-selected + .qt-guide { border-left: 1px solid var(--blue); }
+.qt-header-end { position: absolute; right: 0; left: 0; border-top: calc(1px / var(--qt-z)) dashed var(--line-strong); pointer-events: none; }
+.qt-header-end span { position: absolute; bottom: calc(4px / var(--qt-z)); left: 0; color: var(--muted); font-family: Inter, 'Inter Fallback', sans-serif; font-size: calc(12px / var(--qt-z)); font-weight: 700; white-space: nowrap; }
+
+.qt-block { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; margin: 0; padding: 0 3px; border: 0; border-radius: 0; background: transparent; color: inherit; font: inherit; letter-spacing: normal; text-align: left; text-transform: none; outline: calc(1px / var(--qt-z)) dashed transparent; outline-offset: calc(1px / var(--qt-z)); cursor: pointer; touch-action: none; user-select: none; }
+.qt-block:hover { background: var(--blue-soft); outline-color: var(--line-strong); }
+.qt-scope .qt-block:focus-visible { outline: calc(2px / var(--qt-z)) solid var(--green); outline-offset: calc(1px / var(--qt-z)); }
+.qt-scope .qt-block.is-selected { z-index: 3; background: var(--blue-soft); outline: calc(2px / var(--qt-z)) solid var(--blue); cursor: grab; }
+.qt-scope .qt-block.has-problem { background: var(--red-soft); outline: calc(2px / var(--qt-z)) solid var(--red); }
+.qt-tag { position: absolute; bottom: 100%; left: calc(-2px / var(--qt-z)); z-index: 4; display: none; margin-bottom: calc(4px / var(--qt-z)); padding: calc(2px / var(--qt-z)) calc(8px / var(--qt-z)); border-radius: calc(var(--radius-sm) / var(--qt-z)); background: var(--ink-secondary); color: var(--on-color); font-family: Inter, 'Inter Fallback', sans-serif; font-size: calc(12px / var(--qt-z)); font-weight: 750; line-height: 1.3; white-space: nowrap; pointer-events: none; }
+.qt-block:hover .qt-tag, .qt-block:focus-visible .qt-tag, .qt-block.is-selected .qt-tag, .qt-block.has-problem .qt-tag { display: block; }
+.qt-block.is-selected .qt-tag { background: var(--blue); }
+.qt-block.has-problem .qt-tag { background: var(--red); }
+.qt-handle { position: absolute; top: 50%; right: calc(-7px / var(--qt-z)); z-index: 5; width: calc(12px / var(--qt-z)); height: calc(28px / var(--qt-z)); border: calc(2px / var(--qt-z)) solid var(--blue); border-radius: calc(var(--radius-sm) / var(--qt-z)); background: var(--paper); cursor: ew-resize; transform: translateY(-50%); }
+.qt-block.has-problem .qt-handle { border-color: var(--red); }
+.qt-text { display: flex; flex-direction: column; overflow: hidden; }
+.qt-text > div { height: var(--qt-row); overflow: hidden; line-height: var(--qt-row); text-overflow: ellipsis; white-space: nowrap; }
+.qt-heading { font-weight: 700; }
+.qt-text > .qt-sign { height: calc(var(--qt-row) - 6px); border-bottom: 1px solid currentColor; }
+.qt-total { display: flex; justify-content: space-between; gap: 12px; border-top: 1px solid currentColor; font-weight: 700; }
+.qt-block-logo { overflow: visible; }
+.qt-logo { display: flex; flex: none; align-items: center; justify-content: center; border: 1.5px dashed var(--line-strong); border-radius: var(--radius-sm); background: var(--bg); color: var(--muted); font-family: Inter, 'Inter Fallback', sans-serif; font-size: 13px; font-weight: 700; }
+.qt-block-logo.has-problem .qt-logo { border-color: var(--red); background: var(--red-soft); color: var(--red); }
+.qt-table { display: grid; }
+.qt-cell { height: var(--qt-row); padding: 0 4px; overflow: hidden; line-height: var(--qt-row); text-overflow: ellipsis; white-space: nowrap; }
+.qt-cell.is-head { border-bottom: 1px solid currentColor; font-weight: 700; }
+.qt-cell.is-item { border-bottom: 1px solid var(--line-subtle); }
+
+/* ---------- Side panel ---------- */
+.qt-inspector { position: sticky; top: 0; display: grid; grid-template-columns: minmax(0, 1fr); align-content: start; gap: 16px; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius-lg); background: var(--surface-elevated); box-shadow: var(--shadow-xs); }
+.qt-panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.qt-eyebrow { display: block; margin-bottom: 4px; color: var(--muted); font-size: 12px; font-weight: 850; letter-spacing: 0.03em; text-transform: uppercase; }
+.qt-group { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; padding-top: 16px; border-top: 1px solid var(--line-subtle); }
+.qt-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.qt-inspector > *, .qt-group > *, .qt-pair > * { min-width: 0; }
+.qt-stepper { display: grid; grid-template-columns: 32px minmax(0, 1fr) 32px; height: 36px; overflow: hidden; border: 1px solid var(--line-strong); border-radius: var(--radius-md); background: var(--paper); }
+.qt-stepper:focus-within { border-color: var(--blue); box-shadow: var(--shadow-glow-blue); }
+.qt-scope .qt-stepper input { height: 100%; min-height: 0; padding: 0 4px; border: 0; border-radius: 0; box-shadow: none; text-align: center; font-variant-numeric: tabular-nums; -moz-appearance: textfield; }
+.qt-stepper input::-webkit-inner-spin-button, .qt-stepper input::-webkit-outer-spin-button { margin: 0; -webkit-appearance: none; }
+.qt-step { min-height: 0; padding: 0; border: 0; background: var(--bg); color: var(--ink-secondary); font: inherit; font-size: 16px; font-weight: 700; cursor: pointer; }
+.qt-step:hover:not(:disabled) { background: var(--line-subtle); }
+.qt-scope .qt-step:focus-visible { outline-offset: -2px; }
+.qt-color { display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 8px; }
+.qt-scope input.qt-swatch { width: 36px; height: 36px; min-height: 0; padding: 4px; border: 1px solid var(--line-strong); border-radius: var(--radius-md); background: var(--paper); cursor: pointer; }
+.qt-swatch::-webkit-color-swatch-wrapper { padding: 0; }
+.qt-swatch::-webkit-color-swatch { border: 1px solid var(--line); border-radius: var(--radius-sm); }
+.qt-swatch::-moz-color-swatch { border: 1px solid var(--line); border-radius: var(--radius-sm); }
+.qt-scope input.qt-hex { font-variant-numeric: tabular-nums; text-transform: uppercase; }
+.qt-problems { display: grid; gap: 8px; padding: 12px 16px; border: 1px solid var(--red-border); border-left: 5px solid var(--red); border-radius: var(--radius-md); background: var(--red-soft); }
+.qt-problems strong { color: var(--red); font-size: 14px; font-weight: 900; }
+.qt-problem { display: block; padding: 0; border: 0; background: none; color: var(--red); font: inherit; font-size: 13px; font-weight: 600; line-height: 1.45; text-align: left; text-transform: none; }
+button.qt-problem { cursor: pointer; }
+button.qt-problem:hover { text-decoration: underline; }
+.qt-fit { color: var(--green); font-size: 13px; font-weight: 600; }
+.qt-fit.is-over { color: var(--red); }
+.qt-order { display: flex; gap: 8px; }
+.qt-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.qt-chip { min-height: 32px; padding: 0 12px; border: 1px solid var(--line); border-radius: var(--radius-pill); background: var(--bg); color: var(--ink-secondary); font: inherit; font-size: 13px; font-weight: 700; cursor: pointer; }
+.qt-chip:hover { border-color: var(--line-strong); background: var(--blue-soft); }
+/* Columns table: the app's th style (12 px / 850, uppercase), tighter padding for the side panel. */
+.qt-cols { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 13px; }
+.qt-cols th { padding: 8px 4px; }
+.qt-cols th:first-child { width: 44px; }
+.qt-cols th:last-child { width: 72px; }
+.qt-cols td { padding: 4px; border-top: 1px solid var(--line-subtle); border-bottom: 0; vertical-align: middle; }
+.qt-cols tr.is-selected td { background: var(--blue-soft); }
+.qt-col-letter { width: 32px; height: 32px; min-height: 0; padding: 0; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--bg); color: var(--ink-secondary); font: inherit; font-weight: 800; cursor: pointer; }
+.qt-col-letter:hover { border-color: var(--line-strong); background: var(--blue-soft); }
+.qt-scope .qt-cols input[type="number"] { width: 84px; padding: 0 8px; font-variant-numeric: tabular-nums; }
+.qt-check { display: inline-flex; align-items: center; gap: 8px; color: var(--ink-secondary); font-size: 13px; font-weight: 700; cursor: pointer; }
+.qt-scope .qt-check input { width: 16px; height: 16px; min-height: 0; margin: 0; accent-color: var(--green); }
+.qt-row-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+.qt-subhead { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.qt-muted { color: var(--muted); font-size: 13px; font-weight: 600; }
+.qt-tcols { display: grid; gap: 8px; }
+.qt-tcol { display: grid; gap: 8px; padding: 8px; border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--bg); }
+.qt-tcol-top { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; }
+.qt-tcol-kind { color: var(--muted); font-size: 12px; font-weight: 700; }
+.qt-tcol-bottom { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; align-items: end; gap: 8px; }
+.qt-mini { display: grid; gap: 4px; color: var(--ink-secondary); font-size: 12px; font-weight: 800; }
+.qt-req { padding: 0 4px; color: var(--muted); font-size: 12px; font-weight: 700; }
+.qt-seg { display: inline-flex; height: 36px; overflow: hidden; border: 1px solid var(--line-strong); border-radius: var(--radius-md); background: var(--paper); }
+.qt-seg button { display: grid; place-items: center; width: 36px; min-height: 0; padding: 0; border: 0; background: transparent; color: var(--ink-secondary); cursor: pointer; }
+.qt-seg button + button { border-left: 1px solid var(--line); }
+.qt-seg button[aria-pressed="true"] { background: var(--blue-soft); color: var(--blue); }
+.qt-scope .qt-seg button:focus-visible { outline-offset: -2px; }
+
+/* ---------- Footer (the Settings window's own footer row) ---------- */
+.qt-editor-footer .qt-footer-left { flex-wrap: wrap; gap: 8px; }
+.qt-status { display: inline-flex; align-items: center; gap: 8px; min-height: 40px; margin-right: 8px; padding: 0 12px; border: 1px solid transparent; border-radius: var(--radius-pill); font: inherit; font-size: 13px; font-weight: 800; white-space: nowrap; }
+.qt-status::before { width: 8px; height: 8px; border-radius: 50%; background: currentColor; content: ""; }
+.qt-status.is-ok { background: var(--green-soft); color: var(--green); cursor: default; }
+.qt-status.is-bad { border-color: var(--red-border); background: var(--red-soft); color: var(--red); cursor: pointer; }
+.qt-status.is-bad:hover { text-decoration: underline; }
+.qt-footer-note { color: var(--muted); font-size: 13px; font-weight: 600; }
+.qt-scope .qt-footer-left .secondary-button { gap: 0; }
+.qt-busy { display: inline-block; width: 14px; height: 14px; margin-right: 8px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin 900ms linear infinite; }
+
+/* Delete confirm: the standard eyebrow (12 px / 850 / 0.03em). */
+#qtDeleteModal .basis-chat-eyebrow { font-size: 12px; font-weight: 850; letter-spacing: 0.03em; }
+
+/* ---------- Company Profile dropdown ---------- */
+#quoteTemplateSelect:disabled { background: var(--line-subtle); color: var(--muted-light); cursor: not-allowed; }
+
+/* 880 px: the rail and pane go full width; the side panel moves under the page. */
+@media (max-width: 880px) {
+  .qt-editor-main { grid-template-columns: minmax(0, 1fr); }
+  .qt-inspector { position: static; }
+}
+/* 640 px: every button at least 44 px tall. */
+@media (max-width: 640px) {
+  .qt-hint-wide { display: none; }
+  .qt-hint-narrow { display: inline; }
+  .qt-row { grid-template-columns: auto minmax(0, 1fr); align-items: start; padding: 12px; }
+  .qt-row-actions { grid-column: 2; }
+  .qt-wide-only { display: none; }
+  .qt-list-tools { justify-content: space-between; width: 100%; }
+  .qt-name-field { flex-basis: 100%; }
+  .qt-canvas { padding: 8px; }
+  .qt-zoom-tools { justify-content: space-between; width: 100%; }
+  .qt-view .primary-button, .qt-view .secondary-button, .qt-editor .primary-button, .qt-editor .secondary-button { min-height: 44px; }
+  .qt-scope .secondary-button.qt-icon-btn { width: 44px; min-width: 44px; min-height: 44px; }
+  .qt-scope .qt-row-menu .company-preset-menu-item { min-height: 44px; }
+  .qt-scope input:not([type="checkbox"]):not([type="color"]), .qt-scope select { min-height: 44px; }
+  .qt-zoom button { min-width: 44px; min-height: 44px; }
+  .qt-ruler { height: calc(44px / var(--qt-z)); }
+  .qt-stepper { grid-template-columns: 44px minmax(0, 1fr) 44px; height: 44px; }
+  .qt-color { grid-template-columns: 44px minmax(0, 1fr); }
+  .qt-scope input.qt-swatch { width: 44px; height: 44px; }
+  .qt-chip { min-height: 44px; }
+  .qt-col-letter { width: 44px; height: 44px; }
+  .qt-cols th:first-child { width: 52px; }
+  .qt-seg { height: 44px; }
+  .qt-seg button { width: 44px; }
+  /* The editor footer: status and previews on one row, Cancel and Save on the next. */
+  .modal-actions.qt-editor-footer { gap: 8px; padding: 8px 12px 12px; }
+  .qt-editor-footer .pricing-reference-template-footer { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .qt-editor-footer .qt-footer-left .secondary-button { min-width: 0; min-height: 44px; padding: 0 12px; font-size: 14px; }
+  .qt-status { min-height: 44px; margin-right: 0; }
+  .qt-editor-footer .qt-footer-note { flex-basis: 100%; }
+  .qt-editor-footer .qt-footer-note:empty { display: none; }
+  .qt-editor-footer .pricing-reference-action-buttons { grid-template-columns: 1fr 1fr; gap: 8px; }
+  .qt-editor-footer .pricing-reference-action-buttons button { min-height: 44px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pricing-reference-settings-panel, .qt-row { transition: none; }
 }

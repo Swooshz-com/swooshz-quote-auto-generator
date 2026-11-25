@@ -493,6 +493,11 @@
                           Current Profile
                           <select id="presetSelect"></select>
                         </label>
+                        <label class="compact-control" id="quoteTemplateField">
+                          Quote template
+                          <select id="quoteTemplateSelect"><option value="default">Workspace default</option></select>
+                        </label>
+                        <p class="settings-note" id="quoteTemplateNote">Workspace default: Standard</p>
                       </div>
                       <div class="company-preset-action-panel" aria-label="Profile controls">
                         <input id="importPresetFile" type="file" accept="application/json,.json" hidden>
@@ -953,10 +958,10 @@
         <section class="modal-panel pricing-reference-modal-panel pricing-reference-settings-panel">
           <header class="modal-header">
             <div>
-              <span class="basis-chat-eyebrow">Settings</span>
-              <h3 id="pricingReferenceModalTitle">Pricing Reference Settings</h3>
+              <span class="basis-chat-eyebrow">Workspace</span>
+              <h3 id="pricingReferenceModalTitle">Settings</h3>
             </div>
-            <button class="icon-button" type="button" id="pricingReferenceCloseButton" aria-label="Close pricing reference modal">x</button>
+            <button class="icon-button" type="button" id="pricingReferenceCloseButton" aria-label="Close settings">x</button>
           </header>
           <form class="modal-form" id="pricingReferenceForm">
             <div class="pricing-reference-no-access" id="pricingReferenceNoAccess" hidden>
@@ -964,6 +969,11 @@
               <p>Your current role cannot create, edit, import, delete, or save pricing references.</p>
             </div>
             <div class="pricing-reference-editor-body" id="pricingReferenceEditorBody">
+              <div class="pricing-reference-settings-tabs" role="tablist" aria-label="Settings sections">
+                <button class="pricing-reference-settings-tab is-active" type="button" id="settingsPricingTab" role="tab" aria-selected="true" aria-controls="settingsPricingSection" data-settings-section="pricing">Pricing Reference</button>
+                <button class="pricing-reference-settings-tab" type="button" id="settingsTemplatesTab" role="tab" aria-selected="false" aria-controls="settingsTemplatesSection" data-settings-section="templates">Quote Templates</button>
+              </div>
+              <div class="settings-section-panel" id="settingsPricingSection" role="tabpanel" aria-labelledby="settingsPricingTab">
               <div class="pricing-reference-settings-tabs" role="tablist" aria-label="Pricing reference settings">
                 <button class="pricing-reference-settings-tab is-active" type="button" id="pricingReferenceManageTab" role="tab" aria-selected="true" aria-controls="pricingReferenceManagePanel" data-pricing-reference-settings-mode="manage">Manage</button>
                 <button class="pricing-reference-settings-tab" type="button" id="pricingReferenceImportTab" role="tab" aria-selected="false" aria-controls="pricingReferenceImportPanel" data-pricing-reference-settings-mode="import">Import</button>
@@ -1053,8 +1063,68 @@
                   </div>
                 </div>
               </section>
+              </div>
+            <!-- Quote Templates: admins build the Excel and PDF quote layouts (sqag.quote-template.v1). -->
+            <div class="qt-scope" id="settingsTemplatesSection" role="tabpanel" aria-labelledby="settingsTemplatesTab" hidden>
+              <div class="qt-view" id="qtListView">
+                <div class="qt-list-head">
+                  <div class="qt-list-title">
+                    <h4>Quote templates</h4>
+                    <p class="settings-note">The layout of the Excel and PDF quote. Each company profile picks one.</p>
+                  </div>
+                  <div class="qt-list-tools">
+                    <span class="qt-meter" id="qtMeter"><span class="qt-meter-bar" aria-hidden="true"><span id="qtMeterFill"></span></span><span id="qtCounter"></span></span>
+                    <button class="primary-button" type="button" id="qtNewButton">New template</button>
+                  </div>
+                </div>
+                <p class="qt-banner is-warning" id="qtLimitMessage" role="status" hidden></p>
+                <p class="qt-banner is-done" id="qtListStatus" role="status" hidden></p>
+                <div class="qt-loading" id="qtListLoading" role="status" hidden><span class="pricing-reference-spinner" aria-hidden="true"></span>Loading templates&hellip;</div>
+                <div class="qt-banner qt-banner-row" id="qtListError" role="alert" hidden>
+                  <p><strong>Templates could not be loaded.</strong><span id="qtListErrorText">Check your connection and try again.</span></p>
+                  <button class="secondary-button" type="button" id="qtListRetry">Try again</button>
+                </div>
+                <ul class="qt-list" id="qtList" aria-label="Quote templates" aria-live="polite"></ul>
+                <p class="qt-empty" id="qtEmpty" hidden><strong>No templates of your own yet.</strong> Use New template, or Make a copy on Standard, to start one.</p>
+              </div>
+
+              <div class="qt-editor" id="qtEditorView" hidden>
+                <div class="qt-editor-top">
+                  <div class="qt-editor-title">
+                    <button class="secondary-button qt-btn-quiet qt-back" type="button" id="qtBackButton">
+                      <span class="qt-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"></path></svg></span>
+                      All templates
+                    </button>
+                    <h4 id="qtEditorTitle">New template</h4>
+                  </div>
+                  <div class="qt-field qt-name-field">
+                    <label for="qtNameInput">Template name</label>
+                    <input id="qtNameInput" type="text" maxlength="60" autocomplete="off" placeholder="e.g. Compact" aria-describedby="qtNameError">
+                    <p class="qt-field-error" id="qtNameError" role="alert" hidden></p>
+                  </div>
+                </div>
+                <p class="qt-banner" id="qtSaveError" role="alert" hidden><strong>Template not saved.</strong><span id="qtSaveErrorText">Something went wrong. Your changes are still here; try Save again.</span></p>
+                <div class="qt-editor-main">
+                  <section class="qt-canvas" aria-label="Page preview">
+                    <div class="qt-canvas-bar">
+                      <p class="qt-canvas-hint"><span class="qt-hint-wide">Click a block to edit it. Drag a column edge on the ruler to change its width.</span><span class="qt-hint-narrow">Tap a block or a column letter to edit it.</span><span id="qtPanNote" hidden> Scroll sideways to see the rest of the page.</span></p>
+                      <div class="qt-zoom-tools">
+                        <button class="secondary-button qt-btn-quiet" type="button" id="qtZoomFit">Whole page</button>
+                        <div class="qt-zoom" role="group" aria-label="Zoom">
+                          <button type="button" id="qtZoomOut" aria-label="Zoom out">&minus;</button>
+                          <span class="qt-zoom-value" id="qtZoomValue" aria-live="polite">100%</span>
+                          <button type="button" id="qtZoomIn" aria-label="Zoom in">+</button>
+                        </div>
+                      </div>
+                    </div>
+                    <div class="qt-stage" id="qtStage"><div class="qt-paper-wrap" id="qtPaperWrap"></div></div>
+                  </section>
+                  <aside class="qt-inspector" id="qtSide" aria-label="Settings for the selected item"></aside>
+                </div>
+              </div>
             </div>
-            <div class="modal-actions pricing-reference-modal-actions">
+            </div>
+            <div class="modal-actions pricing-reference-modal-actions" id="settingsPricingFooter">
               <div class="pricing-reference-template-footer" id="pricingReferenceTemplateFooter">
                 <button class="secondary-button pricing-reference-export-button" type="button" id="exportPricingReferenceButton" disabled>Export Selected</button>
                 <a class="secondary-button pricing-template-download" id="pricingReferenceTemplateButton" href="/api/pricing-reference/template.xlsx?template=examples-v3" download>Download Template</a>
@@ -1064,7 +1134,42 @@
                 <button class="primary-button" type="submit" id="pricingReferenceSaveButton" disabled>Save Reference</button>
               </div>
             </div>
+            <!-- Quote template editor footer: the same footer row as Pricing Reference, shown only while a template is open. -->
+            <div class="modal-actions pricing-reference-modal-actions qt-scope qt-editor-footer" id="qtEditorFooter" hidden>
+              <div class="pricing-reference-template-footer qt-footer-left">
+                <button class="qt-status" type="button" id="qtStatus">Ready to save</button>
+                <button class="secondary-button qt-btn-quiet" type="button" id="qtPreviewExcel" aria-label="Preview Excel"><span class="qt-wide-only">Preview&nbsp;</span>Excel</button>
+                <button class="secondary-button qt-btn-quiet" type="button" id="qtPreviewPdf" aria-label="Preview PDF"><span class="qt-wide-only">Preview&nbsp;</span>PDF</button>
+                <span class="qt-footer-note" id="qtFooterNote" role="status"></span>
+              </div>
+              <div class="pricing-reference-action-buttons">
+                <button class="secondary-button" type="button" id="qtCancelButton">Cancel</button>
+                <button class="primary-button" type="button" id="qtSaveButton">Save template</button>
+              </div>
+            </div>
           </form>
+        </section>
+      </div>
+      <div class="modal-overlay profile-delete-modal" id="qtDeleteModal" role="dialog" aria-modal="true" aria-labelledby="qtDeleteTitle" aria-describedby="qtDeleteText" hidden>
+        <div class="modal-backdrop" data-qt-delete-close></div>
+        <section class="modal-panel profile-delete-panel quote-session-delete-panel">
+          <header class="modal-header">
+            <div>
+              <span class="basis-chat-eyebrow">Quote Template</span>
+              <h3 id="qtDeleteTitle">Delete this template?</h3>
+            </div>
+          </header>
+          <div class="profile-delete-body">
+            <div class="profile-delete-warning" id="qtDeleteText">
+              <strong>This cannot be undone.</strong>
+              <span id="qtDeleteDetail"></span>
+            </div>
+            <p class="profile-delete-error" id="qtDeleteError" role="alert" hidden></p>
+          </div>
+          <div class="modal-actions profile-delete-actions">
+            <button class="secondary-button" type="button" id="qtDeleteCancel">Cancel</button>
+            <button class="secondary-button danger-button" type="button" id="qtDeleteConfirm">Delete template</button>
+          </div>
         </section>
       </div>
       <div class="modal-overlay pricing-reference-table-overlay" id="pricingReferenceTableOverlay" role="dialog" aria-modal="true" aria-labelledby="pricingReferenceTableTitle" hidden>

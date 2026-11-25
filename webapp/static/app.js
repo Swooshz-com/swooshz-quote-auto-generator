@@ -256,6 +256,7 @@ const state = {
   selectedPresetValue: "",
   profiles: [],
   companyProfiles: [],
+  quoteTemplateChoices: null,
   workspace: null,
   pricingReferences: [],
   defaultProfileId: DEFAULT_PROFILE_ID,
@@ -5673,6 +5674,7 @@ function updatePresetButtons() {
     elements.profileActionsMenuButton.setAttribute("aria-disabled", String(elements.profileActionsMenuButton.disabled));
     if (busy) closeProfileActionsMenu();
   }
+  quoteTemplatesSettings.renderProfileField({ preset, canManageProfiles: canManage, busy });
 }
 
 function handlePresetSelectChange() {
@@ -8935,6 +8937,7 @@ function openPricingReferenceModal(options = {}) {
   syncPricingReferenceSettingsMode();
   elements.pricingReferenceModal.hidden = false;
   elements.pricingReferenceModal.classList.add("is-open");
+  quoteTemplatesSettings.onSettingsOpened();
   state.restorableOverlay = "pricing_reference_settings";
   saveSessionState();
   const canManage = setPricingReferenceModalAccessState();
@@ -8949,6 +8952,7 @@ function closePricingReferenceModal() {
   if (pricingReferenceOperationBusy()) {
     return;
   }
+  if (!quoteTemplatesSettings.beforeSettingsClose()) return;
   closePricingReferenceTableOverlay();
   stopElapsedTimer("pricingReferenceImportElapsed");
   stopElapsedTimer("pricingReferenceSaveElapsed");
@@ -9056,6 +9060,8 @@ async function editSelectedPricingReference(options = {}) {
 
 async function savePricingReferenceFromModal(event) {
   event.preventDefault();
+  // Enter in a Quote Templates field submits this form too; only Save Reference saves a reference.
+  if (quoteTemplatesSettings.sectionActive()) return;
   if (!canManagePricingReferences()) {
     setPricingReferenceSaveButtonState({
       canSave: false,
@@ -9319,6 +9325,7 @@ async function loadProfiles() {
   state.profiles = hydrated.profiles;
   state.pricingReferenceOrderDigitLimit = data.pricing_reference_order_digit_limit;
   state.companyProfiles = hydrated.companyProfiles;
+  state.quoteTemplateChoices = canReadCompanyProfiles && isPlainObject(data.quote_templates) ? data.quote_templates : null;
   state.workspace = workspace;
   state.defaultProfileId = defaultProfileId;
   state.defaultPricingReferenceId = defaultPricingReferenceId;
@@ -19293,6 +19300,7 @@ function markPageUnloading() {
 function pricingReferenceShouldWarnBeforeUnload() {
   if (!elements.pricingReferenceModal || elements.pricingReferenceModal.hidden) return false;
   if (pricingReferenceOperationBusy()) return true;
+  if (quoteTemplatesSettings.isDirty()) return true;
   if (!state.pendingPricingReference) return false;
   return pricingReferenceHasPendingChanges(state.pendingPricingReference);
 }
@@ -19311,6 +19319,7 @@ function handleBeforeUnload(event) {
 }
 
 function wireEvents() {
+  quoteTemplatesSettings.bind();
   if (elements.topbarLogoutLink) {
     elements.topbarLogoutLink.addEventListener("click", async (event) => {
       event.preventDefault();
@@ -19508,7 +19517,9 @@ function wireEvents() {
       } else if (elements.profileDeleteModal && !elements.profileDeleteModal.hidden) {
         hideProfileDeleteModal();
       } else if (elements.pricingReferenceModal && !elements.pricingReferenceModal.hidden) {
-        if (elements.pricingReferenceDeleteConfirm && !elements.pricingReferenceDeleteConfirm.hidden) {
+        if (quoteTemplatesSettings.handleEscape()) {
+          event.preventDefault();
+        } else if (elements.pricingReferenceDeleteConfirm && !elements.pricingReferenceDeleteConfirm.hidden) {
           hidePricingReferenceDeleteConfirm();
         } else {
           closePricingReferenceModal();
@@ -19962,5 +19973,1996 @@ async function boot() {
   showOlderRecoveryCopyHoldNotice();
   if (newSignIn) saveWorkspaceViewState();
 }
+
+// --- quote template model: start ---
+// Settings > Quote Templates: the editor's copy of the quote template reader rules
+// (scripts/quote_template.py; constant names in brackets), so a problem shows on the page, in words staff
+// use, before Save instead of the server refusing the layout. Pure data and arithmetic, no page access:
+// tests/quote_template_editor_harness.cjs runs this block on its own.
+const QT_RULES = Object.freeze({
+  digitEm: { Calibri: 1038 / 2048, Arial: 1139 / 2048 }, // DIGIT_EM
+  dpis: [96, 120, 144, 168, 192, 216, 240, 288, 336], // DISPLAY_DPIS
+  hintedDigitRatio: 0.92, // MIN_HINTED_DIGIT_RATIO
+  printedRowAllowancePt: 0.75, // PRINTED_ROW_ALLOWANCE_POINTS
+  spareRowsPerPage: 1, // SPARE_ROWS_PER_PAGE
+  minPrintScale: 0.13, // MIN_PRINT_SCALE
+  minBodyRows: 20, // MIN_BODY_ROWS
+  minDescriptionWidth: 30, // MIN_DESCRIPTION_WIDTH_UNITS
+  a4Mm: [210, 297], // A4_MM
+  pointsPerMm: 72 / 25.4, // POINTS_PER_MM
+  emuPerMm: 36000, // EMU_PER_MM
+  emuPerPoint: 12700, // EMU_PER_POINT
+  emuPerPixel: 9525, // EMU_PER_PIXEL
+  quantityDigits: 3, // MIN_QUANTITY_DIGITS
+  quantityDigitEm: 0.55, // QUANTITY_DIGIT_EM
+  cellPaddingPt: 6, // CELL_TEXT_PADDING_POINTS
+  gridMin: 4, // MIN_GRID_COLUMNS
+  gridMax: 12, // MAX_GRID_COLUMNS
+  widthMin: 4,
+  widthMax: 60,
+  sizeMin: 7,
+  sizeMax: 20,
+  sizeStep: 0.5, // FONT_SIZE_STEP_PT
+  logoMin: 5,
+  logoMax: 120,
+  maxTableColumns: 8, // MAX_TABLE_COLUMNS
+  labelMax: 40,
+  nameMax: 60,
+  columnKeys: ["position", "quantity", "unit", "description", "unit_price", "amount"], // TABLE_COLUMN_KEYS
+  requiredKeys: ["description", "amount"],
+  alignments: ["left", "center", "right"], // ALIGNMENTS
+  alignmentLabels: ["Left", "Center", "Right"],
+  defaultAlign: { position: "left", quantity: "center", unit: "left", description: "left", unit_price: "right", amount: "right" },
+  defaultLabel: { position: "Pos.", quantity: "Quantity", unit: "Unit", description: "Service", unit_price: "Unit price", amount: "Estimate" },
+  formulaPrefixes: ["=", "+", "-", "@"], // FORMULA_PREFIXES
+});
+const QT_BLOCK_LABELS = Object.freeze({
+  logo: "Logo", company_details: "Company details", client_details: "Client details", quote_details: "Quote details",
+  item_table: "Item table", totals: "Totals", free_text: "Free text", terms: "Terms", notes: "Notes",
+  signature: "Signature", acceptance: "Acceptance",
+});
+const QT_COLUMN_KINDS = Object.freeze({
+  position: "Item number", quantity: "Quantity", unit: "Unit", description: "Description", unit_price: "Unit price", amount: "Amount",
+});
+// Characters the reader refuses in template text (REFUSED_CHARACTER_CATEGORIES).
+const QT_HIDDEN_CHARACTER = /[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}]/u;
+
+function qtClamp(value, low, high) { return Math.max(low, Math.min(high, value)); }
+function qtLetter(n) { return String.fromCharCode(64 + n); }
+function qtFormat(value) { return String(Math.round(value * 1000000) / 1000000); }
+function qtClone(value) { return JSON.parse(JSON.stringify(value)); }
+function qtRange(from, to) { const out = []; for (let i = from; i <= to; i += 1) out.push(i); return out; }
+// Python round(): halves go to the even whole number.
+function qtPyRound(value) {
+  const floor = Math.floor(value);
+  const diff = value - floor;
+  if (diff > 0.5) return floor + 1;
+  if (diff < 0.5) return floor;
+  return floor % 2 === 0 ? floor : floor + 1;
+}
+function qtSpansOverlap(a, b) { return a.col <= b.col + b.span - 1 && b.col <= a.col + a.span - 1; }
+function qtRectsOverlap(a, b) { return a.row <= b.row + b.rows - 1 && b.row <= a.row + a.rows - 1 && qtSpansOverlap(a, b); }
+function qtBlockLabel(block) { return QT_BLOCK_LABELS[block.type] || "Block"; }
+
+// Checked display text, as the reader's _text: "" when fine, else "empty", "hidden" or "long".
+function qtTextProblem(value, maxLength, allowEmpty = true) {
+  const raw = String(value ?? "");
+  if (QT_HIDDEN_CHARACTER.test(raw)) return "hidden";
+  let text = raw.normalize("NFC").trim();
+  if (!text && !allowEmpty) return "empty";
+  if (QT_RULES.formulaPrefixes.some((prefix) => text.startsWith(prefix))) text = `'${text}`;
+  return Array.from(text).length > maxLength ? "long" : "";
+}
+
+// Width of one grid width unit in points for the theme font (width_unit_points).
+function qtUnitPoints(theme) {
+  const exact = QT_RULES.digitEm[theme.font] * theme.size_pt;
+  let best = exact;
+  QT_RULES.dpis.forEach((dpi) => { best = Math.min(best, Math.floor(exact * dpi / 72 + 0.5) * 72 / dpi); });
+  return best;
+}
+function qtGridPixels(width) { return qtPyRound(width * 7 + 5); } // grid_column_pixels
+function qtDrawingPixels(column, theme) { // drawing_column_pixels
+  if (column.hidden) return 0;
+  return Math.min(qtGridPixels(column.width), Math.floor(column.width * qtUnitPoints(theme) * QT_RULES.hintedDigitRatio * 96 / 72));
+}
+function qtDrawingEmu(t, first, span) { // drawing_width_emu
+  let pixels = 0;
+  t.grid.columns.slice(first - 1, first - 1 + span).forEach((column) => { pixels += qtDrawingPixels(column, t.theme); });
+  return pixels * QT_RULES.emuPerPixel;
+}
+function qtCellPoints(t, first, span) { // cell_text_width_points
+  let pixels = 0;
+  t.grid.columns.slice(first - 1, first - 1 + span).forEach((column) => { if (!column.hidden) pixels += Math.floor(column.width * 7); });
+  return pixels * 72 / 96 - QT_RULES.cellPaddingPt;
+}
+function qtMinQuantityPoints(size) { // min_quantity_points
+  let total = 0;
+  for (let i = 0; i < QT_RULES.quantityDigits; i += 1) total += QT_RULES.quantityDigitEm * size;
+  return total;
+}
+function qtVisibleWidth(t, first, span) { // _visible_width_units
+  let total = 0;
+  t.grid.columns.slice(first - 1, first - 1 + span).forEach((column) => { if (!column.hidden) total += column.width; });
+  return total;
+}
+function qtPrintScale(t) { // print_scale
+  const paperWidth = t.page.orientation === "portrait" ? QT_RULES.a4Mm[0] : QT_RULES.a4Mm[1];
+  const margins = t.page.margins_mm;
+  const printable = (paperWidth - margins.left - margins.right) * QT_RULES.pointsPerMm;
+  const visible = qtVisibleWidth(t, 1, t.grid.columns.length) * qtUnitPoints(t.theme);
+  return Math.min(1, printable / visible);
+}
+function qtPrintableRows(t) { // printable_rows_per_page
+  const paperHeight = t.page.orientation === "portrait" ? QT_RULES.a4Mm[1] : QT_RULES.a4Mm[0];
+  const margins = t.page.margins_mm;
+  const printable = (paperHeight - margins.top - margins.bottom) * QT_RULES.pointsPerMm;
+  const printedRow = (t.page.row_height_pt + QT_RULES.printedRowAllowancePt) * qtPrintScale(t);
+  return Math.floor(printable / printedRow - QT_RULES.spareRowsPerPage);
+}
+function qtLogoFitMm(t, block) { return Math.floor(qtDrawingEmu(t, block.col, block.span) / QT_RULES.emuPerMm * 10) / 10; }
+function qtFieldRows(block) { // _field_rows
+  const sizes = { client_address: block.address_rows || 1, attention: 2 };
+  return block.fields.reduce((total, field) => total + (sizes[field] || 1), 0);
+}
+
+// One quote template being edited. Owns the definition and every change the editor makes to it, so
+// changes that move one thing also move what depends on it (a table's columns, the totals' label and
+// currency columns). `keys` give each block a stable name while the body order changes.
+class QuoteTemplateDraft {
+  constructor(definition) {
+    this.t = qtClone(definition);
+    this.keys = this.t.blocks.map((_, index) => `b${index}`);
+  }
+
+  keyOf(block) { return this.keys[this.t.blocks.indexOf(block)] || null; }
+
+  block(key) {
+    const index = this.keys.indexOf(key);
+    return index >= 0 ? this.t.blocks[index] : null;
+  }
+
+  firstOfType(type) { return this.t.blocks.find((block) => block.type === type) || null; }
+
+  isHeader(block) { return block.area === "header"; }
+
+  bodyBlocks() { return this.t.blocks.filter((block) => block.area === "body"); }
+
+  snapshot() { return JSON.stringify(this.t); }
+
+  toDefinition(name) { return { ...qtClone(this.t), name }; }
+
+  // Starts at column: a table's columns, and the totals' label and currency columns, move with it.
+  setCol(block, col) {
+    const next = qtClamp(col, 1, this.t.grid.columns.length - block.span + 1);
+    const delta = next - block.col;
+    if (block.type === "item_table") block.columns.forEach((column) => { column.col += delta; });
+    if (block.type === "totals") {
+      block.label_col += delta;
+      if (block.currency_col > 0) block.currency_col += delta;
+    }
+    block.col = next;
+  }
+
+  // Spans: a narrower table pulls its columns in so none runs past its last column.
+  setSpan(block, span) {
+    block.span = qtClamp(span, 1, this.t.grid.columns.length - block.col + 1);
+    if (block.type !== "item_table") return;
+    const last = block.col + block.span - 1;
+    block.columns.forEach((column) => {
+      if (column.col > last) column.col = last;
+      if (column.col + column.span - 1 > last) column.span = last - column.col + 1;
+    });
+  }
+
+  setRow(block, row) { block.row = qtClamp(row, 1, this.t.header.rows - block.rows + 1); }
+
+  setRows(block, rows) { block.rows = qtClamp(rows, 1, this.t.header.rows - block.row + 1); }
+
+  // Moves a block below the top section one place up (-1) or down (1). False when it cannot move.
+  moveInOrder(block, direction) {
+    const body = [];
+    this.t.blocks.forEach((item, index) => { if (item.area === "body") body.push(index); });
+    const position = body.indexOf(this.t.blocks.indexOf(block));
+    const target = position + direction;
+    if (position < 0 || target < 0 || target >= body.length) return false;
+    [this.t.blocks[body[position]], this.t.blocks[body[target]]] = [this.t.blocks[body[target]], this.t.blocks[body[position]]];
+    [this.keys[body[position]], this.keys[body[target]]] = [this.keys[body[target]], this.keys[body[position]]];
+    return true;
+  }
+
+  blocksUsingColumn(index) { return this.t.blocks.filter((block) => block.col <= index && block.col + block.span - 1 >= index); }
+
+  visibleColumnCount() { return this.t.grid.columns.filter((column) => !column.hidden).length; }
+
+  setColumnWidth(index, width) { this.t.grid.columns[index].width = qtClamp(width, QT_RULES.widthMin, QT_RULES.widthMax); }
+
+  // False when hiding would leave no column that prints.
+  setColumnHidden(index, hidden) {
+    if (hidden && !this.t.grid.columns[index].hidden && this.visibleColumnCount() <= 1) return false;
+    this.t.grid.columns[index].hidden = hidden;
+    return true;
+  }
+
+  addGridColumn() {
+    if (this.t.grid.columns.length >= QT_RULES.gridMax) return `A page can have at most ${QT_RULES.gridMax} columns.`;
+    this.t.grid.columns.push({ width: 10, hidden: false });
+    return "";
+  }
+
+  // Removes the last page column; a note says why when it cannot.
+  removeGridColumn() {
+    const columns = this.t.grid.columns;
+    const last = columns.length;
+    if (last <= QT_RULES.gridMin) return `A page needs at least ${QT_RULES.gridMin} columns.`;
+    if (columns.slice(0, last - 1).every((column) => column.hidden)) return "Keep at least one column that prints.";
+    const users = this.t.blocks.filter((block) => block.col + block.span - 1 >= last);
+    if (users.length) return `Column ${qtLetter(last)} is used by ${users.map(qtBlockLabel).join(", ")}. Move them first.`;
+    columns.pop();
+    return "";
+  }
+
+  nextTableKey(table) {
+    const used = table.columns.map((column) => column.key);
+    return QT_RULES.columnKeys.find((key) => !used.includes(key)) || null;
+  }
+
+  freeTableCells(table) {
+    const covered = new Set();
+    table.columns.forEach((column) => { for (let i = column.col; i < column.col + column.span; i += 1) covered.add(i); });
+    return qtRange(table.col, table.col + table.span - 1).filter((index) => !covered.has(index));
+  }
+
+  // Adds the next kind of column the table lacks, on its first free page column; a note says why when it cannot.
+  addTableColumn(table) {
+    const key = this.nextTableKey(table);
+    if (!key || table.columns.length >= QT_RULES.maxTableColumns) return "Every kind of column is already in the table.";
+    const free = this.freeTableCells(table);
+    if (!free.length) return "No free page column inside the table. Widen the table or remove a column first.";
+    const align = QT_RULES.defaultAlign[key];
+    table.columns.push({ key, label: QT_RULES.defaultLabel[key], col: free[0], span: 1, align, item_align: align });
+    return "";
+  }
+
+  // Every quote needs the description and amount columns, so those cannot be removed.
+  removeTableColumn(table, key) {
+    if (QT_RULES.requiredKeys.includes(key)) return false;
+    const index = table.columns.findIndex((column) => column.key === key);
+    if (index < 0) return false;
+    table.columns.splice(index, 1);
+    return true;
+  }
+
+  setTableColumnCol(table, column, col) {
+    const last = table.col + table.span - 1;
+    column.col = qtClamp(col, table.col, last);
+    if (column.col + column.span - 1 > last) column.span = last - column.col + 1;
+  }
+
+  setTableColumnSpan(table, column, span) { column.span = qtClamp(span, 1, table.col + table.span - column.col); }
+
+  // Heading and item rows share the alignment unless the item rows were set apart (as item numbers are).
+  setTableColumnAlign(column, align) {
+    if (column.item_align === column.align) column.item_align = align;
+    column.align = align;
+  }
+
+  // Everything the reader would refuse, as [{ key, text }]: key names the block to fix (null for the page).
+  problems() {
+    const t = this.t;
+    const out = [];
+    const add = (block, text) => out.push({ key: block ? this.keyOf(block) : null, text });
+    const columns = t.grid.columns;
+    const hidden = new Set();
+    columns.forEach((column, index) => { if (column.hidden) hidden.add(index + 1); });
+    if (hidden.size === columns.length) add(null, "Keep at least one column that prints.");
+
+    const header = t.blocks.filter((block) => block.area === "header");
+    header.forEach((a, i) => header.forEach((b, j) => {
+      if (j > i && qtRectsOverlap(a, b)) add(b, `${qtBlockLabel(a)} and ${qtBlockLabel(b)} overlap at the top of the page.`);
+    }));
+
+    t.blocks.forEach((block) => {
+      const label = qtBlockLabel(block);
+      if (qtRange(block.col, block.col + block.span - 1).every((index) => hidden.has(index))) {
+        add(block, `${label} is only on hidden columns, so it would not print. Move it to a column that prints.`);
+      }
+      if (block.type === "client_details" && block.indent_cols >= block.span) {
+        add(block, `Client details must span at least ${block.indent_cols + 1} columns.`);
+      }
+      if ((block.type === "client_details" || block.type === "quote_details") && qtFieldRows(block) > block.rows) {
+        add(block, `${label} needs at least ${qtFieldRows(block)} rows for its lines.`);
+      }
+      if ((block.type === "terms" || block.type === "notes") && block.span < 2) {
+        add(block, `${label} needs to span at least 2 columns.`);
+      }
+      if (block.type === "free_text") {
+        const needed = (block.heading ? 1 : 0) + block.lines.length;
+        if (block.area === "body" && block.lines.length && block.span < 2) add(block, "Free text needs to span at least 2 columns.");
+        if (block.area === "header" && needed > block.rows) add(block, `Free text needs at least ${needed} rows for its lines.`);
+      }
+      if (block.type === "totals" && (block.label_col > block.col + block.span - 1 || block.currency_col > block.col + block.span - 1)) {
+        add(block, "Totals is too narrow for its label and currency. Make it span more columns.");
+      }
+      if (block.type === "company_details" && block.box) {
+        const width = qtDrawingEmu(t, block.col, block.span);
+        const height = block.rows * qtPyRound(t.page.row_height_pt * QT_RULES.emuPerPoint);
+        const [left, top, right] = ["left_mm", "top_mm", "right_mm"].map((key) => qtPyRound((block.box[key] || 0) * QT_RULES.emuPerMm));
+        if (left + right >= width || top >= height) add(block, "Company details is too narrow for its text. Make it wider.");
+      }
+    });
+
+    let band = [];
+    this.bodyBlocks().forEach((block, position) => {
+      if (!block.beside) { band = [block]; return; }
+      const label = qtBlockLabel(block);
+      if (position === 0) {
+        add(block, `${label} sits beside the block above it, so it cannot come first below the top section. Move it down.`);
+      } else if (["item_table", "totals"].includes(block.type) || ["item_table", "totals"].includes(band[0].type)) {
+        add(block, `${label} cannot sit beside the item table or totals. Move it below another block.`);
+      }
+      band.forEach((other) => {
+        if (qtSpansOverlap(block, other)) add(block, `${label} and ${qtBlockLabel(other)} sit side by side but share a page column. Move one of them sideways.`);
+      });
+      band.push(block);
+    });
+
+    const table = this.firstOfType("item_table");
+    const totals = this.firstOfType("totals");
+    if (table && totals) {
+      const order = this.bodyBlocks();
+      if (order.indexOf(totals) < order.indexOf(table)) add(totals, "Totals must come after the item table. Move it down.");
+      const amount = table.columns.find((column) => column.key === "amount");
+      if (amount) {
+        const amountName = amount.label || QT_COLUMN_KINDS.amount;
+        if (!(totals.col <= amount.col && amount.col <= totals.col + totals.span - 1)) {
+          add(totals, `Totals must cover the item table's ${amountName} column (column ${qtLetter(amount.col)}). Move or widen it.`);
+        }
+        const amountCells = qtRange(amount.col, amount.col + amount.span - 1);
+        if (amountCells.includes(totals.label_col) || amountCells.includes(totals.currency_col)) {
+          add(totals, `The totals label and currency need their own columns, not the ${amountName} column. Move Totals.`);
+        }
+      }
+      if (totals.label_col === totals.currency_col) add(totals, "The totals label and currency need separate columns.");
+      if (hidden.has(totals.label_col) || hidden.has(totals.currency_col)) {
+        add(totals, "The totals label or currency is on a hidden column. Show that column or move Totals.");
+      }
+    }
+
+    if (table) {
+      const size = (table.style && table.style.size_pt) || t.theme.size_pt;
+      table.columns.forEach((column) => {
+        const name = column.label || QT_COLUMN_KINDS[column.key];
+        if (hidden.has(column.col)) {
+          add(table, `The ${name} column starts on hidden column ${qtLetter(column.col)}. Move it to a column that prints.`);
+        }
+        const textProblem = qtTextProblem(column.label, QT_RULES.labelMax);
+        if (textProblem === "hidden") add(table, `The ${QT_COLUMN_KINDS[column.key].toLowerCase()} column heading has a hidden character. Retype it.`);
+        if (textProblem === "long") add(table, `The ${QT_COLUMN_KINDS[column.key].toLowerCase()} column heading is too long.`);
+        if (column.key === "quantity" && qtMinQuantityPoints(size) > qtCellPoints(t, column.col, column.span)) {
+          add(table, `The ${column.label || "quantity"} column is too narrow for a ${QT_RULES.quantityDigits}-digit quantity. Widen column ${qtLetter(column.col)} or use smaller text.`);
+        }
+        if (column.key === "description") {
+          const width = qtVisibleWidth(t, column.col, column.span);
+          if (width < QT_RULES.minDescriptionWidth) {
+            add(table, `The ${name} column needs a width of at least ${QT_RULES.minDescriptionWidth}; it has ${qtFormat(width)}. Widen its columns.`);
+          }
+        }
+      });
+      table.columns.forEach((a, i) => table.columns.forEach((b, j) => {
+        if (j > i && qtSpansOverlap(a, b)) add(table, `The ${a.label || "first"} and ${b.label || "second"} table columns use the same page column.`);
+      }));
+    }
+
+    const logo = this.firstOfType("logo");
+    if (logo && qtDrawingEmu(t, logo.col, logo.span) > 0 && qtPyRound(logo.logo.width_mm * QT_RULES.emuPerMm) > qtDrawingEmu(t, logo.col, logo.span)) {
+      add(logo, `The logo is wider than its space. Make it ${qtFormat(qtLogoFitMm(t, logo))} mm or less, or widen its column.`);
+    }
+
+    if (hidden.size < columns.length) {
+      if (qtPrintScale(t) < QT_RULES.minPrintScale) {
+        add(null, "The columns are too wide to fit across the page. Make some narrower.");
+      } else {
+        const fit = qtPrintableRows(t);
+        const needed = Math.max(t.page.first_page_rows, t.page.page_rows);
+        if (needed > fit) {
+          add(null, `At this text size and column width the page holds ${fit} rows, fewer than this layout needs (${needed}). Use smaller text or narrower columns.`);
+        }
+      }
+      const tableHeader = table && table.currency_row ? 2 : 1;
+      if (t.page.first_page_rows - t.header.rows - tableHeader < QT_RULES.minBodyRows
+        || t.page.page_rows - ((t.page.continuation_top_rows ?? 2) + tableHeader + 1) < QT_RULES.minBodyRows) {
+        add(null, "The top section leaves too little room for items on a page.");
+      }
+    }
+    return out;
+  }
+}
+// --- quote template model: end ---
+
+// Settings > Quote Templates and the Company Profile "Quote template" dropdown (#167). Admins list,
+// build, preview, save, delete and pick the default quote layout; QuoteTemplateDraft above owns the
+// layout being edited. The page sets styles through the CSSOM only (the CSP blocks style attributes).
+const QT_ICONS = {
+  x: '<path d="M18 6 6 18"></path><path d="m6 6 12 12"></path>',
+  plus: '<path d="M12 5v14"></path><path d="M5 12h14"></path>',
+  up: '<path d="m18 15-6-6-6 6"></path>',
+  down: '<path d="m6 9 6 6 6-6"></path>',
+  left: '<path d="M4 6h16"></path><path d="M4 12h10"></path><path d="M4 18h14"></path>',
+  center: '<path d="M4 6h16"></path><path d="M7 12h10"></path><path d="M5 18h14"></path>',
+  right: '<path d="M4 6h16"></path><path d="M10 12h10"></path><path d="M6 18h14"></path>',
+  dots: '<circle cx="5" cy="12" r="1"></circle><circle cx="12" cy="12" r="1"></circle><circle cx="19" cy="12" r="1"></circle>',
+};
+const QT_MINUS = "−";
+const QT_HIDDEN_TRACK_PX = 16;
+const QT_API = "/api/settings/quote-templates";
+// Made-up content drawn on the page preview; nothing here comes from a real company or customer.
+const QT_SAMPLE = {
+  company: ["Synthetic Exhibits Pte Ltd", "Sample Street, Sample City"],
+  client: "Sample Booth Co",
+  address: ["Sample Street 1", "Sample City", "Sample Country", "Postal code 000000"],
+  total: "3,700.00",
+};
+const QT_SAMPLE_ROWS = [
+  { position: "1", quantity: "12 sqm", unit: "1 set", description: "Sample booth panel", unit_price: "1,250.00", amount: "2,500.00" },
+  { position: "2", quantity: "1 set", unit: "1 set", description: "Sample display counter", unit_price: "840.00", amount: "840.00" },
+  { position: "3", quantity: "4 sqm", unit: "1 set", description: "Sample carpet", unit_price: "90.00", amount: "360.00" },
+];
+
+function qtNode(tag, attrs, kids) {
+  const node = document.createElement(tag);
+  Object.entries(attrs || {}).forEach(([key, value]) => {
+    if (value === null || value === undefined || value === false) return;
+    if (key === "text") { node.textContent = value; return; }
+    if (key === "style") { Object.entries(value).forEach(([name, styleValue]) => node.style.setProperty(name, String(styleValue))); return; }
+    if (key.startsWith("on")) { node.addEventListener(key.slice(2), value); return; }
+    node.setAttribute(key, value === true ? "" : String(value));
+  });
+  const append = (kid) => {
+    if (kid === null || kid === undefined || kid === false) return;
+    if (Array.isArray(kid)) { kid.forEach(append); return; }
+    node.appendChild(typeof kid === "string" ? document.createTextNode(kid) : kid);
+  };
+  append(kids);
+  return node;
+}
+
+function qtIcon(name) {
+  const span = qtNode("span", { class: "qt-ico", "aria-hidden": "true" });
+  span.innerHTML = `<svg viewBox="0 0 24 24">${QT_ICONS[name]}</svg>`;
+  return span;
+}
+
+function qtPtPx(pt) { return pt * 96 / 72; }
+function qtMmPx(mm) { return Math.round(mm * 96 / 25.4); }
+function qtColPx(column) { return column.hidden ? QT_HIDDEN_TRACK_PX : qtGridPixels(column.width); }
+function qtTrackList(columns) { return columns.map((column) => `${qtColPx(column)}px`).join(" "); }
+function qtFontStack(font) { return font === "Arial" ? "Arial, Helvetica, sans-serif" : "Calibri, Carlito, 'Segoe UI', sans-serif"; }
+function qtRowPx(t) { return Math.round(qtPtPx(t.page.row_height_pt)); }
+
+// Rows a block below the top section takes in the preview (sample content only).
+function qtSampleRows(block) {
+  switch (block.type) {
+    case "item_table": return (block.currency_row ? 2 : 1) + QT_SAMPLE_ROWS.length;
+    case "totals": return 3;
+    case "free_text": return Math.max(1, (block.heading ? 1 : 0) + block.lines.length);
+    case "terms": return 4;
+    default: return 3;
+  }
+}
+
+// Where each block sits in the preview: top-section blocks at their own rows; the others follow in
+// order after their blank rows, or beside the block above when set to sit beside it.
+function qtPlacements(t, keyOf) {
+  const out = {};
+  let bandEnd = t.header.rows;
+  let bandStart = null;
+  t.blocks.forEach((block, index) => {
+    const key = keyOf(block, index);
+    if (block.area === "header") { out[key] = { row: block.row, rows: block.rows }; return; }
+    const rows = qtSampleRows(block);
+    let start;
+    if (block.beside && bandStart !== null) {
+      start = bandStart;
+      bandEnd = Math.max(bandEnd, start + rows - 1);
+    } else {
+      start = bandEnd + 1 + (block.gap_before || 0);
+      bandStart = start;
+      bandEnd = start + rows - 1;
+    }
+    out[key] = { row: start, rows };
+  });
+  return out;
+}
+
+const QT_DISCARD_NOTE = "Your unsaved changes will be lost.";
+
+class QuoteTemplatesSettings {
+  constructor({ api, permissions, onChoicesChanged }) {
+    this.api = api;
+    this.permissions = permissions;
+    this.onChoicesChanged = onChoicesChanged;
+    this.list = { status: "idle", templates: [], defaultId: "standard", limit: 10, savedCount: 0, errorText: "" };
+    this.listRequest = 0;
+    this.editor = null;
+    this.selectedKey = null;
+    this.selectedCol = null;
+    this.gridNote = "";
+    this.tableNote = "";
+    this.menuOpen = null;
+    this.deleteTarget = null;
+    this.deleteBusy = false;
+    this.zoom = "auto";
+    this.zoomLock = null;
+    this.paperW = 0;
+    this.dragMoved = false;
+    this.noteTimer = null;
+    this.previewBusy = false;
+    this.saveBusy = false;
+    this.logoAspect = 18.1 / 47.8;
+    this.profileSaveBusy = false;
+    this.profilePick = null;
+    this.profileKeyPick = false;
+  }
+
+  el(id) { return document.getElementById(id); }
+
+  bind() {
+    document.querySelectorAll("[data-settings-section]").forEach((button) => {
+      button.addEventListener("click", () => this.setSection(button.getAttribute("data-settings-section"), { focusTab: false }));
+      button.addEventListener("keydown", (event) => this.sectionTabKey(event));
+    });
+    this.el("qtNewButton")?.addEventListener("click", () => this.openEditor("new", null));
+    this.el("qtBackButton")?.addEventListener("click", () => { if (this.mayLeaveEditor()) this.closeEditor(); });
+    this.el("qtCancelButton")?.addEventListener("click", (event) => this.cancelEditor(event));
+    // Holding Enter repeats the click; only a new press may discard.
+    this.el("qtCancelButton")?.addEventListener("keydown", (event) => { if (event.repeat && event.key === "Enter") event.preventDefault(); });
+    this.el("qtSaveButton")?.addEventListener("click", () => this.saveEditor());
+    this.el("qtStatus")?.addEventListener("click", () => this.goToProblem());
+    this.el("qtPreviewExcel")?.addEventListener("click", () => this.preview("xlsx"));
+    this.el("qtPreviewPdf")?.addEventListener("click", () => this.preview("pdf"));
+    this.el("qtZoomOut")?.addEventListener("click", () => this.stepZoom(-0.1));
+    this.el("qtZoomIn")?.addEventListener("click", () => this.stepZoom(0.1));
+    this.el("qtZoomFit")?.addEventListener("click", () => { this.zoom = "fit"; this.applyZoom(); });
+    this.el("qtNameInput")?.addEventListener("input", () => { this.setNotice(this.el("qtNameError"), ""); this.renderStatus(); });
+    this.el("qtNameInput")?.addEventListener("keydown", (event) => { if (event.key === "Enter") event.preventDefault(); });
+    this.el("qtListRetry")?.addEventListener("click", () => this.loadList({ focusNew: true }));
+    this.el("qtDeleteCancel")?.addEventListener("click", () => this.closeDelete());
+    this.el("qtDeleteConfirm")?.addEventListener("click", () => this.confirmDelete());
+    document.querySelectorAll("[data-qt-delete-close]").forEach((node) => node.addEventListener("click", () => this.closeDelete()));
+    const profileField = this.el("quoteTemplateSelect");
+    profileField?.addEventListener("change", () => this.profileFieldChanged());
+    profileField?.addEventListener("keydown", (event) => this.profileFieldKey(event));
+    profileField?.addEventListener("keyup", () => { this.profileKeyPick = false; });
+    profileField?.addEventListener("mousedown", (event) => {
+      this.profileKeyPick = false;
+      if (this.profileSaveBusy) event.preventDefault();
+    });
+    profileField?.addEventListener("blur", () => {
+      // When the whole window loses focus the field is still the active element, so nothing is saved yet.
+      if (document.activeElement !== profileField) this.commitProfilePick();
+    });
+    if (window.ResizeObserver && this.el("qtStage")) new ResizeObserver(() => this.applyZoom()).observe(this.el("qtStage"));
+    document.addEventListener("click", (event) => {
+      if (this.menuOpen && !event.target.closest(".qt-more")) this.closeRowMenu(false);
+    });
+  }
+
+  canManage() { return Boolean(this.permissions()?.canManageSettings); }
+
+  /* ---------- Settings window and sections ---------- */
+
+  sectionActive() {
+    const section = this.el("settingsTemplatesSection");
+    const modal = this.el("pricingReferenceModal");
+    return Boolean(section && !section.hidden && modal && !modal.hidden);
+  }
+
+  onSettingsOpened() {
+    const tab = this.el("settingsTemplatesTab");
+    if (tab) {
+      tab.disabled = !this.canManage();
+      tab.title = this.canManage() ? "" : "Only admins can change quote templates.";
+    }
+    this.setSection("pricing", { focusTab: false });
+  }
+
+  // Closing Settings (X, outside the window, Escape) with unsaved template changes only asks: the changes
+  // are discarded by the "Discard changes" button alone. While a save runs, Settings stays open.
+  beforeSettingsClose() {
+    if (!this.mayLeaveEditor()) {
+      const reachable = this.sectionActive() && document.activeElement !== document.body;
+      this.setSection("templates", { focusTab: !reachable });
+      return false;
+    }
+    this.closeDeleteModal();
+    this.menuOpen = null;
+    this.editor = null;
+    this.selectedKey = null;
+    this.selectedCol = null;
+    this.showView("list");
+    this.setSection("pricing", { focusTab: false });
+    return true;
+  }
+
+  sectionTabKey(event) {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    const tabs = Array.from(document.querySelectorAll("[data-settings-section]")).filter((tab) => !tab.disabled);
+    const index = tabs.indexOf(event.currentTarget);
+    if (index < 0) return;
+    event.preventDefault();
+    const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+    this.setSection(tabs[next].getAttribute("data-settings-section"), { focusTab: true });
+  }
+
+  setSection(name, { focusTab } = {}) {
+    const section = name === "templates" && this.canManage() ? "templates" : "pricing";
+    document.querySelectorAll("[data-settings-section]").forEach((tab) => {
+      const on = tab.getAttribute("data-settings-section") === section;
+      tab.classList.toggle("is-active", on);
+      tab.setAttribute("aria-selected", on ? "true" : "false");
+      tab.tabIndex = on ? 0 : -1;
+      if (on && focusTab) tab.focus();
+    });
+    if (this.el("settingsPricingSection")) this.el("settingsPricingSection").hidden = section !== "pricing";
+    if (this.el("settingsTemplatesSection")) this.el("settingsTemplatesSection").hidden = section !== "templates";
+    if (this.el("settingsPricingFooter")) this.el("settingsPricingFooter").hidden = section !== "pricing";
+    if (section === "templates" && !this.editor && this.list.status !== "loading") this.loadList();
+    this.syncChrome();
+  }
+
+  showView(view) {
+    if (this.el("qtListView")) this.el("qtListView").hidden = view !== "list";
+    if (this.el("qtEditorView")) this.el("qtEditorView").hidden = view !== "editor";
+    this.syncChrome();
+  }
+
+  // The editor footer and the wider window apply only while a template is open in this section.
+  syncChrome() {
+    const editing = Boolean(this.editor) && this.sectionActive();
+    if (this.el("qtEditorFooter")) this.el("qtEditorFooter").hidden = !editing;
+    document.querySelector(".pricing-reference-settings-panel")?.classList.toggle("is-wide", editing);
+    if (editing) this.applyZoom();
+  }
+
+  scrollBodyTop() {
+    const body = this.el("pricingReferenceEditorBody");
+    if (body) body.scrollTop = 0;
+  }
+
+  // Escape: closes the delete confirm or the row menu first; in the editor it only clears the selection.
+  handleEscape() {
+    if (this.el("qtDeleteModal") && !this.el("qtDeleteModal").hidden) { this.closeDelete(); return true; }
+    if (this.menuOpen) { this.closeRowMenu(true); return true; }
+    if (this.editor && this.sectionActive()) {
+      if (this.selectedKey || this.selectedCol !== null) this.selectNone();
+      return true;
+    }
+    return false;
+  }
+
+  /* ---------- Small helpers ---------- */
+
+  setNotice(node, text) {
+    if (!node) return;
+    node.textContent = text || "";
+    node.hidden = !text;
+  }
+
+  setBanner(node, lead, text) {
+    if (!node) return;
+    node.textContent = "";
+    if (lead || text) {
+      node.appendChild(qtNode("strong", { text: lead }));
+      node.appendChild(qtNode("span", { text }));
+    }
+    node.hidden = !(lead || text);
+  }
+
+  flashNote(text) {
+    this.holdNote(text);
+    this.noteTimer = setTimeout(() => { this.noteTimer = null; this.renderStatus(); }, 4000);
+  }
+
+  // A note that stays until the next change, for text people may need to copy (a support code).
+  holdNote(text) {
+    const note = this.el("qtFooterNote");
+    if (note) note.textContent = text;
+    if (this.noteTimer) clearTimeout(this.noteTimer);
+    this.noteTimer = null;
+  }
+
+  // The code the server logged with the failure, in the words of the approved mockup.
+  supportCode(data) {
+    const reference = errorReferenceFrom(data);
+    return reference ? ` If it keeps happening, contact support with code ${reference}.` : "";
+  }
+
+  // Redrawing the list drops the focus; this puts it on a template's row, or on the nearest control left.
+  focusRow(id) {
+    const newButton = this.el("qtNewButton");
+    const target = (id && this.el(`qtMore-${id}`)) || (newButton && !newButton.disabled ? newButton : this.el("qtList")?.querySelector("button:not(:disabled)"));
+    target?.focus();
+  }
+
+  field(label, control, help) {
+    return qtNode("div", { class: "qt-field" }, [qtNode("span", { text: label }), control, help ? qtNode("span", { class: "qt-help", text: help }) : null]);
+  }
+
+  selectControl(options, value, onChange) {
+    const select = qtNode("select", null, options.map((option) => qtNode("option", { value: String(option.value), text: option.label })));
+    select.value = String(value);
+    select.addEventListener("change", () => onChange(select.value));
+    return select;
+  }
+
+  letterOptions(from, to) { return qtRange(from, to).map((n) => ({ value: n, label: qtLetter(n) })); }
+
+  // A number box with minus and plus buttons; onSet gets a value rounded to the step and kept in range.
+  stepper(label, fk, value, options, onSet) {
+    const set = (next) => onSet(qtClamp(Math.round(next / options.step) * options.step, options.min, options.max));
+    const input = qtNode("input", {
+      type: "number", min: String(options.min), max: String(options.max), step: String(options.step), value: qtFormat(value),
+      inputmode: "decimal", "aria-label": label, "data-fk": fk,
+      onchange: (event) => {
+        const next = parseFloat(event.target.value);
+        if (Number.isNaN(next)) { event.target.value = qtFormat(value); return; }
+        set(next);
+      },
+    });
+    return this.field(label, qtNode("div", { class: "qt-stepper" }, [
+      qtNode("button", { type: "button", class: "qt-step", "aria-label": `Less ${label.toLowerCase()}`, "data-fk": `${fk}-dec`, disabled: value <= options.min, onclick: () => set(value - options.step) }, [QT_MINUS]),
+      input,
+      qtNode("button", { type: "button", class: "qt-step", "aria-label": `More ${label.toLowerCase()}`, "data-fk": `${fk}-inc`, disabled: value >= options.max, onclick: () => set(value + options.step) }, ["+"]),
+    ]), options.help);
+  }
+
+  // Colour: a swatch that opens the picker, plus the hex code to type or paste.
+  colorField(label, fk, value, onSet) {
+    let hex = null;
+    const picker = qtNode("input", {
+      type: "color", class: "qt-swatch", value: value.toLowerCase(), "aria-label": `${label}: pick a colour`, "data-fk": fk,
+      oninput: (event) => { hex.value = event.target.value.toUpperCase(); onSet(event.target.value.toUpperCase()); },
+    });
+    hex = qtNode("input", {
+      type: "text", class: "qt-hex", value: value.toUpperCase(), maxlength: "7", spellcheck: "false", autocomplete: "off",
+      "aria-label": `${label}: hex code`, "data-fk": `${fk}-hex`,
+      onchange: (event) => {
+        let next = event.target.value.trim();
+        if (next.charAt(0) !== "#") next = `#${next}`;
+        if (/^#[0-9a-fA-F]{6}$/.test(next)) {
+          next = next.toUpperCase();
+          event.target.value = next;
+          picker.value = next.toLowerCase();
+          onSet(next);
+        } else {
+          event.target.value = picker.value.toUpperCase();
+        }
+      },
+    });
+    return this.field(label, qtNode("div", { class: "qt-color" }, [picker, hex]));
+  }
+
+  miniSelect(label, fk, options, value, onChange) {
+    const select = this.selectControl(options, value, onChange);
+    select.setAttribute("data-fk", fk);
+    return qtNode("label", { class: "qt-mini" }, [label, select]);
+  }
+
+  badge(text, quiet) { return qtNode("span", { class: `qt-badge${quiet ? " is-quiet" : ""}`, text }); }
+
+  /* ---------- Template list ---------- */
+
+  savedTemplates() { return this.list.templates.filter((template) => !template.builtin); }
+
+  template(id) { return this.list.templates.find((template) => template.id === id) || null; }
+
+  atLimit() { return this.list.savedCount >= this.list.limit; }
+
+  limitText() {
+    if (!this.list.limit) return "This workspace cannot keep saved templates.";
+    return `You have ${this.list.limit} saved templates, the most a workspace can keep. Delete one to add or copy another.`;
+  }
+
+  nameTaken(name, exceptId) {
+    const lower = name.toLowerCase();
+    return this.list.templates.some((template) => template.id !== exceptId && String(template.name).toLowerCase() === lower);
+  }
+
+  usageText(template) {
+    if (template.builtin) return "Built in, so it cannot be changed. Copy it to make your own.";
+    if (!template.usage) return "Not used by any profile yet";
+    return `Used by ${template.usage}${template.usage === 1 ? " profile" : " profiles"}`;
+  }
+
+  async loadList({ focusNew = false } = {}) {
+    const request = this.listRequest + 1;
+    this.listRequest = request;
+    this.list.status = "loading";
+    this.setNotice(this.el("qtListStatus"), "");
+    this.renderList();
+    const { ok, status, data } = await this.api.get(QT_API);
+    if (request !== this.listRequest) return;
+    if (!ok || !Array.isArray(data?.templates)) {
+      this.list.status = "error";
+      this.list.errorText = (status === 503
+        ? "Saved templates are not available on this server yet."
+        : "Check your connection and try again.") + this.supportCode(data);
+      this.renderList();
+      return;
+    }
+    this.list = {
+      status: "ready",
+      templates: data.templates,
+      defaultId: data.default_template_id || "standard",
+      limit: Number.isInteger(data.limit) ? data.limit : 10,
+      savedCount: Number(data.saved_count) || 0,
+      errorText: "",
+    };
+    const standardLogo = data.templates.find((template) => template.builtin)?.definition?.blocks?.find((block) => block.type === "logo")?.logo;
+    if (standardLogo?.width_mm) this.logoAspect = standardLogo.height_mm / standardLogo.width_mm;
+    this.onChoicesChanged({
+      available: true,
+      default_template_id: this.list.defaultId,
+      templates: data.templates.map((template) => ({ id: template.id, name: template.name, builtin: Boolean(template.builtin) })),
+    });
+    this.renderList();
+    if (focusNew) this.el("qtNewButton")?.focus();
+  }
+
+  renderList() {
+    const list = this.el("qtList");
+    if (!list) return;
+    const status = this.list.status;
+    const ready = status === "ready";
+    const full = ready && this.atLimit();
+    list.textContent = "";
+    this.el("qtMeter").hidden = !ready;
+    this.el("qtCounter").textContent = `${this.list.savedCount} of ${this.list.limit} saved`;
+    this.el("qtMeterFill").style.setProperty("width", `${Math.round(Math.min(1, this.list.savedCount / Math.max(1, this.list.limit)) * 100)}%`);
+    this.el("qtMeter").classList.toggle("is-full", full);
+    this.el("qtNewButton").disabled = full || !ready;
+    this.el("qtNewButton").title = !ready ? "Wait until the templates have loaded." : "";
+    this.setBanner(this.el("qtLimitMessage"), full ? "Limit reached." : "", full ? this.limitText() : "");
+    this.el("qtListLoading").hidden = status !== "loading";
+    this.el("qtListError").hidden = status !== "error";
+    if (this.el("qtListErrorText")) this.el("qtListErrorText").textContent = this.list.errorText || "Check your connection and try again.";
+    this.el("qtEmpty").hidden = !(ready && this.list.savedCount === 0 && !full);
+    list.hidden = !ready;
+    if (!ready) return;
+    this.list.templates.forEach((template) => list.appendChild(this.templateRow(template)));
+  }
+
+  thumb(template) {
+    const t = template.definition;
+    if (!t) return qtNode("div", { class: "qt-thumb", "aria-hidden": "true" });
+    const columns = t.grid.columns;
+    let total = 0;
+    columns.forEach((column) => { total += column.hidden ? 0 : column.width; });
+    const places = qtPlacements(t, (_, index) => index);
+    let last = 1;
+    Object.values(places).forEach((place) => { last = Math.max(last, place.row + place.rows - 1); });
+    const widthOf = (from, count) => {
+      let sum = 0;
+      columns.slice(from - 1, from - 1 + count).forEach((column) => { sum += column.hidden ? 0 : column.width; });
+      return sum / total * 100;
+    };
+    const inner = qtNode("div", { class: "qt-thumb-inner" });
+    t.blocks.forEach((block, index) => {
+      const place = places[index];
+      const kind = block.type === "logo" ? "logo" : (block.type === "item_table" ? "table" : "text");
+      const style = {
+        left: `${widthOf(1, block.col - 1)}%`, width: `${widthOf(block.col, block.span)}%`,
+        top: `${(place.row - 1) / last * 100}%`, height: `${Math.max(2, place.rows / last * 100)}%`,
+      };
+      if (kind === "table") style["--qt-c"] = t.theme.heading_color;
+      inner.appendChild(qtNode("span", { class: `qt-thumb-b qt-thumb-${kind}`, style }));
+    });
+    return qtNode("div", { class: "qt-thumb", "aria-hidden": "true" }, [inner]);
+  }
+
+  menuItem(label, disabled, onPick, danger, title) {
+    return qtNode("button", {
+      type: "button", role: "menuitem", disabled, title: title || null,
+      class: `secondary-button company-preset-menu-item${danger ? " danger-button" : ""}`,
+      onclick: (event) => { event.stopPropagation(); this.menuOpen = null; onPick(); },
+    }, [label]);
+  }
+
+  templateRow(template) {
+    const isDefault = template.id === this.list.defaultId;
+    const full = this.atLimit();
+    const limitTip = !full ? null : this.list.limit ? `You have ${this.list.limit} saved templates. Delete one first.` : this.limitText();
+    const menuId = `qtMenu-${template.id}`;
+    const open = this.menuOpen === template.id;
+    const main = template.builtin
+      ? qtNode("button", { type: "button", class: "secondary-button qt-btn-sm", disabled: full, title: limitTip, onclick: () => this.openEditor("copy", template.id) }, ["Make a copy"])
+      : qtNode("button", { type: "button", class: "secondary-button qt-btn-sm", "aria-label": `Edit ${template.name}`, onclick: () => this.openEditor("edit", template.id) }, ["Edit"]);
+    const items = [];
+    if (!template.builtin) items.push(this.menuItem("Make a copy", full, () => this.openEditor("copy", template.id), false, limitTip));
+    items.push(this.menuItem(isDefault ? "Already the workspace default" : "Make workspace default", isDefault, () => this.setDefault(template.id)));
+    if (!template.builtin) items.push(this.menuItem("Delete", false, () => this.openDelete(template.id), true));
+    const more = qtNode("button", {
+      type: "button", id: `qtMore-${template.id}`, class: "secondary-button qt-btn-quiet qt-icon-btn",
+      "aria-label": `More actions for ${template.name}`, "aria-haspopup": "menu", "aria-expanded": open ? "true" : "false", "aria-controls": menuId,
+      onclick: (event) => { event.stopPropagation(); this.toggleRowMenu(template.id); },
+    }, [qtIcon("dots")]);
+    return qtNode("li", { class: "qt-row" }, [
+      this.thumb(template),
+      qtNode("div", { class: "qt-row-info" }, [
+        qtNode("div", { class: "qt-row-title" }, [qtNode("strong", { text: template.name }), isDefault ? this.badge("Default") : null, template.builtin ? this.badge("Built in", true) : null]),
+        qtNode("span", { class: "qt-row-meta", text: this.usageText(template) }),
+      ]),
+      qtNode("div", { class: "qt-row-actions" }, [
+        main,
+        qtNode("div", { class: "qt-more" }, [more, qtNode("div", { class: "company-preset-menu qt-row-menu", id: menuId, role: "menu", "aria-label": `Actions for ${template.name}`, hidden: !open }, items)]),
+      ]),
+    ]);
+  }
+
+  toggleRowMenu(id) {
+    this.menuOpen = this.menuOpen === id ? null : id;
+    this.renderList();
+    if (this.menuOpen) {
+      document.querySelector(`#qtMenu-${id} button:not(:disabled)`)?.focus();
+    } else {
+      this.el(`qtMore-${id}`)?.focus();
+    }
+  }
+
+  closeRowMenu(refocus) {
+    if (!this.menuOpen) return;
+    const id = this.menuOpen;
+    this.menuOpen = null;
+    this.renderList();
+    if (refocus) this.el(`qtMore-${id}`)?.focus();
+  }
+
+  async setDefault(id) {
+    const template = this.template(id);
+    if (!template) return;
+    this.renderList();
+    const { ok, data } = await this.api.post(`${QT_API}/default`, { template_id: id });
+    if (!ok) {
+      this.setBanner(this.el("qtListStatus"), "Not changed.", this.failureText(data));
+      this.focusRow(id);
+      return;
+    }
+    await this.loadList();
+    this.setBanner(this.el("qtListStatus"), "Default changed.", `"${template.name}" is now the workspace default. Profiles set to Workspace default use it.`);
+    this.focusRow(id);
+  }
+
+  failureText(data) { return `Something went wrong. Try again.${this.supportCode(data)}`; }
+
+  /* ---------- Editor: open, save, cancel ---------- */
+
+  openEditor(mode, sourceId) {
+    const source = sourceId ? this.template(sourceId) : this.list.templates.find((template) => template.builtin);
+    this.menuOpen = null;
+    if (!source?.definition) return;
+    if (mode !== "edit" && this.atLimit()) { this.renderList(); return; }
+    const draft = new QuoteTemplateDraft(source.definition);
+    const name = mode === "new" ? "" : mode === "copy" ? `${source.name} copy`.slice(0, QT_RULES.nameMax) : source.name;
+    this.editor = {
+      mode, id: mode === "edit" ? source.id : null, saveNumber: mode === "edit" ? source.save_number : null,
+      draft, baseline: draft.snapshot(), baseName: name, discardAskedFor: null, rowId: mode === "new" ? null : source.id,
+    };
+    this.el("qtEditorTitle").textContent = mode === "new" ? "New template" : (mode === "copy" ? `Copy of ${source.name}` : `Edit ${source.name}`);
+    this.el("qtNameInput").value = name;
+    this.setNotice(this.el("qtNameError"), "");
+    this.setNotice(this.el("qtListStatus"), "");
+    this.el("qtSaveError").hidden = true;
+    this.resetCancel();
+    this.holdNote("");
+    this.selectedKey = null;
+    this.selectedCol = null;
+    this.gridNote = "";
+    this.tableNote = "";
+    this.zoom = "auto";
+    this.showView("editor");
+    this.scrollBodyTop();
+    this.renderAll();
+    if (mode !== "edit") { this.el("qtNameInput").focus(); this.el("qtNameInput").select(); }
+  }
+
+  isDirty() {
+    const editor = this.editor;
+    return Boolean(editor) && (editor.draft.snapshot() !== editor.baseline || this.el("qtNameInput").value !== editor.baseName);
+  }
+
+  resetCancel() {
+    const cancel = this.el("qtCancelButton");
+    cancel.textContent = "Cancel";
+    cancel.classList.remove("danger-button");
+    if (this.editor) this.editor.discardAskedFor = null;
+  }
+
+  editSnapshot() { return JSON.stringify([this.editor.draft.snapshot(), this.el("qtNameInput").value]); }
+
+  // "Discard changes" stands only for the changes it was asked about: any edit since then asks again.
+  discardAsked() { return Boolean(this.editor) && this.editor.discardAskedFor !== null && this.editor.discardAskedFor === this.editSnapshot(); }
+
+  // Never moves the focus onto "Discard changes", so a second press of the same key cannot discard.
+  askDiscard() {
+    this.editor.discardAskedFor = this.editSnapshot();
+    this.el("qtCancelButton").textContent = "Discard changes";
+    this.el("qtCancelButton").classList.add("danger-button");
+    this.holdNote(QT_DISCARD_NOTE);
+  }
+
+  // The one question every way out of the editor asks, except "Discard changes" itself.
+  mayLeaveEditor() {
+    if (!this.editor) return true;
+    if (this.saveBusy) return false;
+    if (!this.isDirty()) return true;
+    this.askDiscard();
+    return false;
+  }
+
+  // First Cancel with unsaved changes asks; a new click on "Discard changes" discards.
+  cancelEditor(event) {
+    if (this.saveBusy) return;
+    if (this.isDirty() && this.discardAsked()) {
+      if (event?.detail > 1) return; // the second half of the double click that asked
+      this.closeEditor();
+    } else if (this.mayLeaveEditor()) {
+      this.closeEditor();
+    }
+  }
+
+  closeEditor() {
+    const rowId = this.editor?.rowId;
+    this.editor = null;
+    this.selectedKey = null;
+    this.selectedCol = null;
+    this.setNotice(this.el("qtNameError"), "");
+    this.resetCancel();
+    this.showView("list");
+    this.renderList();
+    this.scrollBodyTop();
+    this.focusRow(rowId);
+  }
+
+  nameProblem(name, exceptId) {
+    const problem = qtTextProblem(name, QT_RULES.nameMax, false);
+    if (problem === "empty") return "Give the template a name.";
+    if (problem === "hidden") return "The name has a hidden character. Retype it.";
+    if (problem === "long") return `Keep the name to ${QT_RULES.nameMax} characters or fewer.`;
+    if (this.nameTaken(name.trim(), exceptId)) return "Another template already has this name.";
+    return "";
+  }
+
+  setSaveBusy(busy) {
+    this.saveBusy = busy;
+    // Edits made while the save is on its way would not be in it, so the page takes none until it is back.
+    this.el("qtEditorView").inert = busy;
+    const button = this.el("qtSaveButton");
+    button.disabled = busy;
+    button.textContent = "";
+    if (busy) {
+      button.appendChild(qtNode("span", { class: "qt-busy", "aria-hidden": "true" }));
+      button.appendChild(document.createTextNode("Saving"));
+    } else {
+      button.textContent = "Save template";
+    }
+  }
+
+  async saveEditor() {
+    const editor = this.editor;
+    if (!editor || this.saveBusy) return;
+    const name = this.el("qtNameInput").value.trim();
+    const nameProblem = this.nameProblem(name, editor.id);
+    if (nameProblem) {
+      this.setNotice(this.el("qtNameError"), nameProblem);
+      this.flashNote(`Not saved: ${nameProblem.charAt(0).toLowerCase()}${nameProblem.slice(1)}`);
+      this.el("qtNameInput").focus();
+      return;
+    }
+    const problems = editor.draft.problems();
+    if (problems.length) {
+      this.goToProblem();
+      this.flashNote(`Fix the ${problems.length === 1 ? "item" : `${problems.length} items`} marked in red, then save.`);
+      return;
+    }
+    if (editor.mode !== "edit" && this.atLimit()) { this.showSaveError(this.limitText()); return; }
+    this.resetCancel();
+    this.setSaveBusy(true);
+    this.el("qtSaveError").hidden = true;
+    const definition = editor.draft.toDefinition(name);
+    const { ok, status, data } = editor.mode === "edit"
+      ? await this.api.post(`${QT_API}/${encodeURIComponent(editor.id)}`, { definition, save_number: editor.saveNumber })
+      : await this.api.post(QT_API, { definition });
+    this.setSaveBusy(false);
+    if (this.editor !== editor) return;
+    if (!ok) {
+      this.showSaveError(this.saveFailureText(status, data));
+      // The list behind the editor is out of date, so "All templates" shows what is saved now.
+      if (status === 409 || status === 404) this.loadList();
+      return;
+    }
+    this.closeEditor();
+    await this.loadList();
+    this.setBanner(this.el("qtListStatus"), "Saved.", `"${name}" is ready to pick in Company Profile.`);
+    this.focusRow(data?.template?.id);
+  }
+
+  showSaveError(text) {
+    this.el("qtSaveErrorText").textContent = text;
+    this.el("qtSaveError").hidden = false;
+    this.flashNote("Not saved. Your changes are still here.");
+    this.scrollBodyTop();
+    this.el("qtSaveButton").focus();
+  }
+
+  saveFailureText(status, data) {
+    const reason = data?.reason || data?.failure_kind || "";
+    if (status === 409 && reason === "template_limit_reached") return this.limitText();
+    if (status === 409) return "Someone saved this template since you opened it. Go back to All templates and open it again.";
+    if (status === 404) return "Someone deleted this template since you opened it, so it cannot be saved. Go back to All templates.";
+    if (status === 400) return "The layout was not accepted. Check the blocks and columns you changed, then try Save again.";
+    return `Something went wrong. Your changes are still here; try Save again.${this.supportCode(data)}`;
+  }
+
+  /* ---------- Preview Excel and PDF ---------- */
+
+  async preview(format) {
+    const editor = this.editor;
+    if (!editor || this.previewBusy) return;
+    const problems = editor.draft.problems();
+    if (problems.length) {
+      this.goToProblem();
+      this.flashNote(`Fix the ${problems.length === 1 ? "item" : `${problems.length} items`} marked in red, then preview.`);
+      return;
+    }
+    const name = this.el("qtNameInput").value.trim() || "Preview";
+    const pressed = document.activeElement;
+    this.previewBusy = true;
+    this.el("qtPreviewExcel").disabled = true;
+    this.el("qtPreviewPdf").disabled = true;
+    this.flashNote(format === "pdf" ? "Preparing the sample PDF…" : "Preparing the sample Excel file…");
+    let result;
+    try {
+      result = await this.api.postBlob(`${QT_API}/preview`, { definition: editor.draft.toDefinition(name.slice(0, QT_RULES.nameMax)), format });
+    } finally {
+      this.previewBusy = false;
+      this.el("qtPreviewExcel").disabled = false;
+      this.el("qtPreviewPdf").disabled = false;
+      // A disabled button drops the focus; give it back unless it has moved on.
+      if (document.activeElement === document.body) pressed?.focus();
+    }
+    if (!result.ok) {
+      if (this.editor !== editor) return;
+      const reference = errorReferenceFrom(result.data);
+      if (result.status === 503 && format === "pdf") this.flashNote("PDF preview is not available on this server right now. Use Preview Excel instead.");
+      else if (result.status === 429) this.flashNote("Too many previews in a minute. Wait a moment and try again.");
+      else if (reference) this.holdNote(`The preview could not be made. Try again, or contact support with code ${reference}.`);
+      else this.flashNote("The preview could not be made. Try again.");
+      return;
+    }
+    // Both files download: a PDF opened from page memory would inherit this page's content security
+    // policy, which stops the browser's PDF viewer from showing it.
+    downloadBlobFile(`quote-template-preview.${format}`, result.blob);
+    if (this.editor === editor) this.flashNote(format === "pdf" ? "The sample PDF was downloaded." : "The sample Excel file was downloaded.");
+  }
+
+  /* ---------- Page preview ---------- */
+
+  renderPaper() {
+    const draft = this.editor.draft;
+    const t = draft.t;
+    const wrap = this.el("qtPaperWrap");
+    const columns = t.grid.columns;
+    const tracks = qtTrackList(columns);
+    const margins = t.page.margins_mm;
+    let contentW = 0;
+    columns.forEach((column) => { contentW += qtColPx(column); });
+    const paperW = contentW + qtMmPx(margins.left) + qtMmPx(margins.right);
+    const rowPx = qtRowPx(t);
+    const places = qtPlacements(t, (block) => draft.keyOf(block));
+    const bad = new Set(draft.problems().map((problem) => problem.key).filter(Boolean));
+    this.paperW = paperW;
+    wrap.textContent = "";
+    wrap.style.setProperty("--qt-row", `${rowPx}px`);
+    wrap.appendChild(qtNode("div", { class: "qt-ruler", style: { "grid-template-columns": tracks, width: `${contentW}px`, "margin-left": `${qtMmPx(margins.left)}px` } },
+      columns.map((column, index) => this.rulerSlot(column, index))));
+    const grid = qtNode("div", { class: "qt-grid", style: { "grid-template-columns": tracks, "grid-auto-rows": `${rowPx}px` } });
+    grid.appendChild(qtNode("div", { class: "qt-guides", "aria-hidden": "true", style: { "grid-template-columns": tracks } },
+      columns.map((column, index) => qtNode("span", { class: `qt-guide${column.hidden ? " is-hidden" : ""}${this.selectedCol === index ? " is-selected" : ""}` }))));
+    grid.appendChild(qtNode("div", { class: "qt-header-end", "aria-hidden": "true", style: { top: `${t.header.rows * rowPx}px` } }, [
+      qtNode("span", { text: "Top section ends here. Blocks below follow in order." }),
+    ]));
+    t.blocks.forEach((block) => {
+      const key = draft.keyOf(block);
+      grid.appendChild(this.blockEl(t, block, key, places[key], bad.has(key)));
+    });
+    const paper = qtNode("div", {
+      class: "qt-paper",
+      style: {
+        width: `${paperW}px`, "min-height": `${Math.round(paperW * 297 / 210)}px`,
+        padding: `${qtMmPx(margins.top)}px ${qtMmPx(margins.right)}px ${qtMmPx(margins.bottom)}px ${qtMmPx(margins.left)}px`,
+        "font-family": qtFontStack(t.theme.font), "font-size": `${qtPtPx(t.theme.size_pt)}px`, color: t.theme.color,
+      },
+    }, [grid]);
+    paper.addEventListener("click", (event) => { if (!this.dragMoved && (event.target === paper || event.target === grid)) this.selectNone(); });
+    wrap.appendChild(paper);
+    this.applyZoom();
+  }
+
+  rulerSlot(column, index) {
+    const selected = this.selectedCol === index;
+    const showWidth = !column.hidden && qtGridPixels(column.width) >= 90;
+    const name = `Column ${qtLetter(index + 1)}`;
+    const cell = qtNode("button", {
+      type: "button", class: `qt-ruler-cell${column.hidden ? " is-hidden" : ""}${selected ? " is-selected" : ""}`,
+      "aria-pressed": selected ? "true" : "false", "data-col": String(index),
+      "aria-label": `${name}${column.hidden ? ", hidden" : `, width ${qtFormat(column.width)}`}`,
+      title: `${name}${column.hidden ? " (hidden)" : `, width ${qtFormat(column.width)}`}`,
+      onclick: () => { if (!this.dragMoved) this.selectColumn(index); },
+    }, [qtNode("span", { text: qtLetter(index + 1) }), showWidth ? qtNode("span", { class: "qt-ruler-width", text: qtFormat(Math.round(column.width * 10) / 10) }) : null]);
+    const handle = column.hidden ? null : qtNode("span", {
+      class: "qt-col-handle", "aria-hidden": "true", "data-col": String(index), title: `Drag to change the width of column ${qtLetter(index + 1)}`,
+      onpointerdown: (event) => this.startWidthDrag(event, index),
+    });
+    return qtNode("div", { class: "qt-ruler-slot" }, [cell, handle]);
+  }
+
+  blockAria(block) {
+    let where = `columns ${qtLetter(block.col)} to ${qtLetter(block.col + block.span - 1)}`;
+    if (block.area === "header") where += `, rows ${block.row} to ${block.row + block.rows - 1}`;
+    return `${qtBlockLabel(block)}, ${where}. Arrow keys move it. Shift and arrow keys change its size.`;
+  }
+
+  blockEl(t, block, key, place, bad) {
+    const selected = this.selectedKey === key;
+    const node = qtNode("button", {
+      type: "button", class: `qt-block qt-block-${block.type}${selected ? " is-selected" : ""}${bad ? " has-problem" : ""}`,
+      "data-block": key, "data-block-type": block.type, "aria-pressed": selected ? "true" : "false", "aria-label": this.blockAria(block),
+      style: { "grid-column": `${block.col} / span ${block.span}`, "grid-row": `${place.row} / span ${place.rows}` },
+    }, [
+      qtNode("span", { class: "qt-tag", text: qtBlockLabel(block) }),
+      this.blockBody(t, block, place),
+      selected ? qtNode("span", { class: "qt-handle", "data-handle": "span", title: "Drag to change how many columns it spans" }) : null,
+    ]);
+    node.addEventListener("pointerdown", (event) => {
+      const onHandle = event.target?.getAttribute?.("data-handle") === "span";
+      this.startBlockDrag(event, key, onHandle ? "span" : "move");
+    });
+    node.addEventListener("click", () => { if (!this.dragMoved) { this.selectBlock(key); this.focusBlock(key); } });
+    node.addEventListener("keydown", (event) => this.blockKey(event, key));
+    return node;
+  }
+
+  blockBody(t, block, place) {
+    if (block.type === "logo") {
+      // Placeholder at the logo's real width (what the checks measure); its height stays inside the block.
+      const height = Math.min(qtMmPx(block.logo.width_mm * this.logoAspect), place.rows * qtRowPx(t) - 6);
+      return qtNode("div", { class: "qt-logo", style: { width: `${qtMmPx(block.logo.width_mm)}px`, height: `${height}px` }, text: "Your logo" });
+    }
+    if (block.type === "item_table") return this.tableBody(t, block);
+    const style = block.style || {};
+    return qtNode("div", { class: "qt-text", style: { "font-size": `${qtPtPx(style.size_pt || t.theme.size_pt)}px`, color: style.color || t.theme.color } },
+      this.textLines(t, block).map((line) => this.lineNode(t, line)));
+  }
+
+  textLines(t, block) {
+    const labels = t.labels;
+    const out = [];
+    const add = (text, heading) => out.push({ text, heading: Boolean(heading) });
+    switch (block.type) {
+      case "company_details":
+        block.fields.forEach((field) => {
+          if (field === "header_lines") QT_SAMPLE.company.forEach((line) => add(line));
+          else if (field === "project_number") add(`${labels.project_number} 0000`);
+          else add("");
+        });
+        break;
+      case "client_details":
+        block.fields.forEach((field) => {
+          if (field === "client_name") add(QT_SAMPLE.client);
+          else if (field === "client_address") QT_SAMPLE.address.slice(0, block.address_rows).forEach((line) => add(line));
+          else if (field === "attention") add(`${labels.attention} Sample contact`);
+          else if (field === "client_title") add("Sample job title");
+          else add("");
+        });
+        break;
+      case "quote_details":
+        block.fields.forEach((field) => {
+          if (field === "quote_date") add("Quote date: 21 Nov 2026");
+          else if (field === "project_title") add("Sample booth project");
+          else if (field === "project_number") add(`${labels.project_number} 0000`);
+          else add("");
+        });
+        break;
+      case "totals": add(""); out.push({ total: true }); break;
+      case "free_text": if (block.heading) add(block.heading, true); block.lines.forEach((line) => add(line)); break;
+      case "terms": add("Terms", true); add("Sample payment terms line."); break;
+      case "notes": add("Notes", true); add("Sample note line."); break;
+      case "signature": add("Signature", true); add(""); out.push({ sign: true }); break;
+      case "acceptance": add("Acceptance", true); add("Accepted by"); out.push({ sign: true }); break;
+      default: break;
+    }
+    return out;
+  }
+
+  lineNode(t, line) {
+    if (line.sign) return qtNode("div", { class: "qt-sign" });
+    if (line.total) return qtNode("div", { class: "qt-total" }, [qtNode("span", { text: t.labels.total }), qtNode("span", { text: `SGD ${QT_SAMPLE.total}` })]);
+    return qtNode("div", { class: line.heading ? "qt-heading" : "qt-line", style: line.heading ? { color: t.theme.heading_color } : null, text: line.text });
+  }
+
+  tableBody(t, block) {
+    const columns = t.grid.columns.slice(block.col - 1, block.col - 1 + block.span);
+    const size = (block.style && block.style.size_pt) || t.theme.size_pt;
+    const grid = qtNode("div", { class: "qt-table", style: { "grid-template-columns": qtTrackList(columns), "font-size": `${qtPtPx(size)}px` } });
+    let row = 0;
+    const addRow = (cells, kind) => {
+      row += 1;
+      cells.forEach((cell) => {
+        const style = { "grid-column": `${cell.col - block.col + 1} / span ${cell.span}`, "grid-row": String(row), "text-align": cell.align };
+        if (kind === "head") style.color = t.theme.heading_color;
+        grid.appendChild(qtNode("div", { class: `qt-cell${kind ? ` is-${kind}` : ""}`, style, text: cell.text }));
+      });
+    };
+    if (block.currency_row) addRow(block.columns.map((column) => ({ col: column.col, span: column.span, align: column.align, text: column.key === "amount" ? "SGD" : "" })), null);
+    addRow(block.columns.map((column) => ({ col: column.col, span: column.span, align: column.align, text: column.label })), "head");
+    QT_SAMPLE_ROWS.forEach((sample) => {
+      addRow(block.columns.map((column) => ({ col: column.col, span: column.span, align: column.item_align || column.align, text: sample[column.key] || "" })), "item");
+    });
+    return grid;
+  }
+
+  /* ---------- Zoom ---------- */
+
+  fitZoom() {
+    const available = this.el("qtStage")?.clientWidth || 0;
+    if (!available || !this.paperW) return 1;
+    return qtClamp(Math.floor(available / this.paperW * 100) / 100, 0.3, 1);
+  }
+
+  // Smallest zoom at which the smallest text on the page is still 12 px on screen (the UI standard's floor).
+  readableZoom() {
+    const t = this.editor.draft.t;
+    const sizes = [t.theme.size_pt];
+    t.blocks.forEach((block) => { if (block.style && block.style.size_pt) sizes.push(block.style.size_pt); });
+    return qtClamp(12 / qtPtPx(Math.min(...sizes)), 0.3, 1);
+  }
+
+  // "auto" (the default) fits the page to the width but never shrinks text below readable, so a phone pans
+  // sideways instead. "fit" shows the whole page width. A number is a fixed zoom from the minus and plus buttons.
+  currentZoom() {
+    if (this.zoomLock) return this.zoomLock;
+    if (this.zoom === "fit") return this.fitZoom();
+    if (this.zoom === "auto") return Math.max(this.fitZoom(), this.readableZoom());
+    return this.zoom;
+  }
+
+  applyZoom() {
+    if (!this.editor) return;
+    const zoom = this.currentZoom();
+    const wrap = this.el("qtPaperWrap");
+    if (wrap.style.zoom !== String(zoom)) {
+      wrap.style.zoom = String(zoom);
+      wrap.style.setProperty("--qt-z", String(zoom));
+    }
+    this.el("qtZoomValue").textContent = `${Math.round(zoom * 100)}%`;
+    this.el("qtZoomFit").hidden = Math.abs(zoom - this.fitZoom()) < 0.005;
+    this.el("qtPanNote").hidden = zoom <= this.fitZoom() + 0.005;
+  }
+
+  stepZoom(delta) {
+    this.zoom = qtClamp(Math.round((this.currentZoom() + delta) * 10) / 10, 0.3, 1.5);
+    this.applyZoom();
+  }
+
+  /* ---------- Direct editing: select, drag, keys ---------- */
+
+  focusBlock(key) { document.querySelector(`#qtPaperWrap [data-block="${key}"]`)?.focus({ preventScroll: true }); }
+
+  selectBlock(key) {
+    this.selectedKey = key;
+    this.selectedCol = null;
+    this.tableNote = "";
+    this.gridNote = "";
+    this.renderAll();
+  }
+
+  selectColumn(index) {
+    this.selectedCol = index;
+    this.selectedKey = null;
+    this.gridNote = "";
+    this.renderAll();
+    document.querySelector(`#qtPaperWrap .qt-ruler-cell[data-col="${index}"]`)?.focus({ preventScroll: true });
+  }
+
+  selectNone() {
+    this.selectedKey = null;
+    this.selectedCol = null;
+    this.renderAll();
+  }
+
+  // Page column under a screen x position, 1-based, from the ruler cells.
+  colIndexAt(x) {
+    const slots = document.querySelectorAll("#qtPaperWrap .qt-ruler-slot");
+    if (!slots.length) return 1;
+    for (let i = 0; i < slots.length; i += 1) {
+      if (x < slots[i].getBoundingClientRect().right) return i + 1;
+    }
+    return slots.length;
+  }
+
+  onPointerEnd(move, up) {
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
+    return () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
+    };
+  }
+
+  startBlockDrag(event, key, mode) {
+    if (event.button !== 0) return;
+    const draft = this.editor.draft;
+    const block = draft.block(key);
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const startIdx = this.colIndexAt(startX);
+    const startCol = block.col;
+    const startRow = block.row;
+    const zoom = this.currentZoom();
+    const rowPx = qtRowPx(draft.t);
+    this.dragMoved = false;
+    this.zoomLock = zoom;
+    if (mode === "span") event.preventDefault();
+    const stop = this.onPointerEnd((moveEvent) => {
+      if (!this.dragMoved && Math.abs(moveEvent.clientX - startX) + Math.abs(moveEvent.clientY - startY) < 5) return;
+      if (!this.dragMoved) {
+        this.dragMoved = true;
+        this.selectedKey = key;
+        this.selectedCol = null;
+        document.body.classList.add(mode === "span" ? "qt-resizing" : "qt-dragging");
+      }
+      const index = this.colIndexAt(moveEvent.clientX);
+      if (mode === "span") {
+        draft.setSpan(block, index - block.col + 1);
+      } else {
+        draft.setCol(block, startCol + index - startIdx);
+        if (block.area === "header") draft.setRow(block, startRow + Math.round((moveEvent.clientY - startY) / (rowPx * zoom)));
+      }
+      this.renderPaper();
+      this.renderStatus();
+    }, () => {
+      stop();
+      this.zoomLock = null;
+      document.body.classList.remove("qt-resizing", "qt-dragging");
+      if (this.dragMoved) {
+        this.renderAll();
+        this.focusBlock(key);
+        setTimeout(() => { this.dragMoved = false; }, 0);
+      }
+    });
+  }
+
+  startWidthDrag(event, index) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const draft = this.editor.draft;
+    const column = draft.t.grid.columns[index];
+    const startX = event.clientX;
+    const startWidth = column.width;
+    const zoom = this.currentZoom();
+    this.zoomLock = zoom;
+    this.dragMoved = false;
+    document.body.classList.add("qt-resizing");
+    const stop = this.onPointerEnd((moveEvent) => {
+      if (Math.abs(moveEvent.clientX - startX) > 2) this.dragMoved = true;
+      const width = qtClamp(Math.round((startWidth + (moveEvent.clientX - startX) / zoom / 7) * 8) / 8, QT_RULES.widthMin, QT_RULES.widthMax);
+      if (width !== column.width) {
+        draft.setColumnWidth(index, width);
+        this.selectedCol = index;
+        this.selectedKey = null;
+        this.renderPaper();
+        this.renderStatus();
+        document.querySelector(`#qtPaperWrap .qt-col-handle[data-col="${index}"]`)?.classList.add("is-active");
+      }
+    }, () => {
+      stop();
+      this.zoomLock = null;
+      document.body.classList.remove("qt-resizing");
+      this.selectedCol = index;
+      this.selectedKey = null;
+      this.renderAll();
+      setTimeout(() => { this.dragMoved = false; }, 0);
+    });
+  }
+
+  blockKey(event, key) {
+    const draft = this.editor.draft;
+    const block = draft.block(key);
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      const dx = event.key === "ArrowLeft" ? -1 : 1;
+      if (event.shiftKey) draft.setSpan(block, block.span + dx); else draft.setCol(block, block.col + dx);
+    } else if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+      const dy = event.key === "ArrowUp" ? -1 : 1;
+      if (block.area === "header") {
+        if (event.shiftKey) draft.setRows(block, block.rows + dy); else draft.setRow(block, block.row + dy);
+      } else {
+        draft.moveInOrder(block, dy);
+      }
+    } else {
+      return;
+    }
+    event.preventDefault();
+    this.selectedKey = key;
+    this.selectedCol = null;
+    this.renderAll();
+    this.focusBlock(key);
+  }
+
+  /* ---------- Side panel ---------- */
+
+  renderSide() {
+    const draft = this.editor.draft;
+    const t = draft.t;
+    const side = this.el("qtSide");
+    const active = document.activeElement;
+    const fk = active && side.contains(active) ? active.getAttribute("data-fk") : null;
+    const block = this.selectedKey ? draft.block(this.selectedKey) : null;
+    side.textContent = "";
+    if (block) this.renderBlockPanel(side, draft, block);
+    else if (this.selectedCol !== null && t.grid.columns[this.selectedCol]) this.renderColumnPanel(side, draft, this.selectedCol);
+    else this.renderStylePanel(side, draft);
+    if (fk) {
+      const again = side.querySelector(`[data-fk="${fk}"]`);
+      if (again && !again.disabled) again.focus();
+    }
+  }
+
+  panelHead(eyebrow, title, closable) {
+    return qtNode("div", { class: "qt-panel-head" }, [
+      qtNode("div", null, [qtNode("span", { class: "qt-eyebrow", text: eyebrow }), qtNode("h5", { text: title })]),
+      closable ? qtNode("button", { type: "button", class: "secondary-button qt-btn-quiet qt-icon-btn", "aria-label": "Done, show page style", title: "Done", onclick: () => this.selectNone() }, [qtIcon("x")]) : null,
+    ]);
+  }
+
+  // Problems box: all problems when nothing is selected (each one jumps to its block), or one block's problems.
+  problemsBox(draft, only) {
+    const list = draft.problems().filter((problem) => !only || problem.key === only);
+    const box = qtNode("div", { class: "qt-problems", id: "qtSideProblems", role: "status", hidden: !list.length });
+    if (list.length) {
+      box.appendChild(qtNode("strong", { text: only ? "Fix before saving" : (list.length === 1 ? "1 thing to fix before saving" : `${list.length} things to fix before saving`) }));
+      list.forEach((problem) => {
+        box.appendChild(only || !problem.key
+          ? qtNode("p", { class: "qt-problem", text: problem.text })
+          : qtNode("button", { type: "button", class: "qt-problem", text: problem.text, onclick: () => { this.selectBlock(problem.key); this.revealBlock(problem.key); } }));
+      });
+    }
+    return box;
+  }
+
+  refreshProblems() {
+    const old = this.el("qtSideProblems");
+    if (old) old.replaceWith(this.problemsBox(this.editor.draft, this.selectedKey));
+  }
+
+  renderStylePanel(side, draft) {
+    const theme = draft.t.theme;
+    side.appendChild(this.panelHead("Whole page", "Page style", false));
+    side.appendChild(this.problemsBox(draft, null));
+    const font = this.selectControl([{ value: "Calibri", label: "Calibri" }, { value: "Arial", label: "Arial" }], theme.font, (value) => { theme.font = value; this.renderAll(); });
+    font.setAttribute("data-fk", "font");
+    font.setAttribute("aria-label", "Font");
+    side.appendChild(qtNode("div", { class: "qt-pair" }, [
+      this.field("Font", font),
+      this.stepper("Text size (pt)", "size", theme.size_pt, { min: QT_RULES.sizeMin, max: QT_RULES.sizeMax, step: QT_RULES.sizeStep }, (value) => { theme.size_pt = value; this.renderAll(); }),
+    ]));
+    side.appendChild(qtNode("div", { class: "qt-pair" }, [
+      this.colorField("Text colour", "color", theme.color, (value) => { theme.color = value; this.refreshLive(); }),
+      this.colorField("Heading colour", "hcolor", theme.heading_color, (value) => { theme.heading_color = value; this.refreshLive(); }),
+    ]));
+    side.appendChild(this.columnsGroup(draft));
+  }
+
+  columnsGroup(draft) {
+    const columns = draft.t.grid.columns;
+    const visible = draft.visibleColumnCount();
+    const body = qtNode("tbody", null, columns.map((column, index) => qtNode("tr", { class: this.selectedCol === index ? "is-selected" : null }, [
+      qtNode("td", null, [qtNode("button", { type: "button", class: "qt-col-letter", text: qtLetter(index + 1), "aria-label": `Select column ${qtLetter(index + 1)}`, onclick: () => this.selectColumn(index) })]),
+      qtNode("td", null, [column.hidden ? qtNode("span", { class: "qt-muted", text: "Hidden" }) : qtNode("input", {
+        type: "number", min: String(QT_RULES.widthMin), max: String(QT_RULES.widthMax), step: "0.5", value: qtFormat(column.width), "data-fk": `w${index}`,
+        "aria-label": `Width of column ${qtLetter(index + 1)}`,
+        onchange: (event) => { const width = parseFloat(event.target.value); if (!Number.isNaN(width)) draft.setColumnWidth(index, width); this.renderAll(); },
+      })]),
+      qtNode("td", null, [qtNode("label", { class: "qt-check" }, [
+        qtNode("input", { type: "checkbox", checked: Boolean(column.hidden), disabled: !column.hidden && visible <= 1, "data-fk": `hid${index}`, "aria-label": `Hide column ${qtLetter(index + 1)}`, onchange: (event) => { draft.setColumnHidden(index, event.target.checked); this.renderAll(); } }),
+      ])]),
+    ])));
+    const group = qtNode("div", { class: "qt-group" }, [
+      qtNode("div", { class: "qt-subhead" }, [qtNode("h6", { text: "Columns" }), qtNode("span", { class: "qt-muted", text: `${columns.length} columns` })]),
+      qtNode("p", { class: "qt-help", text: "Width is the number Excel shows for the column. Hidden columns do not print." }),
+      qtNode("table", { class: "qt-cols" }, [qtNode("thead", null, [qtNode("tr", null, [qtNode("th", { text: "Col" }), qtNode("th", { text: "Width" }), qtNode("th", { text: "Hidden" })])]), body]),
+      qtNode("div", { class: "qt-row-buttons" }, [
+        qtNode("button", { type: "button", class: "secondary-button qt-btn-quiet qt-btn-sm", disabled: columns.length >= QT_RULES.gridMax, onclick: () => { this.gridNote = draft.addGridColumn(); this.renderAll(); } }, [qtIcon("plus"), "Add column"]),
+        qtNode("button", { type: "button", class: "secondary-button qt-btn-quiet qt-btn-sm", disabled: columns.length <= QT_RULES.gridMin, onclick: () => this.removeGridColumn() }, [`Remove column ${qtLetter(columns.length)}`]),
+      ]),
+    ]);
+    if (this.gridNote) group.appendChild(qtNode("p", { class: "qt-field-error", role: "alert", text: this.gridNote }));
+    return group;
+  }
+
+  removeGridColumn() {
+    const draft = this.editor.draft;
+    this.gridNote = draft.removeGridColumn();
+    if (this.selectedCol !== null && this.selectedCol >= draft.t.grid.columns.length) this.selectedCol = null;
+    this.renderAll();
+  }
+
+  renderColumnPanel(side, draft, index) {
+    const column = draft.t.grid.columns[index];
+    const visible = draft.visibleColumnCount();
+    const users = draft.blocksUsingColumn(index + 1);
+    side.appendChild(this.panelHead("Page column", `Column ${qtLetter(index + 1)}`, true));
+    if (column.hidden) {
+      side.appendChild(qtNode("p", { class: "qt-help", text: "This column is hidden, so it does not print. Its width is kept for when it is shown again." }));
+    } else {
+      side.appendChild(this.stepper("Width", "cw", column.width, { min: QT_RULES.widthMin, max: QT_RULES.widthMax, step: 0.5, help: "The number Excel shows for the column width. You can also drag the column edge on the ruler." },
+        (value) => { draft.setColumnWidth(index, value); this.renderAll(); }));
+    }
+    side.appendChild(qtNode("label", { class: "qt-check" }, [
+      qtNode("input", { type: "checkbox", checked: Boolean(column.hidden), disabled: !column.hidden && visible <= 1, "data-fk": "chid", onchange: (event) => { draft.setColumnHidden(index, event.target.checked); this.renderAll(); } }),
+      "Hidden (does not print)",
+    ]));
+    side.appendChild(qtNode("div", { class: "qt-group" }, [
+      qtNode("h6", { text: users.length ? "Used by" : "Not used by any block" }),
+      users.length ? qtNode("div", { class: "qt-chips" }, users.map((block) => {
+        const key = draft.keyOf(block);
+        return qtNode("button", { type: "button", class: "qt-chip", text: qtBlockLabel(block), onclick: () => { this.selectBlock(key); this.revealBlock(key); } });
+      })) : null,
+    ]));
+  }
+
+  renderBlockPanel(side, draft, block) {
+    const t = draft.t;
+    const columnCount = t.grid.columns.length;
+    const header = block.area === "header";
+    side.appendChild(this.panelHead(header ? "Top of the page" : "Below the top section", qtBlockLabel(block), true));
+    side.appendChild(this.problemsBox(draft, draft.keyOf(block)));
+    const position = qtNode("div", { class: "qt-group" }, [qtNode("h6", { text: "Position" })]);
+    if (header) {
+      position.appendChild(qtNode("div", { class: "qt-pair" }, [
+        this.stepper("Starts at row", "row", block.row, { min: 1, max: t.header.rows - block.rows + 1, step: 1 }, (value) => { draft.setRow(block, value); this.renderAll(); }),
+        this.stepper("Rows tall", "rows", block.rows, { min: 1, max: t.header.rows - block.row + 1, step: 1 }, (value) => { draft.setRows(block, value); this.renderAll(); }),
+      ]));
+    }
+    const startCol = this.selectControl(this.letterOptions(1, columnCount - block.span + 1), block.col, (value) => { draft.setCol(block, Number(value)); this.renderAll(); });
+    startCol.setAttribute("data-fk", "col");
+    startCol.setAttribute("aria-label", "Starts at column");
+    position.appendChild(qtNode("div", { class: "qt-pair" }, [
+      this.field("Starts at column", startCol),
+      this.stepper("Spans (columns)", "span", block.span, { min: 1, max: columnCount - block.col + 1, step: 1 }, (value) => { draft.setSpan(block, value); this.renderAll(); }),
+    ]));
+    if (!header) {
+      const body = draft.bodyBlocks();
+      const at = body.indexOf(block);
+      position.appendChild(this.field("Order", qtNode("div", { class: "qt-order" }, [
+        qtNode("button", { type: "button", class: "secondary-button qt-btn-sm", "data-fk": "up", disabled: at <= 0, onclick: () => { draft.moveInOrder(block, -1); this.renderAll(); } }, [qtIcon("up"), "Move up"]),
+        qtNode("button", { type: "button", class: "secondary-button qt-btn-sm", "data-fk": "down", disabled: at >= body.length - 1, onclick: () => { draft.moveInOrder(block, 1); this.renderAll(); } }, [qtIcon("down"), "Move down"]),
+      ])));
+    }
+    position.appendChild(qtNode("p", { class: "qt-help", text: header
+      ? "Drag it on the page, or use the arrow keys. Shift and arrow keys change its size."
+      : "Drag it sideways on the page, or use the arrow keys. Up and down change its order." }));
+    side.appendChild(position);
+
+    if (block.type === "logo") {
+      const fit = qtLogoFitMm(t, block);
+      side.appendChild(qtNode("div", { class: "qt-group" }, [
+        this.stepper("Logo width (mm)", "logo", block.logo.width_mm, { min: QT_RULES.logoMin, max: QT_RULES.logoMax, step: 0.5 }, (value) => { block.logo.width_mm = value; this.renderAll(); }),
+        qtNode("p", { class: `qt-fit${block.logo.width_mm > fit ? " is-over" : ""}`, id: "qtLogoFit", text: fit > 0 ? `Fits up to ${qtFormat(fit)} mm in this space.` : "Its column is hidden, so it will not print." }),
+      ]));
+    }
+    // Text size (and colour for free text) only where the layout already sets the block's own text style.
+    if (block.style && Object.keys(block.style).length) {
+      const styleGroup = qtNode("div", { class: "qt-group" }, [qtNode("h6", { text: "Text" })]);
+      const pair = qtNode("div", { class: "qt-pair" }, [
+        this.stepper("Size (pt)", "bsize", block.style.size_pt || t.theme.size_pt, { min: QT_RULES.sizeMin, max: QT_RULES.sizeMax, step: QT_RULES.sizeStep }, (value) => { block.style.size_pt = value; this.renderAll(); }),
+      ]);
+      if (block.type === "free_text") pair.appendChild(this.colorField("Colour", "bcolor", block.style.color || t.theme.color, (value) => { block.style.color = value; this.refreshLive(); }));
+      styleGroup.appendChild(pair);
+      side.appendChild(styleGroup);
+    }
+    if (block.type === "item_table") side.appendChild(this.tableColumnsGroup(draft, block));
+  }
+
+  tableColumnsGroup(draft, table) {
+    const group = qtNode("div", { class: "qt-group qt-tcols" }, [
+      qtNode("div", { class: "qt-subhead" }, [qtNode("h6", { text: "Table columns" }), qtNode("span", { class: "qt-muted", text: "Left to right" })]),
+    ]);
+    table.columns.slice().sort((a, b) => a.col - b.col).forEach((column) => group.appendChild(this.tableColumnRow(draft, table, column)));
+    group.appendChild(qtNode("div", { class: "qt-row-buttons" }, [
+      qtNode("button", {
+        type: "button", class: "secondary-button qt-btn-quiet qt-btn-sm", disabled: table.columns.length >= QT_RULES.maxTableColumns || !draft.nextTableKey(table),
+        onclick: () => { this.tableNote = draft.addTableColumn(table); this.renderAll(); },
+      }, [qtIcon("plus"), "Add column"]),
+    ]));
+    if (this.tableNote) group.appendChild(qtNode("p", { class: "qt-field-error", role: "alert", text: this.tableNote }));
+    return group;
+  }
+
+  tableColumnRow(draft, table, column) {
+    const last = table.col + table.span - 1;
+    const kind = QT_COLUMN_KINDS[column.key];
+    const required = QT_RULES.requiredKeys.includes(column.key);
+    const segment = qtNode("div", { class: "qt-seg", role: "group", "aria-label": "Alignment" }, QT_RULES.alignments.map((align, index) => qtNode("button", {
+      type: "button", "aria-pressed": column.align === align ? "true" : "false", "aria-label": QT_RULES.alignmentLabels[index], title: QT_RULES.alignmentLabels[index],
+      "data-fk": `al-${column.key}-${align}`, onclick: () => { draft.setTableColumnAlign(column, align); this.renderAll(); },
+    }, [qtIcon(align)])));
+    return qtNode("div", { class: "qt-tcol" }, [
+      qtNode("div", { class: "qt-tcol-top" }, [
+        qtNode("input", { type: "text", maxlength: String(QT_RULES.labelMax), value: column.label, "data-fk": `tl-${column.key}`, "aria-label": `Heading for the ${kind.toLowerCase()} column`, oninput: (event) => { column.label = event.target.value; this.refreshLive(); } }),
+        required ? qtNode("span", { class: "qt-req", text: "Required", title: "Every quote needs this column." })
+          : qtNode("button", { type: "button", class: "secondary-button qt-btn-quiet qt-icon-btn", "aria-label": `Remove the ${column.label || kind} column`, title: "Remove column", onclick: () => { draft.removeTableColumn(table, column.key); this.tableNote = ""; this.renderAll(); } }, [qtIcon("x")]),
+      ]),
+      qtNode("span", { class: "qt-tcol-kind", text: `Shows: ${kind}` }),
+      qtNode("div", { class: "qt-tcol-bottom" }, [
+        this.miniSelect("Column", `tc-${column.key}`, this.letterOptions(table.col, last), column.col, (value) => { draft.setTableColumnCol(table, column, Number(value)); this.renderAll(); }),
+        this.miniSelect("Spans", `ts-${column.key}`, qtRange(1, last - column.col + 1).map((n) => ({ value: n, label: String(n) })), column.span, (value) => { draft.setTableColumnSpan(table, column, Number(value)); this.renderAll(); }),
+        qtNode("div", { class: "qt-mini" }, ["Align", segment]),
+      ]),
+    ]);
+  }
+
+  /* ---------- Status, problems and refresh ---------- */
+
+  revealBlock(key) {
+    const node = document.querySelector(`#qtPaperWrap [data-block="${key}"]`);
+    if (node) { node.scrollIntoView({ block: "center", inline: "nearest", behavior: "smooth" }); node.focus({ preventScroll: true }); }
+  }
+
+  goToProblem() {
+    if (!this.editor) return;
+    const problems = this.editor.draft.problems();
+    if (!problems.length) return;
+    const first = problems.find((problem) => problem.key) || null;
+    if (first) { this.selectBlock(first.key); this.revealBlock(first.key); } else { this.selectNone(); }
+  }
+
+  renderStatus() {
+    if (!this.editor) return;
+    const problems = this.editor.draft.problems();
+    const status = this.el("qtStatus");
+    status.className = `qt-status ${problems.length ? "is-bad" : "is-ok"}`;
+    status.textContent = problems.length ? (problems.length === 1 ? "1 thing to fix" : `${problems.length} things to fix`) : "Ready to save";
+    status.setAttribute("aria-disabled", problems.length ? "false" : "true");
+    status.title = problems.length ? "Show what to fix" : "";
+    if (this.editor.discardAskedFor !== null && !this.discardAsked()) this.resetCancel();
+    if (!this.noteTimer) this.el("qtFooterNote").textContent = this.discardAsked() ? QT_DISCARD_NOTE : this.isDirty() ? "Unsaved changes" : "";
+  }
+
+  renderAll() {
+    if (!this.editor) return;
+    this.renderPaper();
+    this.renderSide();
+    this.renderStatus();
+  }
+
+  // Used while typing or picking a colour, so the side panel keeps its focus.
+  refreshLive() {
+    if (!this.editor) return;
+    this.renderPaper();
+    this.renderStatus();
+    this.refreshProblems();
+  }
+
+  /* ---------- Delete confirm ---------- */
+
+  openDelete(id) {
+    const template = this.template(id);
+    if (!template || template.builtin) return;
+    const isDefault = this.list.defaultId === template.id;
+    const nextDefault = isDefault ? "Standard" : (this.template(this.list.defaultId)?.name || "Standard");
+    const parts = [];
+    if (template.usage > 0) {
+      // Profiles set to Workspace default follow it without a note, and the default's count includes them.
+      const noted = isDefault ? "" : " and say so on their next quote";
+      parts.push(`${template.usage === 1 ? "1 company profile uses it. It" : `${template.usage} company profiles use it. They`} will switch to the workspace default (${nextDefault})${noted}.`);
+    }
+    if (isDefault) parts.push("It is the workspace default, so Standard becomes the default.");
+    parts.push("Quotes already made keep their layout.");
+    // The delete names exactly what this dialog shows, even if the list is loaded again behind it.
+    this.deleteTarget = { id, name: template.name, saveNumber: template.save_number, isDefault };
+    this.renderList();
+    this.el("qtDeleteTitle").textContent = `Delete "${template.name}"?`;
+    this.el("qtDeleteDetail").textContent = parts.join(" ");
+    this.setNotice(this.el("qtDeleteError"), "");
+    this.el("qtDeleteConfirm").disabled = false;
+    this.el("qtDeleteModal").hidden = false;
+    this.el("qtDeleteCancel").focus();
+  }
+
+  closeDeleteModal() {
+    if (this.el("qtDeleteModal")) this.el("qtDeleteModal").hidden = true;
+    this.deleteTarget = null;
+  }
+
+  closeDelete() {
+    if (this.deleteBusy) return;
+    const id = this.deleteTarget?.id;
+    this.closeDeleteModal();
+    this.focusRow(id);
+  }
+
+  async confirmDelete() {
+    const target = this.deleteTarget;
+    if (!target || this.deleteBusy) { this.closeDelete(); return; }
+    this.deleteBusy = true;
+    this.el("qtDeleteConfirm").disabled = true;
+    this.setNotice(this.el("qtDeleteError"), "");
+    const { ok, status, data } = await this.api.delete(`${QT_API}/${encodeURIComponent(target.id)}?save_number=${encodeURIComponent(target.saveNumber)}`);
+    this.deleteBusy = false;
+    if (!ok) {
+      // Changed or gone: this dialog no longer shows what would be deleted, so Delete stays off until it is opened again.
+      const outdated = status === 409 || status === 404;
+      this.el("qtDeleteConfirm").disabled = outdated;
+      this.setNotice(this.el("qtDeleteError"), status === 409
+        ? "Someone changed this template since the list loaded. Close this, check the list, then try again."
+        : status === 404 ? "This template was already deleted. Close this to see the list." : this.failureText(data));
+      this.el(outdated ? "qtDeleteCancel" : "qtDeleteConfirm").focus();
+      this.loadList();
+      return;
+    }
+    this.closeDeleteModal();
+    await this.loadList();
+    this.setBanner(this.el("qtListStatus"), "Deleted.", `"${target.name}" is gone.${target.isDefault ? " Standard is now the default." : ""}`);
+    this.focusRow(null);
+  }
+
+  /* ---------- Company Profile "Quote template" dropdown ---------- */
+
+  // The saved company profile picked in Current Profile, or null for a built-in profile template.
+  selectedCompanyProfile(preset) {
+    if (preset?.source !== "company") return null;
+    return state.companyProfiles.find((profile) => safeProfileId(profile.id || profile.label, "") === preset.id) || null;
+  }
+
+  profileTemplates() {
+    const templates = state.quoteTemplateChoices?.templates;
+    return Array.isArray(templates) ? templates : [];
+  }
+
+  // What the profile has now. One saved before templates existed keeps its own layout until a template is picked.
+  profileChoice(profile) {
+    const stored = profile && typeof profile.quote_template_id === "string" ? profile.quote_template_id : "";
+    if (!stored) return "own";
+    return stored === "default" || this.profileTemplates().some((template) => template.id === stored) ? stored : "default";
+  }
+
+  renderProfileField({ preset, canManageProfiles, busy }) {
+    const select = this.el("quoteTemplateSelect");
+    const note = this.el("quoteTemplateNote");
+    if (!select || !note) return;
+    const choices = state.quoteTemplateChoices;
+    const templates = this.profileTemplates();
+    const profile = this.selectedCompanyProfile(preset);
+    const value = this.profileChoice(profile);
+    if (this.profilePick?.profileId !== profile?.id) this.profilePick = null;
+    select.textContent = "";
+    // A profile with a layout of its own can always go back to it.
+    if (value === "own" || profile?.own_layout === true) select.appendChild(qtNode("option", { value: "own", text: "Profile's own layout" }));
+    select.appendChild(qtNode("option", { value: "default", text: "Workspace default" }));
+    if (templates.length) {
+      select.appendChild(qtNode("optgroup", { label: "Templates" }, templates.map((template) => qtNode("option", { value: template.id, text: `${template.name}${template.builtin ? " (built in)" : ""}` }))));
+    }
+    if (this.profilePick) select.value = this.profilePick.choice;
+    if (!this.profilePick || select.value !== this.profilePick.choice) { this.profilePick = null; select.value = value; }
+    const editable = Boolean(choices?.available && profile && canManageProfiles && profile.permissions?.canUpdate !== false && Number.isInteger(profile.revision ?? profile._revision));
+    // While its own choice is being saved the field keeps the focus and takes no other (see profileFieldChanged).
+    select.disabled = !editable || busy;
+    select.setAttribute("aria-disabled", String(select.disabled || this.profileSaveBusy));
+    const defaultName = templates.find((template) => template.id === choices?.default_template_id)?.name || "Standard";
+    if (this.profileSaveBusy) note.textContent = "Saving…";
+    else if (choices && !choices.available) note.textContent = "Quote templates are not available on this server.";
+    else if (!editable) note.textContent = "Read-only profile";
+    else note.textContent = `Workspace default: ${defaultName}`;
+  }
+
+  // Arrow keys and letters on the closed list step through the options one by one; none of those is a choice
+  // yet. Enter or leaving the field takes the option shown, Escape goes back to the saved one. A click, and a
+  // pick in the opened list, is a choice and saves at once.
+  profileFieldKey(event) {
+    if (["Tab", "Shift", "Control", "Alt", "Meta"].includes(event.key)) return;
+    const opensList = event.key === " " || event.key === "F4" || (event.altKey && ["ArrowDown", "ArrowUp"].includes(event.key));
+    this.profileKeyPick = !opensList && event.key !== "Enter";
+    if (event.key === "Enter" && this.profilePick) {
+      event.preventDefault();
+      this.commitProfilePick();
+    } else if (event.key === "Escape" && this.profilePick) {
+      this.profilePick = null;
+      updatePresetButtons();
+    }
+  }
+
+  profileFieldChanged() {
+    const profile = this.selectedCompanyProfile(selectedPreset());
+    if (!profile || this.profileSaveBusy) { updatePresetButtons(); return; }
+    const choice = this.el("quoteTemplateSelect").value;
+    this.profilePick = choice === this.profileChoice(profile) ? null : { profileId: profile.id, choice };
+    if (!this.profileKeyPick) this.commitProfilePick();
+  }
+
+  commitProfilePick() {
+    if (this.profilePick && !this.profileSaveBusy) this.saveProfileChoice(this.profilePick.choice);
+  }
+
+  async saveProfileChoice(choice) {
+    const preset = selectedPreset();
+    const profile = this.selectedCompanyProfile(preset);
+    if (!profile || profile.id !== this.profilePick?.profileId) return;
+    const templateName = choice === "own" ? "its own layout" : choice === "default" ? "the workspace default"
+      : this.profileTemplates().find((template) => template.id === choice)?.name || "the chosen template";
+    this.profileSaveBusy = true;
+    updatePresetButtons();
+    const { ok, status, data } = await this.api.post("/api/settings/profiles", {
+      operation: "template", id: profile.id, quote_template_id: choice, revision: profile.revision ?? profile._revision ?? 0,
+    });
+    this.profileSaveBusy = false;
+    this.profilePick = null;
+    if (ok && isPlainObject(data?.profile)) {
+      profile.quote_template_id = data.profile.quote_template_id;
+      profile.own_layout = data.profile.own_layout;
+      if (Number.isInteger(data.profile.revision)) profile.revision = data.profile.revision;
+      renderPresetStatus(`"${profile.label || preset.name}" will use ${templateName} for new quotes.`);
+    } else {
+      renderPresetStatus(status === 409
+        ? "This profile changed since the page loaded. Reload the page, then pick the template again."
+        : genericFailureMessage(data));
+    }
+    updatePresetButtons();
+  }
+
+  // Called when the Settings list changes, so the dropdown offers the same templates.
+  static applyChoices(choices) {
+    state.quoteTemplateChoices = choices;
+    updatePresetButtons();
+  }
+}
+
+async function quoteTemplateDeleteRequest(url) {
+  try {
+    const response = await fetch(url, { method: "DELETE", headers: state.csrfToken ? { [state.csrfHeaderName]: state.csrfToken } : {} });
+    const data = await response.json().catch(() => ({}));
+    if (await recoverFromAuthenticationResponse(response, data)) return { ok: false, status: 401, data };
+    return { ok: response.ok, status: response.status, data };
+  } catch (error) {
+    return { ok: false, status: 0, data: {} };
+  }
+}
+
+// Preview files come back as bytes, not JSON; errors come back as JSON.
+async function quoteTemplatePreviewRequest(url, payload) {
+  try {
+    const response = await fetchPostJsonResponse(url, payload);
+    if (response.ok) return { ok: true, status: response.status, blob: await response.blob() };
+    const data = await response.json().catch(() => ({}));
+    if (await recoverFromAuthenticationResponse(response, data)) return { ok: false, status: 401, data };
+    return { ok: false, status: response.status, data };
+  } catch (error) {
+    return { ok: false, status: 0, data: {} };
+  }
+}
+
+const quoteTemplatesSettings = new QuoteTemplatesSettings({
+  api: {
+    get: (url) => getJson(url, { expectedStatus: 503 }),
+    post: (url, payload) => postJson(url, payload),
+    delete: quoteTemplateDeleteRequest,
+    postBlob: quoteTemplatePreviewRequest,
+  },
+  permissions: () => state.permissions,
+  onChoicesChanged: (choices) => QuoteTemplatesSettings.applyChoices(choices),
+});
 
 boot();

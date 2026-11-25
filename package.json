@@ -15,7 +15,8 @@
     "playwright:rehearsal-check": "node --test tests/test_rehearsal_check.mjs tests/test_live_e2e.mjs",
     "playwright:customer-summary": "node scripts/playwright-customer-summary.mjs",
     "playwright:owner-uat-basis": "node scripts/playwright-owner-uat-basis-repair.mjs --lines=24 --latency-ms=800",
-    "playwright:click-budget": "node scripts/playwright-basis-click-budget.mjs"
+    "playwright:click-budget": "node scripts/playwright-basis-click-budget.mjs",
+    "playwright:quote-templates": "node scripts/playwright-quote-templates.mjs"
   },
   "devDependencies": {
     "playwright": "^1.65.0"

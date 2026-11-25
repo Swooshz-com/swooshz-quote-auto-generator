@@ -243,6 +243,8 @@ or deployment behaviour changes accompany this test.
   scaling, margins, page count, and deterministic rendered output.
 - Runs `npm run playwright:ai-stress`.
 - Runs `npm run playwright:internal-auth`.
+- Runs `npm run playwright:quote-templates`: the Settings > Quote Templates editor on a synthetic SQLite
+  database server, admin and operator, including a real PDF preview through the job's LibreOffice.
 - Runs `npm run playwright:smoke` and `npm run playwright:alpha-smoke`, plus `npm run playwright:smoke -- --recovery-only` in a separate
   process with fresh quote state. The isolated `npm run playwright:smoke -- --terminal-only` step checks live
   needs-review, blocked, failed and interrupted polling without reload. `npm run playwright:rehearsal-check` runs
@@ -253,7 +255,7 @@ or deployment behaviour changes accompany this test.
   `SQAG_ARTIFACT_STORAGE_MODE=object`) built by `tests/disposable_database_mode.py`: a uniquely named
   database on the job's disposable PostgreSQL 17 service, migrations through 011 as on live, the runtime
   contract's grants, and an in-memory object store. The harness drops the database (and any roles it
-  created) when it stops. Under `CI=true` a missing PostgreSQL service fails this run instead of skipping it. All seven browser steps remain gated by the successful
+  created) when it stops. Under `CI=true` a missing PostgreSQL service fails this run instead of skipping it. All eight browser steps remain gated by the successful
   `runtime_prerequisites` privilege-contract validation, including after a
   Python test failure.
 - The default app smoke covers reload, saved reopen and generation recovery,

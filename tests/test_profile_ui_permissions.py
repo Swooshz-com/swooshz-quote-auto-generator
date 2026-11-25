@@ -35,7 +35,9 @@ const state = {permissions:{canManageProfiles:true},companyProfiles:[
 let preset = {id:'shared',source:'company',permissions:{canUpdate:false,canDelete:false}};
 const elements = Object.fromEntries(['loadPresetButton','deletePresetButton','savePresetButton',
  'importPresetButton','exportPresetButton','profileActionsMenuButton'].map(key=>[key,button()]));
+const fieldCalls = [];
 const context = {state,elements,selectedPreset:()=>preset,appIsBusy:()=>false,
+  quoteTemplatesSettings:{renderProfileField:(args)=>fieldCalls.push(args)},
   updatePresetSourceBadge(){},closeProfileActionsMenu(){},safeProfileLabel:(x)=>String(x),
   safeProfileId:(x)=>String(x),profilePackPayloadForSave:()=>null,
   collectQuoteCompanyProfileDetails:()=>({}),normalizeCompanyProfile:x=>x};
@@ -58,6 +60,8 @@ preset={id:'owned',source:'company',permissions:{canDelete:true}};
 context.updatePresetButtons(); assert.equal(elements.deletePresetButton.disabled,false);
 state.permissions.canManageProfiles=false;
 context.updatePresetButtons(); assert.equal(elements.savePresetButton.disabled,true);
+// The Quote template dropdown follows the same profile, permission and busy state as the buttons.
+assert.deepEqual(fieldCalls.at(-1),{preset,canManageProfiles:false,busy:false});
 state.permissions.canManageProfiles=true;state.profileSaveBusy=true;
 context.updatePresetButtons(); assert.equal(elements.loadPresetButton.disabled,true);
 assert.equal(elements.exportPresetButton.disabled,true);
