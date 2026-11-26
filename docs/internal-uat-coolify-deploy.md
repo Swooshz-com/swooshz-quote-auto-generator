@@ -488,9 +488,21 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
    on live. Changes made during UAT stay on the copy and are deleted with it.
    - **Agent UAT.** The agent signs in to the copy in a browser as the owner
      would (the owner's email and `SWOOSHZ_SQAG_REHEARSAL_UAT_LOGIN_PASSWORD`)
-     and runs the owner's UAT steps for this release on the copy. Every step
-     must pass before the owner is asked; a failure goes back to the builder.
-     Expect every quote of your own saved on live to reopen with Quote Basis
+     and runs every line of the [release UAT checklist](internal-uat.md) on
+     the copy, plus this release's own UAT steps, and records each with one
+     of the checklist's results (pass, known and planned, fail, not run or
+     not applicable) before the owner is asked. A failure goes back to the
+     builder and blocks the release when no open task's plan covers it and
+     it is new in this release or breaks a safety or pricing rule (the
+     checklist's Results section names those rules and their lines). A
+     safety or pricing failure that a plan covers never passes as known and
+     planned: it goes on the owner's list with its task and slice, and only
+     the owner may defer it. Any other failure a plan covers is known and
+     planned and stays off the owner's list; any other failure goes to its
+     area's open task. The owner's UAT list is the checklist's human-eye
+     lines, the lines and release steps the agent could not run, and each
+     failure that does not block, with a fix-before-live-or-later decision
+     for each. Expect every quote of your own saved on live to reopen with Quote Basis
      locked until Next in Customer is pressed: the copy's `SESSION_SECRET`
      differs from live's (see the Pass A walk above). A quote made by another
      staff member opens view only instead, with no lock: every step with
@@ -510,7 +522,9 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      > only, a quote of yours that you reopen keeps Quote Basis locked until
      > you press Next in Customer; live does not do this. A quote another
      > staff member made opens view only, on the copy and on live. The agent's
-     > UAT passed: <evidence link>. UAT steps: <the release's UAT list>. It
+     > UAT passed: <evidence link>. Please check only these: <the gaps list>.
+     > Please decide fix before live or later for each of these failures:
+     > <each non-blocking failure, with its task and slice where planned>. It
      > stays up until <hand-off time + 24 hours> unless you extend it. Reply
      > "UAT pass <short>" to deploy it to live, or tell me what failed.
 

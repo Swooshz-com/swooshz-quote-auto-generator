@@ -53,3 +53,27 @@ brief and produces the XLSX with the selected profile layout or quote template.
 
 The external quotation API remains disabled. Staff access and persisted quote
 data are governed by the existing server and storage boundaries.
+
+## Request database work
+
+Each HTTP GET or POST, and each stage of an Excel or PDF job, runs inside one
+`RequestWork` (`webapp/server.py`). It owns that request's database
+connections and the schema checks that passed. A block that asks for a
+connection gets one that no other block holds. When the block ends cleanly the
+connection is rolled back and kept for the next block with the same database
+URL and session role, for at most 30 seconds; an error leaving the block, or a
+failed rollback, closes it. A block opened inside another gets its own
+connection, so transactions, locks and what each one sees stay as before. The
+PostgreSQL role check runs once per physical connection. A passed schema check
+is not repeated in the same request or stage; a failed one is. A job closes its
+idle connections before the generator runs, and publication is a new stage.
+Only the thread that started the request sees its `RequestWork`. Deletes,
+draft and basis-chat jobs, retention, migrations, scripts and warm-up open one
+connection per block as before. Nothing outlives the request: there is no
+connection pool and no cache. Because a rollback does not reset session-level
+PostgreSQL state, code that runs on these connections must not use any: no
+`SET` without `LOCAL`, no `set_config(..., false)`, no session advisory locks
+(use the `_xact_` forms) and no temporary tables. Each returned connection costs
+one rollback round trip when its block left a transaction open; closing it
+used not to wait. `tests/test_request_work_budget.py` holds each
+route's connection, schema-check, statement and object-read counts.

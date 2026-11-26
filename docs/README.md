@@ -19,8 +19,8 @@ See [the repo map](repo-map.md) for parts, entry points, sources of truth and ow
   containers, status, review checklist).
 - `docs/testing-plan.md`: validation expectations for product, frontend,
   import/export, security, CI, and smoke-test changes.
-- `docs/internal-uat.md`: internal Koncept/Swooshz UAT checklist, smoke
-  commands, known limits, bug-report format, and private-data guardrails.
+- `docs/internal-uat.md`: release UAT checklist that every agent UAT runs on
+  the copy of live before a deploy; the owner checks only its gaps.
 - `docs/internal-uat-checkpoint.md`: documentation-only local UAT passed
   checkpoint for the Platform launch and SQAG quote/dashboard baseline through
   PR #82.
