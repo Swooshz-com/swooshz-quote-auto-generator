@@ -28849,7 +28849,7 @@ const waitForUiPaint = async () => {};
 const logs = [];
 const messages = [];
 const state = {
-  quoteAiSpendRequest: 0, quoteSessions: [],
+  quoteSessions: [],
   quoteSessionId: scenario.path === "initial" ? "" : "quote-synthetic-a",
   pricingDraftVersion: scenario.path === "initial" ? "" : "a".repeat(64),
   quoteSessionRestoredSessionId: scenario.path === "restored" ? "quote-synthetic-a" : "",
@@ -29058,7 +29058,6 @@ const required = ["isPlainObject", "objectHasExactKeys", "safeQuoteSessionId", "
   "adoptServerQuoteCommercialReview", "errorReferenceFrom", "genericFailureMessage", "genericFailureMessages",
   "newClientErrorReference", "stringifyPricingReferenceJson", "jsonFromResponse", "fetchPostJsonResponse", "postJsonFetchFailure",
   "refreshSessionToken", "postJson", "logClientEvent", "ensureClientQuoteSessionId", "mergeDashboardQuoteSession",
-  "quoteAiSpendText", "renderQuoteAiSpend", "refreshQuoteAiSpend",
   "currentQuoteSessionPayload", "currentQuoteSessionDraftState", "quoteSessionDraftComparisonKey",
   "recordSavedExclusions", "pendingReinclusionTagged", "pendingReinclusionDraftBasis", "restorePendingReinclusions",
   "quoteSessionDraftFileComparisonKey", "rememberConfirmedQuoteSessionDraft", "quoteSessionDraftFilesAreConfirmed",

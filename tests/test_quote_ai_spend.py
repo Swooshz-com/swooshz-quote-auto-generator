@@ -242,8 +242,11 @@ class QuoteAiSpendTest(unittest.TestCase):
         peer = server.DatabaseSqagStorage(store.database_url, store.workspace_id, "operator", "peer-test")
         other = server.DatabaseSqagStorage(store.database_url, "other-workspace", "admin", "admin-test")
         policy = InternalAuthPolicy(store.workspace_id, (), "synthetic", {})
-        self.assertEqual(admin.list_quote_sessions(staff_policy=policy)[0]["ai_spend"], {
-            "total": {"status": "reported", "display": "USD 0.25"},
+        # The quote list carries no spend (#443); the single-quote readback keeps the total.
+        self.assertNotIn("ai_spend", admin.list_quote_sessions(staff_policy=policy)[0])
+        self.assertNotIn("ai_spend", store.list_quote_sessions()[0])
+        self.assertEqual(store.get_quote_session(binding.session_id)["ai_spend"]["total"], {
+            "status": "reported", "display": "USD 0.25",
         })
         for requester in (admin, peer, other):
             with self.subTest(role=requester.role, workspace=requester.workspace_id):
@@ -251,6 +254,18 @@ class QuoteAiSpendTest(unittest.TestCase):
                 with self.assertRaises(server.SqagStorageAccessError):
                     self.bind(requester, payload)
         self.assertEqual(other.list_quote_sessions(staff_policy=policy), [])
+
+    def test_file_storage_list_carries_no_spend(self):
+        store = server.LocalSqagStorage()
+        binding = self.bind(store, self.save(store, "quote-test-file-list"))
+        operation = binding.claim("job-file-list-test")
+        operation.settle(operation.reserve(), Decimal("0.40"))
+        listed = [session for session in store.list_quote_sessions() if session["session_id"] == binding.session_id]
+        self.assertEqual(len(listed), 1)
+        self.assertNotIn("ai_spend", listed[0])
+        self.assertEqual(store.get_quote_session(binding.session_id)["ai_spend"]["total"], {
+            "status": "reported", "display": "USD 0.40",
+        })
 
     def test_job_cache_replay_and_payload_cannot_supply_spend_context(self):
         store = server.LocalSqagStorage()

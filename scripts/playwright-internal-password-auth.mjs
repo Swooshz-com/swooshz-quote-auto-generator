@@ -28,7 +28,9 @@ try {
   // HTTP tests independently verify server-side ownership and row admission.
   const quoteSummaries = [
     { session_id: "quote-browser-mapped", customer_summary: { customer_name: "Mapped fixture" },
-      created_by: "alpha-operator" + "@" + "example.test", dashboard_summary_only: true },
+      created_by: "alpha-operator" + "@" + "example.test", dashboard_summary_only: true,
+      // A row as an older server sent it: the card must still show no AI spend (#443).
+      ai_spend: { total: { status: "reported", display: "USD 0.25" } } },
     { session_id: "quote-browser-unmapped", customer_summary: { customer_name: "Legacy fixture" },
       created_by: "", dashboard_summary_only: true },
   ];
@@ -129,6 +131,8 @@ try {
   const cards = page.locator(".dashboard-session-card");
   await cards.nth(1).waitFor();
   assert.equal(await cards.count(), 2);
+  const mappedCardText = await cards.filter({ hasText: "Mapped fixture" }).innerText();
+  assert.ok(!mappedCardText.includes("AI spend") && !mappedCardText.includes("USD 0.25"), "The Dashboard card shows AI spend");
   await cards.filter({ hasText: "Mapped fixture" }).click();
   await page.getByText("Created by alpha-operator" + "@" + "example.test", { exact: true }).waitFor();
   assert.equal(await page.getByRole("button", { name: "Modify quote" }).isDisabled(), true);
