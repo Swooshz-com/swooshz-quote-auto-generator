@@ -10487,6 +10487,9 @@ def ai_pricing_reference_import_preview(filename: str, content: Any, tax: dict[s
 
 
 
+PRICING_REFERENCE_NO_ROWS_MESSAGE = "This file has no rows to import."
+
+
 def pricing_reference_import_preview(payload: dict[str, Any]) -> dict[str, Any]:
     started_at = time.perf_counter()
     filename = clean_text(payload.get("filename"))
@@ -10537,7 +10540,11 @@ def pricing_reference_import_preview(payload: dict[str, Any]) -> dict[str, Any]:
                     timings_ms["ai_context_extract"] = elapsed_milliseconds(context_started_at)
                     detected_currency = detect_currency_from_rows(headers, rows)
                     rows_have_content = any(any(clean_text(value) for value in row.values()) for row in rows)
-                    if result.get("missing") or rows_have_content:
+                    if not ai_rows:
+                        # Nothing the AI would read: refuse here instead of a paid call that cannot import anything.
+                        route = "no_rows"
+                        result = pricing_reference_validation_result([], [], 0, filename) | {"errors": [PRICING_REFERENCE_NO_ROWS_MESSAGE]}
+                    elif result.get("missing") or rows_have_content:
                         route = "ai_normalization"
                         used_ai = True
                         ai_started_at = time.perf_counter()
@@ -10556,11 +10563,15 @@ def pricing_reference_import_preview(payload: dict[str, Any]) -> dict[str, Any]:
                 markdown_started_at = time.perf_counter()
                 markdown = markdown_text_from_bytes(raw)
                 timings_ms["markdown_extract"] = elapsed_milliseconds(markdown_started_at)
-                used_ai = True
-                ai_started_at = time.perf_counter()
-                result = ai_pricing_reference_import_preview(filename, {"markdown": markdown}, tax)
-                timings_ms["ai_normalization_total"] = elapsed_milliseconds(ai_started_at)
-                result["currency"] = detected_currency_label(markdown) or currency
+                if not markdown.strip():
+                    route = "no_rows"
+                    result = pricing_reference_validation_result([], [], 0, filename) | {"errors": [PRICING_REFERENCE_NO_ROWS_MESSAGE]}
+                else:
+                    used_ai = True
+                    ai_started_at = time.perf_counter()
+                    result = ai_pricing_reference_import_preview(filename, {"markdown": markdown}, tax)
+                    timings_ms["ai_normalization_total"] = elapsed_milliseconds(ai_started_at)
+                    result["currency"] = detected_currency_label(markdown) or currency
             except ValueError as exc:
                 route = "parse_error"
                 result = pricing_reference_validation_result([], [], 0, filename) | {"errors": [safe_error_messages([str(exc)])[0]]}
@@ -32586,12 +32597,16 @@ def generic_referenced_errors(error_reference: str = "") -> list[str]:
 def failed_result_payload(error_reference: str, *, exception: BaseException | None = None) -> dict[str, Any]:
     diagnostics = safe_ai_output_diagnostics(getattr(exception, "diagnostics", {}))
     message = draft_failure_message(diagnostics)
-    return {
+    payload = {
         "status": "failed",
         "errors": ([f"{message} Reference: {clean_text(error_reference)}."] if message
                    else generic_referenced_errors(error_reference)),
         "error_reference": clean_text(error_reference),
     }
+    if message:
+        # One of the fixed reference-limit messages: the page shows it instead of the generic failure.
+        payload["limit_message"] = message
+    return payload
 
 
 def post_commit_projection_warning(error_reference: str) -> dict[str, Any]:

@@ -355,7 +355,11 @@ button {
 .topbar-privacy-link:focus-visible {
   color: var(--green-dark);
   text-decoration: underline;
-  outline: none;
+}
+
+.topbar-privacy-link:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 2px;
 }
 
 .topbar-auth-state {
@@ -382,7 +386,11 @@ button {
 .topbar-auth-state a:hover,
 .topbar-auth-state a:focus-visible {
   text-decoration: underline;
-  outline: none;
+}
+
+.topbar-auth-state a:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 2px;
 }
 
 body.auth-page {

@@ -6,7 +6,7 @@ import unittest
 
 
 class ProfileUiPermissionsTest(unittest.TestCase):
-    def test_existing_controls_consume_per_record_permissions_and_import_creates_copy(self):
+    def test_existing_controls_consume_per_record_permissions_and_import_overwrites_only_own_names(self):
         node = shutil.which("node")
         if not node:
             self.skipTest("Node is required for the isolated permission state harness")
@@ -51,9 +51,14 @@ assert.equal(elements.importPresetButton.disabled,false);
 assert.equal(elements.deletePresetButton.disabled,true);
 assert.equal(elements.exportPresetButton.disabled,false);
 assert.equal(context.existingCompanyProfileForLabel('Synthetic'),null);
-assert.equal(context.existingCompanyProfileForLabel('Owned',{mode:'import'}),null);
+// #443: an import whose name is taken finds the profile (the page then asks before overwriting);
+// a profile this user cannot update is never found, so that import stays a new copy.
+assert.equal(context.existingCompanyProfileForLabel('Owned',{mode:'import'}).id,'owned');
+assert.equal(context.existingCompanyProfileForLabel('Synthetic',{mode:'import'}),null);
 assert.equal(context.profilePayloadForLabel('Owned',{existingProfile:state.companyProfiles[1]}).operation,'update');
-assert.equal(context.profilePayloadForLabel('Owned',{mode:'import',existingProfile:state.companyProfiles[1]}).operation,'create');
+assert.equal(context.profilePayloadForLabel('Owned',{mode:'import',existingProfile:state.companyProfiles[1]}).operation,'update');
+assert.equal(context.profilePayloadForLabel('Owned',{mode:'import',existingProfile:state.companyProfiles[1]}).revision,3);
+assert.equal(context.profilePayloadForLabel('New name',{mode:'import'}).operation,'create');
 assert.equal(context.profilePayloadForLabel('Owned',{existingProfile:state.companyProfiles[1]}).revision,3);
 assert.equal(context.companyProfilePresets()[0].permissions.canDelete,false);
 preset={id:'owned',source:'company',permissions:{canDelete:true}};

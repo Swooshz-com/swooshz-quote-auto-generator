@@ -607,8 +607,11 @@ class TemplateRenderTest(unittest.TestCase):
         formulas = sorted(value for (kind, value), _ in summary["cells"].values() if kind == "formula")
         self.assertEqual(len(formulas), 3)
         self.assertTrue(all(re.fullmatch(r"(SUM|ROUND)\(E\d+[:*][E0-9.,]+\)", formula) for formula in formulas), formulas)
-        for text in ("'=SUM(A1:A9)", "'@cmd", "'+42", "'-1+1", "'=HYPERLINK(\"x\")", "=HYPERLINK(\"x\")", "=1+1"):
+        # Template text shows exactly as typed, with no apostrophe, and is never a formula (#443 QT-07).
+        for text in ("=SUM(A1:A9)", "@cmd", "+42", "-1+1", "=HYPERLINK(\"x\")", "=1+1"):
             self.assertTrue(find_refs(summary, text), text)
+        for text in ("'=SUM(A1:A9)", "'@cmd", "'+42", "'-1+1", "'=HYPERLINK(\"x\")"):
+            self.assertFalse(find_refs(summary, text), text)
 
     def test_a_table_without_quantity_or_position_shows_neither(self):
         definition = custom_template()

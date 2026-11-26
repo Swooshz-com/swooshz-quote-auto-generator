@@ -1675,6 +1675,14 @@ function aiAnalysisInvalidReferenceMessage(data = {}) {
   return "";
 }
 
+// A failed analysis that hit a reference limit (such as PDF pages) says which limit; else the generic failure.
+function analysisJobFailureMessage(data = {}) {
+  const limitMessage = data && typeof data === "object" && typeof data.limit_message === "string" ? data.limit_message.trim() : "";
+  if (!limitMessage) return genericFailureMessage(data);
+  const reference = errorReferenceFrom(data);
+  return reference ? `${limitMessage} Reference: ${reference}.` : limitMessage;
+}
+
 function aiAnalysisFailureMessage(data = {}) {
   const invalidReferenceMessage = aiAnalysisInvalidReferenceMessage(data);
   if (invalidReferenceMessage) {
@@ -1763,10 +1771,26 @@ function fileToText(file) {
   });
 }
 
+// The server keeps only PNG or JPEG profile logos of 2 MiB or less (check_profile_logo_data_url).
+const PROFILE_LOGO_MAX_BYTES = 2 * 1024 * 1024;
+const PROFILE_LOGO_TYPES = new Set(["image/png", "image/jpeg"]);
+
+function profileLogoFileRefusal(file = {}) {
+  const type = String(file.type || "").toLowerCase();
+  if (!PROFILE_LOGO_TYPES.has(type) || !(Number(file.size) <= PROFILE_LOGO_MAX_BYTES)) {
+    return "Use a PNG or JPEG logo of 2 MB or less.";
+  }
+  return "";
+}
+
+// The analysis takes these types only (the server refuses others, such as GIF, when it starts).
+const ACCEPTED_REFERENCE_FILE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "application/pdf"]);
+const ACCEPTED_REFERENCE_FILES_MESSAGE = "Add JPG, PNG, WebP or PDF files only.";
+
 function isAcceptedReferenceFile(file = {}) {
   const type = String(file.type || "").toLowerCase();
   const name = String(file.name || "").toLowerCase();
-  return type.startsWith("image/") || type === "application/pdf" || name.endsWith(".pdf");
+  return ACCEPTED_REFERENCE_FILE_TYPES.has(type) || name.endsWith(".pdf");
 }
 
 function referenceFileType(entry = {}) {
@@ -1944,8 +1968,9 @@ async function withBrowserRecoveryFileOperation(operation) {
 
 async function readImagesFromFiles(files) {
   const referenceFiles = Array.from(files).filter(isAcceptedReferenceFile);
+  const refusedTypeMessage = referenceFiles.length < Array.from(files).length ? ` ${ACCEPTED_REFERENCE_FILES_MESSAGE}` : "";
   if (!referenceFiles.length) {
-    if (Array.from(files).length) setImageUploadStatus("Only JPG, PNG, WebP, or PDF files can be added.");
+    if (Array.from(files).length) setImageUploadStatus(ACCEPTED_REFERENCE_FILES_MESSAGE);
     return;
   }
   const capacity = imageCapacity();
@@ -1989,7 +2014,7 @@ async function readImagesFromFiles(files) {
   const generator = currentGenerator();
   const duplicateMessage = duplicateCount ? ` ${duplicateCount} duplicate file${duplicateCount === 1 ? "" : "s"} skipped.` : "";
   const overflowMessage = overflowCount ? ` ${overflowCount} file${overflowCount === 1 ? "" : "s"} skipped because the maximum is ${MAX_REFERENCE_IMAGES}.` : "";
-  setImageUploadStatus(`${unique.length} new ${generator.imageNoun}${unique.length === 1 ? "" : "s"} added.${duplicateMessage}${overflowMessage}`);
+  setImageUploadStatus(`${unique.length} new ${generator.imageNoun}${unique.length === 1 ? "" : "s"} added.${duplicateMessage}${overflowMessage}${refusedTypeMessage}`);
   syncControlStates();
 }
 
@@ -4714,15 +4739,17 @@ function furthestQuoteSessionSidePanel(saved = {}) {
     || saved.basisConfirmed
     || ["completed", "pricing_review", "generating"].includes(workflowStage)
   );
-  const hasBasis = Boolean(
-    hasOutput
-    || (Array.isArray(saved.lineItems) && saved.lineItems.length)
+  const hasBasisContent = Boolean(
+    (Array.isArray(saved.lineItems) && saved.lineItems.length)
     || (Array.isArray(saved.quoteBasisSections) && saved.quoteBasisSections.length)
     || (Array.isArray(saved.analysisFindings) && saved.analysisFindings.length)
     || hasBasisText
   );
+  // Quote Basis changed after Output was built and not confirmed again: Output is out of date,
+  // so the quote reopens on Quote Basis, where Confirm brings Output up to date.
+  if (hasOutput && hasBasisContent && saved.basisConfirmed !== true) return "basis";
   if (hasOutput) furthestIndex = Math.max(furthestIndex, SIDE_PANEL_SEQUENCE.indexOf("output"));
-  else if (hasBasis) furthestIndex = Math.max(furthestIndex, SIDE_PANEL_SEQUENCE.indexOf("basis"));
+  else if (hasBasisContent) furthestIndex = Math.max(furthestIndex, SIDE_PANEL_SEQUENCE.indexOf("basis"));
   return SIDE_PANEL_SEQUENCE[Math.max(0, furthestIndex)] || "images";
 }
 
@@ -5774,7 +5801,8 @@ function profilePayloadForLabel(label = "", options = {}) {
   const existingProfile = options.existingProfile || null;
   const profileId = safeProfileId(existingProfile?.id || label, sourceProfile?.id || `profile-${Date.now().toString(36)}`);
   const payload = {
-    operation: existingProfile && options.mode !== "import" ? "update" : "create",
+    // An import whose name is taken overwrites that profile only after the overwrite question.
+    operation: existingProfile ? "update" : "create",
     revision: existingProfile?.revision ?? existingProfile?._revision ?? 0,
     id: profileId,
     label,
@@ -5789,7 +5817,6 @@ function profilePayloadForLabel(label = "", options = {}) {
 }
 
 function existingCompanyProfileForLabel(label = "", options = {}) {
-  if (options.mode === "import") return null;
   const safeLabel = safeProfileLabel(label, "");
   const candidateId = safeProfileId(safeLabel, options.profile?.id || "");
   const candidateLabel = safeLabel.toLowerCase();
@@ -7049,6 +7076,12 @@ const PRICING_REFERENCE_PREVIEW_PLACEHOLDERS = {
   internal_cost: "e.g. 150.00",
   markup_multiplier: "e.g. 1.25",
   remarks: "e.g. Delivery excluded",
+};
+
+// Hover hints on the import preview cells. Cost is what the company pays, so a list that is
+// already in selling prices takes markup 1.
+const PRICING_REFERENCE_PREVIEW_HINTS = {
+  markup_multiplier: "1 if these are already selling prices",
 };
 
 const PRICING_REFERENCE_METADATA_STALE_FIELDS = new Set([
@@ -8421,7 +8454,7 @@ function pricingReferencePreviewTableRows(result = state.pendingPricingReference
   return items.map((item, index) => `
     <tr data-preview-row="${index}">
       ${PRICING_REFERENCE_PREVIEW_FIELDS.map((field) => `
-        <td><input class="pricing-preview-input" data-preview-field="${field}" data-preview-row="${index}" value="${escapeHtml(item[field] ?? "")}" placeholder="${escapeHtml(PRICING_REFERENCE_PREVIEW_PLACEHOLDERS[field] || "")}"></td>
+        <td><input class="pricing-preview-input" data-preview-field="${field}" data-preview-row="${index}" value="${escapeHtml(item[field] ?? "")}" placeholder="${escapeHtml(PRICING_REFERENCE_PREVIEW_PLACEHOLDERS[field] || "")}"${PRICING_REFERENCE_PREVIEW_HINTS[field] ? ` title="${escapeHtml(PRICING_REFERENCE_PREVIEW_HINTS[field])}"` : ""}></td>
       `).join("")}
       <td class="pricing-preview-status ${pricingReferenceStatusClass(item.warning || "OK")}">${escapeHtml(item.warning || "OK")}</td>
       <td class="pricing-reference-row-actions">
@@ -8490,7 +8523,7 @@ function compactPreviewList(values = [], limit = 3) {
 
 function pricingReferenceColumnLabel(column = "") {
   const label = { section: "Section", description: "Description", unit_hint: "Unit", internal_cost: "Cost", markup_multiplier: "Markup" }[column];
-  return label && label.toLowerCase() !== column ? `${label} (${column})` : label || column;
+  return label || column;
 }
 
 function pricingReferenceSkippedRowsText(result = {}, skipped = 0) {
@@ -8698,8 +8731,55 @@ function handlePricingReferencePreviewInput(event) {
     cell.textContent = text;
     cell.className = `pricing-preview-status ${pricingReferenceStatusClass(text)}`;
   });
+  if (elements.pricingReferencePreview && !pricingReferenceOperationBusy()) {
+    renderPricingReferencePreviewSummary(state.pendingPricingReference);
+  }
   updatePricingReferenceGuidanceDisplays(state.pendingPricingReference);
   renderPricingReferenceManageStatus(state.pendingPricingReference);
+}
+
+// The "Needs attention" summary above Review Rows. A row edit redraws only this, so the cell
+// being typed in keeps its focus while the summary follows the rows.
+function renderPricingReferencePreviewSummary(result) {
+  const selectedCurrencyMode = elements.pricingReferenceCurrency?.value;
+  const modalCurrency = pricingReferenceModalCurrency();
+  const currency = selectedCurrencyMode === CUSTOM_CURRENCY_VALUE
+    ? modalCurrency || "Custom"
+    : normalizeCurrencyLabel(result.currency || modalCurrency || DEFAULT_CURRENCY_LABEL);
+  const warnings = result.warnings || [];
+  const rowsCanSave = Boolean(result.canSave);
+  const saveBlockReason = pricingReferenceSaveBlockReason(result);
+  const requiredDetailsBlocked = pricingReferenceSaveBlockReasonIsRequiredDetails(saveBlockReason);
+  const informationalBlockReason = /^(Saved\.|No changes to save\.)/.test(saveBlockReason);
+  const hardSaveBlockReason = Boolean(saveBlockReason) && !requiredDetailsBlocked && !informationalBlockReason;
+  const canSave = rowsCanSave && !saveBlockReason;
+  const currencyNeedsReview = Boolean(currency) && !isValidCurrencyCode(currency);
+  const nameConflict = pricingReferenceImportNameConflictMessage();
+  const attention = pricingReferencePreviewAttention(result, { currency, currencyNeedsReview, nameConflict });
+  const hasFixes = attention.some((item) => item.tone === "error") || !rowsCanSave || hardSaveBlockReason;
+  const hasReviewNotes = attention.length > 0 || requiredDetailsBlocked;
+  const tone = hasFixes ? "error" : hasReviewNotes || warnings.length ? "warn" : "ok";
+  elements.pricingReferencePreview.className = `pricing-reference-preview ${tone}`;
+  elements.pricingReferencePreview.innerHTML = `
+    <div class="pricing-reference-attention ${attention.length ? "" : "is-clear"}">
+      <strong>${attention.length ? "Needs attention" : "No missing required info detected"}</strong>
+      ${attention.length ? `
+        <ul>
+          ${attention.map((item) => `
+            <li class="${item.tone === "error" ? "is-error" : "is-warn"}">
+              <span>${escapeHtml(item.label)}</span>
+              <p>${escapeHtml(item.text)}</p>
+            </li>
+          `).join("")}
+        </ul>
+      ` : `<p>Required columns are present and imported rows pass the basic checks.</p>`}
+    </div>
+    <p class="pricing-reference-save-guidance ${canSave ? "is-ok" : "is-blocked"}">${escapeHtml(sentenceLineBreakText(pricingReferenceSaveGuidance(result)))}</p>
+    <div class="pricing-reference-preview-actions">
+      <button class="secondary-button pricing-reference-table-open" type="button" data-pricing-reference-table-open>${result.items.length ? `Review ${result.items.length} Row${result.items.length === 1 ? "" : "s"}` : "Review Rows"}</button>
+    </div>
+  `;
+  return { rowsCanSave, saveBlockReason };
 }
 
 function renderPricingReferencePreview(result = null, options = {}) {
@@ -8741,45 +8821,8 @@ function renderPricingReferencePreview(result = null, options = {}) {
   }
   result.items = sortPricingReferencePreviewItems((result.items || []).map(normalizePricingReferencePreviewItem));
   if (options.syncCurrencyControls && result.currency) setPricingReferenceCurrencyControls(result.currency);
-  const selectedCurrencyMode = elements.pricingReferenceCurrency?.value;
-  const modalCurrency = pricingReferenceModalCurrency();
-  const currency = selectedCurrencyMode === CUSTOM_CURRENCY_VALUE
-    ? modalCurrency || "Custom"
-    : normalizeCurrencyLabel(result.currency || modalCurrency || DEFAULT_CURRENCY_LABEL);
   refreshPricingReferencePreviewValidity(result);
-  const warnings = result.warnings || [];
-  const rowsCanSave = Boolean(result.canSave);
-  const saveBlockReason = pricingReferenceSaveBlockReason(result);
-  const requiredDetailsBlocked = pricingReferenceSaveBlockReasonIsRequiredDetails(saveBlockReason);
-  const informationalBlockReason = /^(Saved\.|No changes to save\.)/.test(saveBlockReason);
-  const hardSaveBlockReason = Boolean(saveBlockReason) && !requiredDetailsBlocked && !informationalBlockReason;
-  const canSave = rowsCanSave && !saveBlockReason;
-  const currencyNeedsReview = Boolean(currency) && !isValidCurrencyCode(currency);
-  const nameConflict = pricingReferenceImportNameConflictMessage();
-  const attention = pricingReferencePreviewAttention(result, { currency, currencyNeedsReview, nameConflict });
-  const hasFixes = attention.some((item) => item.tone === "error") || !rowsCanSave || hardSaveBlockReason;
-  const hasReviewNotes = attention.length > 0 || requiredDetailsBlocked;
-  const tone = hasFixes ? "error" : hasReviewNotes || warnings.length ? "warn" : "ok";
-  elements.pricingReferencePreview.className = `pricing-reference-preview ${tone}`;
-  elements.pricingReferencePreview.innerHTML = `
-    <div class="pricing-reference-attention ${attention.length ? "" : "is-clear"}">
-      <strong>${attention.length ? "Needs attention" : "No missing required info detected"}</strong>
-      ${attention.length ? `
-        <ul>
-          ${attention.map((item) => `
-            <li class="${item.tone === "error" ? "is-error" : "is-warn"}">
-              <span>${escapeHtml(item.label)}</span>
-              <p>${escapeHtml(item.text)}</p>
-            </li>
-          `).join("")}
-        </ul>
-      ` : `<p>Required columns are present and imported rows pass the basic checks.</p>`}
-    </div>
-    <p class="pricing-reference-save-guidance ${canSave ? "is-ok" : "is-blocked"}">${escapeHtml(sentenceLineBreakText(pricingReferenceSaveGuidance(result)))}</p>
-    <div class="pricing-reference-preview-actions">
-      <button class="secondary-button pricing-reference-table-open" type="button" data-pricing-reference-table-open>${result.items.length ? `Review ${result.items.length} Row${result.items.length === 1 ? "" : "s"}` : "Review Rows"}</button>
-    </div>
-  `;
+  const { rowsCanSave, saveBlockReason } = renderPricingReferencePreviewSummary(result);
   renderPricingReferenceTableOverlay(result);
   setPricingReferenceSaveButtonState({
     canSave: rowsCanSave,
@@ -8885,7 +8928,10 @@ async function handlePricingReferenceFileChange() {
   startElapsedTimer("pricingReferenceImportElapsed", importStartedAt);
   let result;
   try {
-    result = await validatePricingReferenceFile(file);
+    // An empty file has nothing to read: refuse it here, before any upload or AI reader.
+    result = file.size === 0
+      ? { ...pricingReferenceValidationResult([], [], 0, file.name), errors: ["This file has no rows to import."] }
+      : await validatePricingReferenceFile(file);
   } catch (error) {
     result = {
       ...pricingReferenceValidationResult([], [], 0, file.name),
@@ -9458,6 +9504,14 @@ function hideQuoteDependencyConfirmModal(options = {}) {
   if (options.focusButton) elements.sideNextButton?.focus();
 }
 
+// Cancel, Escape or the backdrop: nothing changes, and the saved pricing reference shows again
+// so the next Next does not ask the same question.
+function cancelQuoteDependencyChange() {
+  const changes = [...state.pendingQuoteDependencyChanges];
+  hideQuoteDependencyConfirmModal({ focusButton: true });
+  if (changes.includes("pricing_reference")) resetPendingPricingReferenceSelection();
+}
+
 function requestQuoteDependencyChangeConfirmation(changes = []) {
   const normalized = [...new Set((Array.isArray(changes) ? changes : []).filter(Boolean))];
   if (!normalized.length || !elements.quoteDependencyConfirmModal) return false;
@@ -9904,21 +9958,30 @@ function waitForUiPaint() {
   });
 }
 
+// Hover text saying why Download Excel or View PDF is greyed out; "" when nothing blocks it.
+function downloadButtonBlockReason(validation, fileReady) {
+  if (state.activeSidePanel !== "output") return "";
+  if (!validation.valid) return "Price every row first.";
+  if (quoteCommercialReviewRequired()) return "Check the quote's commercial details first.";
+  if (state.isGenerating || state.isPreparingOutput) return "Preparing the quote...";
+  // Opened to read: only a file that is already there can be downloaded, nothing is generated.
+  if (state.quoteViewOnly && !fileReady) return "Only an existing file can be opened in a view-only quote.";
+  return "";
+}
+
 function updateDownloadButton() {
   if (!elements.sideDownloadButton && !elements.sideViewPdfButton) return;
   const freshFile = downloadFileIsFresh(state.downloadFile) ? state.downloadFile : null;
   const freshPdfFile = elements.sideViewPdfButton && pdfFileIsFresh(state.pdfFile) ? state.pdfFile : null;
   const validation = outputRowsValid();
-  const ready = state.activeSidePanel === "output"
-    && validation.valid
-    && !quoteCommercialReviewRequired()
-    && !state.isGenerating
-    && !state.isPreparingOutput;
-  // Opened to read: only a file that is already there can be downloaded, nothing is generated.
-  const enabled = ready && (!state.quoteViewOnly || Boolean(freshFile));
-  const pdfEnabled = ready && (!state.quoteViewOnly || Boolean(freshPdfFile));
+  const onOutput = state.activeSidePanel === "output";
+  const downloadReason = downloadButtonBlockReason(validation, Boolean(freshFile));
+  const pdfReason = downloadButtonBlockReason(validation, Boolean(freshPdfFile));
+  const enabled = onOutput && !downloadReason;
+  const pdfEnabled = onOutput && !pdfReason;
   if (elements.sideDownloadButton) {
     elements.sideDownloadButton.classList.toggle("is-disabled", !enabled);
+    elements.sideDownloadButton.title = downloadReason;
     elements.sideDownloadButton.setAttribute("aria-disabled", String(!enabled));
     elements.sideDownloadButton.tabIndex = enabled ? 0 : -1;
     elements.sideDownloadButton.href = enabled && freshFile?.url ? freshFile.url : "#";
@@ -9927,6 +9990,7 @@ function updateDownloadButton() {
   }
   if (elements.sideViewPdfButton) {
     elements.sideViewPdfButton.classList.toggle("is-disabled", !pdfEnabled);
+    elements.sideViewPdfButton.title = pdfReason;
     elements.sideViewPdfButton.setAttribute("aria-disabled", String(!pdfEnabled));
     elements.sideViewPdfButton.tabIndex = pdfEnabled ? 0 : -1;
     elements.sideViewPdfButton.href = pdfEnabled && freshPdfFile?.url ? freshPdfFile.url : "#";
@@ -11345,6 +11409,8 @@ function outputPricingSourceLabel() {
 function outputHeaderStatus(rows = state.outputRows) {
   const safeRows = Array.isArray(rows) ? rows : [];
   if (!safeRows.length) return { label: "Draft", className: "is-empty" };
+  // Rows built before the latest Quote Basis edits are not ready until Quote Basis is confirmed again.
+  if (!state.basisConfirmed) return { label: "Confirm Quote Basis", className: "is-warn" };
   const stats = matchSummaryStats(safeRows);
   return stats.totalPending
     ? { label: "Needs pricing", className: "is-warn" }
@@ -18269,7 +18335,7 @@ function syncControlStates() {
     const canManage = canManagePricingReferences();
     elements.settingsButton.hidden = false;
     elements.settingsButton.disabled = busy || !canManage;
-    elements.settingsButton.title = canManage ? "Settings" : pricingReferenceNoAccessReason();
+    elements.settingsButton.title = canManage ? "Settings" : "Only admins can open Settings.";
     elements.settingsButton.setAttribute("aria-disabled", String(elements.settingsButton.disabled));
   }
   updatePresetButtons();
@@ -18418,7 +18484,7 @@ async function handleDraftBasis(options = {}) {
     if (wasBlocked) {
       showAiBlockedBanner(errors.join(" "));
     } else {
-      showAiFailureBanner(genericFailureMessage(polled.data.result || polled.data));
+      showAiFailureBanner(analysisJobFailureMessage(polled.data.result || polled.data));
     }
     restoreQuoteCommercialOverrideSnapshot(quoteCommercialSnapshot, { reason: "draft_poll_failed" });
     syncControlStates();
@@ -18986,7 +19052,7 @@ async function resumeSavedJob() {
 
     if (!polled.ok || ["blocked", "failed"].includes(polled.data.status)) {
       setWorkflowStage("ready_to_analyze");
-      showAiFailureBanner(genericFailureMessage(polled.data.result || polled.data));
+      showAiFailureBanner(analysisJobFailureMessage(polled.data.result || polled.data));
       restoreQuoteCommercialOverrideSnapshot(quoteCommercialSnapshot, { reason: "resume_draft_failed" });
       syncControlStates();
       return;
@@ -19771,6 +19837,13 @@ function wireEvents() {
   elements.headerLogoInput.addEventListener("change", (event) => withBrowserRecoveryFileOperation(async () => {
     const presentationBeforeLogoChange = quoteCompanyPresentationSignature();
     const file = (event.target.files || [])[0];
+    const refusal = file ? profileLogoFileRefusal(file) : "";
+    if (refusal) {
+      // The current logo stays; nothing is saved.
+      renderPresetStatus(refusal);
+      event.target.value = "";
+      return;
+    }
     if (file) {
       const [dataUrl, arrayBuffer] = await Promise.all([
         fileToDataUrl(file),
@@ -19908,7 +19981,7 @@ function wireEvents() {
       } else if (!elements.basisChatOverlay.hidden) {
         closeBasisChatOverlay();
       } else if (elements.quoteDependencyConfirmModal && !elements.quoteDependencyConfirmModal.hidden) {
-        hideQuoteDependencyConfirmModal({ focusButton: true });
+        cancelQuoteDependencyChange();
       } else if (elements.profileLoadModal && !elements.profileLoadModal.hidden) {
         hideProfileLoadModal({ focusButton: true });
       } else if (elements.profileOverwriteModal && !elements.profileOverwriteModal.hidden) {
@@ -20083,11 +20156,11 @@ function wireEvents() {
       closePricingReferenceModal();
     }
   });
-  elements.cancelQuoteDependencyConfirmButton?.addEventListener("click", () => hideQuoteDependencyConfirmModal({ focusButton: true }));
+  elements.cancelQuoteDependencyConfirmButton?.addEventListener("click", cancelQuoteDependencyChange);
   elements.confirmQuoteDependencyChangeButton?.addEventListener("click", confirmQuoteDependencyChange);
   elements.quoteDependencyConfirmModal?.addEventListener("click", (event) => {
     if (event.target === elements.quoteDependencyConfirmModal || event.target.closest("[data-quote-dependency-confirm-close]")) {
-      hideQuoteDependencyConfirmModal({ focusButton: true });
+      cancelQuoteDependencyChange();
     }
   });
   elements.analysisConfirmCancelButton.addEventListener("click", closeAnalysisConfirmModal);
@@ -20419,7 +20492,6 @@ const QT_RULES = Object.freeze({
   alignmentLabels: ["Left", "Center", "Right"],
   defaultAlign: { position: "left", quantity: "center", unit: "left", description: "left", unit_price: "right", amount: "right" },
   defaultLabel: { position: "Pos.", quantity: "Quantity", unit: "Unit", description: "Service", unit_price: "Unit price", amount: "Estimate" },
-  formulaPrefixes: ["=", "+", "-", "@"], // FORMULA_PREFIXES
 });
 const QT_BLOCK_LABELS = Object.freeze({
   logo: "Logo", company_details: "Company details", client_details: "Client details", quote_details: "Quote details",
@@ -20453,9 +20525,8 @@ function qtBlockLabel(block) { return QT_BLOCK_LABELS[block.type] || "Block"; }
 function qtTextProblem(value, maxLength, allowEmpty = true) {
   const raw = String(value ?? "");
   if (QT_HIDDEN_CHARACTER.test(raw)) return "hidden";
-  let text = raw.normalize("NFC").trim();
+  const text = raw.normalize("NFC").trim();
   if (!text && !allowEmpty) return "empty";
-  if (QT_RULES.formulaPrefixes.some((prefix) => text.startsWith(prefix))) text = `'${text}`;
   return Array.from(text).length > maxLength ? "long" : "";
 }
 
