@@ -14741,7 +14741,12 @@ function revisedQuoteRowForApply(row, before, line) {
     ["effective_unit_price", "pricing_basis_amount", "approved_quote_amount"].forEach((key) => delete next[key]);
   }
   // Like every row, normalised: the kept price sets the amount for the new size (a mismatch keeps no price).
-  return normalizeLineItem({ ...next, pricing_authority: authority || buildPricingAuthority("none", next) });
+  // A line ticked back in keeps its mark, as a typed size does: the draft still saves it as excluded, and
+  // Confirm restores the price only while the mark matches the line (dropUnusableReinclusions, the server).
+  return {
+    ...normalizeLineItem({ ...next, pricing_authority: authority || buildPricingAuthority("none", next) }),
+    ...(!unitChanged && row.reincluded_catalog_selection ? { reincluded_catalog_selection: row.reincluded_catalog_selection } : {}),
+  };
 }
 
 // A catalogue line Re turns into another item loses its catalogue price (a typed price and Included stay).

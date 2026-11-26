@@ -22,7 +22,12 @@ const LINES = [
   { id: "rv-cabinet", section: "Synthetic Rentals", text: "nos. synthetic storage cabinet", quantity: 3, unit: "nos", keyword: "synthetic-rentals-synthetic-storage-cabinet" },
   { id: "rv-socket", section: "Synthetic Lighting And AV", text: "nos. synthetic socket point", quantity: 5, unit: "nos", keyword: "synthetic-lighting-and-av-synthetic-socket-point" },
   { id: "rv-light", section: "Synthetic Lighting And AV", text: "nos. synthetic spotlight 6 inch", quantity: 6, unit: "nos", keyword: "synthetic-lighting-and-av-synthetic-spotlight-6-inch" },
+  // X'd and saved, then ticked back in, then revised: by size, by detail, into another item.
+  { id: "rv-panel", section: "Synthetic Graphics", text: "nos. synthetic printed system panel", quantity: 4, unit: "nos", keyword: "synthetic-graphics-synthetic-printed-system-panel" },
+  { id: "rv-decal", section: "Synthetic Graphics", text: "nos. synthetic counter decal", quantity: 6, unit: "nos", keyword: "synthetic-graphics-synthetic-counter-decal" },
+  { id: "rv-spot", section: "Synthetic Lighting And AV", text: "nos. synthetic spotlight 3 inch", quantity: 7, unit: "nos", keyword: "synthetic-lighting-and-av-synthetic-spotlight-3-inch" },
 ];
+const TICKED_BACK = ["rv-panel", "rv-decal", "rv-spot"];
 const slug = (text) => text.toLowerCase().replace(/[^a-z0-9]+/g, "-");
 const titles = [...new Set(LINES.map((line) => line.section))];
 const scenario = { basis_chat_reply: true, mark_estimates: true, raw: {
@@ -126,7 +131,7 @@ try {
     await (await run.basisControl(page, id, '[data-basis-tag]:not([data-basis-tag="Exclude"])')).click();
     await idle(page);
   }
-  for (const id of ["rv-cover", "rv-cabinet", "rv-socket"]) await run.tag(page, id, "Exclude");
+  for (const id of ["rv-cover", "rv-cabinet", "rv-socket", ...TICKED_BACK]) await run.tag(page, id, "Exclude");
   await toOutput(page);
   for (const [id, price] of [["rv-wall", "55.50"], ["rv-vinyl", "9.25"], ["rv-table", "20"]]) await typePrice(page, id, price);
   const before = await outputRows(page);
@@ -147,12 +152,17 @@ try {
   cards.waste = await revise(page, "standard-waste-disposal", "should be recycling at the venue", { text: "Waste disposal and recycling at the venue" });
   cards.cabinet = await revise(page, "rv-cabinet", "include this please", { text: "[ nos. synthetic storage cabinet ]", tag: "Include" });
   await run.tag(page, "rv-socket", "Include");
+  for (const id of TICKED_BACK) await run.tag(page, id, "Include");
+  const panelText = (await basisLine(page, "rv-panel")).text;
+  cards.panel = await revise(page, "rv-panel", "quantity should be 5 nos", { text: panelText, quantity: 5, unit: "nos" });
+  cards.decal = await revise(page, "rv-decal", "colour should be black", { text: "[ nos. synthetic counter decal ] - black colour" });
+  cards.spot = await revise(page, "rv-spot", "should be wall washer", { text: "wall washer" });
   result.cards = cards;
   // The preview shows each size, and the notice only where a catalogue price will go.
   assert(cards.wallQuantity.includes("12 sqm Feature wall") && cards.wallQuantity.includes("15 sqm Feature wall"), "the preview hides the size change", cards.wallQuantity);
   const NOTICE = "This is no longer the same catalogue item, so its catalogue price will not be kept.";
   for (const [name, card] of Object.entries(cards)) {
-    assert(card.includes(NOTICE) === (name === "carpet"), "the catalogue notice is wrong", { name, card });
+    assert(card.includes(NOTICE) === ["carpet", "spot"].includes(name), "the catalogue notice is wrong", { name, card });
   }
   await idle(page);
   // Re's Include is the line's own tick: the same saved tag and mark, and the same price at Confirm.
@@ -165,6 +175,23 @@ try {
   assert(applied.rows["rv-wall"].amount === 832.5, "the saved row's amount is not for the new size", applied.rows["rv-wall"]);
   // A typed price stays in the currency it was typed in (a reference-currency price: the table below).
   assert(["rv-wall", "rv-vinyl", "rv-table"].every((id) => applied.rows[id].currency === "SGD"), "a typed price changed currency", applied.rows);
+  // A line ticked back in and then revised is still saved as excluded with its tick until Confirm, on this
+  // page and after a reopen (PR 432: no unconfirmed line is saved as included).
+  const waiting = (saved) => Object.fromEntries(TICKED_BACK.map((id) => [id, [saved.lines[id].tag, saved.rows[id].mark]]));
+  result.tickedBack = { applied: waiting(applied) };
+  const wanted = Object.fromEntries(TICKED_BACK.map((id) => [id, ["Exclude", true]]));
+  assert(JSON.stringify(result.tickedBack.applied) === JSON.stringify(wanted), "a revised line ticked back in was saved as included", result.tickedBack);
+  // Seventeen Re edits in a minute reach the app's per-minute save limit (30), which staff never do: let it pass.
+  await page.waitForTimeout(61000);
+  await toDashboard(page);
+  await run.openDashboardQuote(page, sessionId);
+  await run.openPanel(page, "basis");
+  result.tickedBack.reopened = await page.evaluate((ids) => Object.fromEntries(ids.map((id) => [id, [
+    normalizeBasisTag(state.quoteBasisSections.flatMap((section) => section.lines).find((line) => line.id === id).tag),
+    Boolean(state.lineItems.find((row) => row.source_basis_line_id === id)?.reincluded_catalog_selection)]])), TICKED_BACK);
+  assert(JSON.stringify(result.tickedBack.reopened) === JSON.stringify(Object.fromEntries(TICKED_BACK.map((id) => [id, ["Include", true]]))),
+    "the reopened quote lost a tick waiting for Confirm", result.tickedBack);
+  assert(JSON.stringify(waiting(await savedRows(sessionId))) === JSON.stringify(wanted), "the reopen saved a waiting line as included");
 
   await toOutput(page);
   const expected = {
@@ -180,6 +207,10 @@ try {
     "standard-waste-disposal": { ...before["standard-waste-disposal"], description: "Waste disposal and recycling at the venue" },
     "rv-cabinet": { description: "nos. synthetic storage cabinet", quantity: 3, unit: "nos", variant: "catalog", price: 21.6, mode: "Priced", deferred: false },
     "rv-socket": { description: "nos. synthetic socket point", quantity: 5, unit: "nos", variant: "catalog", price: 12, mode: "Priced", deferred: false },
+    // Ticked back in, revised, reopened: the same item gets its catalogue price back; another item asks again.
+    "rv-panel": { description: "nos. synthetic printed system panel", quantity: 5, unit: "nos", variant: "catalog", price: 28.8, mode: "Priced", deferred: false },
+    "rv-decal": { description: "nos. synthetic counter decal", quantity: 6, unit: "nos", variant: "catalog", price: 8.75, mode: "Priced", deferred: false },
+    "rv-spot": { description: "wall washer", quantity: 7, unit: "nos", variant: "none", price: null, mode: "Priced", deferred: false },
   };
   const same = (where, actual, wanted) => {
     for (const id of new Set([...Object.keys(actual), ...Object.keys(wanted)])) {
@@ -190,10 +221,10 @@ try {
   same("first Confirm after Apply", result.confirmed, expected);
   const missing = await page.evaluate(() => state.outputErrors);
   const unpriced = await page.evaluate(() => state.outputRows.filter((row) => effectiveOutputUnitPrice(row) === null && row.price_mode !== "Included").map((row) => row.source_basis_line_id).sort());
-  assert(JSON.stringify(unpriced) === JSON.stringify(["rv-carpet", "rv-counter", "rv-door", "rv-sign"]) && missing.length === 4
+  assert(JSON.stringify(unpriced) === JSON.stringify(["rv-carpet", "rv-counter", "rv-door", "rv-sign", "rv-spot"]) && missing.length === 5
     && missing.every((text) => text.endsWith("Unit price is required.")), "Output asks for the wrong prices", { missing, unpriced });
 
-  for (const [id, price] of [["rv-carpet", "30"], ["rv-counter", "40"], ["rv-door", "70"], ["rv-sign", "15"]]) {
+  for (const [id, price] of [["rv-carpet", "30"], ["rv-counter", "40"], ["rv-door", "70"], ["rv-sign", "15"], ["rv-spot", "18"]]) {
     await typePrice(page, id, price);
     expected[id] = { ...expected[id], variant: "manual", price: Number(price) };
   }
@@ -212,7 +243,7 @@ try {
   same("second Confirm", await outputRows(page), expected);
   assert(!(await page.evaluate(() => state.outputErrors)).length, "Output still asks for a price");
 
-  // Fourteen Re edits in a minute reach the app's per-minute save limit (30), which staff never do: let it pass.
+  // The prices, reopen and Confirm since then reach the same limit again.
   await page.waitForTimeout(61000);
   const download = page.waitForEvent("download", { timeout: 90000 });
   await page.locator("#sideDownloadButton").click();
@@ -253,6 +284,8 @@ try {
       manualCatalogue: ["rv-vinyl", rowOf("rv-vinyl")],
       catalogue: ["rv-banner", rowOf("rv-banner")],
       included: ["standard-waste-disposal", rowOf("standard-waste-disposal")],
+      // Included once, but its authority no longer holds (another currency): it becomes an ordinary priced row.
+      includedStale: ["standard-project-management-fee", withAuthority("standard-project-management-fee", (row) => { row.pricing_authority.currency = "USD"; })],
       discussed: ["rv-counter", withAuthority("rv-counter", (row) => { row.pricing_authority = buildPricingAuthority("none", row); delete row.unit_price_override; row.unmatched_pricing_offer = row.deferred_pricing = "a".repeat(64); })],
       historical: ["rv-door", withAuthority("rv-door", (row) => { row.pricing_authority = buildPricingAuthority("historical", row); })],
       tampered: ["rv-graphic", withAuthority("rv-graphic", (row) => { row.pricing_authority.price = 1; })],
@@ -280,7 +313,7 @@ try {
         const after = edit(before);
         const next = revisedQuoteRowForApply(row, before, after);
         out[held + " " + change] = next === row ? "unchanged"
-          : { variant: next.pricing_authority?.variant, price: pricingAuthorityPrice(next.pricing_authority), discussed: Boolean(next.deferred_pricing) };
+          : { variant: next.pricing_authority?.variant, price: pricingAuthorityPrice(next.pricing_authority), discussed: Boolean(next.deferred_pricing), mode: next.price_mode };
         rows[rows.findIndex((entry) => entry.source_basis_line_id === id)] = next;
         sections.forEach((section) => { section.lines = section.lines.map((line) => (line.id === id ? after : line)); });
       }
@@ -294,7 +327,7 @@ try {
       const served = new Map((response?.data?.line_items || []).map((row) => [row.source_basis_line_id, row]));
       for (const [held, [id]] of Object.entries(HELD)) {
         const row = served.get(id);
-        out["server " + held + " " + change] = row ? { variant: row.pricing_authority?.variant, price: pricingAuthorityPrice(row.pricing_authority) } : null;
+        out["server " + held + " " + change] = row ? { variant: row.pricing_authority?.variant, price: pricingAuthorityPrice(row.pricing_authority), mode: row.price_mode } : null;
       }
     }
     return out;
@@ -309,10 +342,10 @@ try {
     quantity: ["manualReference", "manualOwn", "manualCatalogue", "catalogue", "included"],
     wordingAndQuantity: ["manualReference", "manualOwn", "manualCatalogue", "catalogue", "included"],
   };
-  const HELD_KINDS = ["manualReference", "manualOwn", "manualCatalogue", "catalogue", "included", "discussed", "historical", "tampered", "otherCurrency", "none"];
+  const HELD_KINDS = ["manualReference", "manualOwn", "manualCatalogue", "catalogue", "included", "includedStale", "discussed", "historical", "tampered", "otherCurrency", "none"];
   // A changed unit alias or tag alone is no change to the row: it is left exactly as it was.
   const UNTOUCHED_ON_SERVER = { manualReference: ["manual", 16.25], manualOwn: ["manual", 55.5], manualCatalogue: ["manual", 9.25], catalogue: ["catalog", 21.6], included: ["included", 0],
-    discussed: ["none", null], historical: ["historical", null], otherCurrency: ["historical", null], none: ["none", null] };
+    includedStale: ["historical", null], discussed: ["none", null], historical: ["historical", null], otherCurrency: ["historical", null], none: ["none", null] };
   const wrong = [];
   for (const change of ["wording", "otherItem", "unit", "unitAlias", "quantity", "tag", "wordingAndQuantity"]) {
     for (const held of HELD_KINDS) {
@@ -325,11 +358,15 @@ try {
         continue;
       }
       const kept = KEEPS[change].includes(held) ? KEPT[held] : ["none", null];
-      if (JSON.stringify(page) !== JSON.stringify({ variant: kept[0], price: kept[1], discussed: false })) wrong.push([held, change, "page", page, kept]);
+      if (JSON.stringify(page) !== JSON.stringify({ variant: kept[0], price: kept[1], discussed: false, mode: kept[0] === "included" ? "Included" : "Priced" })) wrong.push([held, change, "page", page, kept]);
       // The server's own live grant gives the real catalogue price back to a forged one while the item stays the same.
       const served = held === "tampered" && ["wording", "quantity", "wordingAndQuantity"].includes(change) ? ["catalog", 21] : kept;
       if (JSON.stringify([server?.variant, server?.price]) !== JSON.stringify(served)) wrong.push([held, change, "server", server, served]);
     }
+  }
+  // A row that was Included but no longer holds that authority is priced again, never left reading Included.
+  for (const change of Object.keys(KEEPS)) {
+    if (table["server includedStale " + change]?.mode !== "Priced") wrong.push(["includedStale", change, "server mode", table["server includedStale " + change]]);
   }
   assert(!wrong.length, "the price rule differs from its table", wrong);
 

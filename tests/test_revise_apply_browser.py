@@ -19,7 +19,7 @@ class ReviseApplyBrowserTest(unittest.TestCase):
             result = subprocess.run(
                 [fixtures.require_node(self), 'scripts/playwright-revise-line.mjs'],
                 env={**os.environ, 'SQAG_OWNER_UAT_EVIDENCE_ROOT': evidence_root},
-                text=True, capture_output=True, cwd=fixtures.ROOT, timeout=420,
+                text=True, capture_output=True, cwd=fixtures.ROOT, timeout=600,
             )
         self.assertEqual(result.returncode, 0, (result.stderr or result.stdout)[-4000:])
         evidence = json.loads(result.stdout[result.stdout.index('{'):])
