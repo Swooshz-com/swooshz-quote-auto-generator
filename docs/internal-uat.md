@@ -58,11 +58,25 @@ Record one row per line in the run's evidence:
 | --- | --- | --- | --- | --- |
 | DB-01 | A | D | PASS | 12 rows, counts 12 / 7 / 7 |
 
-- **Result:** `PASS`, `FAIL` (what was seen instead, and how to repeat it),
-  `NOT RUN` (why), or `N/A` (the control is not shown in this setup, and why).
-- Any `FAIL` goes back to the builder before the owner is asked.
+- **Result:** `PASS`, `KNOWN, PLANNED` (see below), `FAIL` (what was seen
+  instead, and how to repeat it), `NOT RUN` (why), or `N/A` (the control is
+  not shown in this setup, and why).
+- **Before marking a line `FAIL`,** check whether a planned change already
+  covers it: the open tasks under the programme's parent issue (named in
+  `.github/toolkit-programme.json`), their task pages and recorded decisions,
+  and their G0 plans in the evidence store. If one does, the result is
+  `KNOWN, PLANNED`, naming the task and slice (for example "task <number>,
+  slice R2"). It does not block the release and never goes on the owner's
+  list.
+- **A `FAIL` blocks the release** only when no plan covers it and it is
+  either new in this release or breaks a safety or pricing rule. It goes back to the
+  builder before the owner is asked.
+- **Any other `FAIL`** is recorded on its area's open task (or a new task, if
+  none fits). The owner decides only whether it is fixed before live or
+  later.
 - **The owner's list** is every `H` line plus every `NOT RUN` line, each in
-  one plain sentence with where to click. Nothing else goes to the owner.
+  one plain sentence with where to click, and the fix-before-live-or-later
+  decision for each non-blocking `FAIL`. Nothing else goes to the owner.
 
 ## Lines
 

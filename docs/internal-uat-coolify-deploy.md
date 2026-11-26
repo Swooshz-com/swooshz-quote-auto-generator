@@ -491,7 +491,11 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      and runs every line of the [release UAT checklist](internal-uat.md) on
      the copy, plus this release's own UAT steps. Every line and step must
      pass, or be recorded NOT RUN with its reason, before the owner is asked;
-     a failure goes back to the builder. The owner's UAT list is only the
+     a blocking failure goes back to the builder. A failure an open task's
+     plan already covers is recorded as known and planned with that task and
+     slice; only a failure no plan covers that is new in this release or
+     breaks a safety or pricing rule blocks the release, and any other goes
+     to its area's open task for the owner to place before live or later. The owner's UAT list is only the
      checklist's human-eye lines, the lines the agent could not run, and any
      release step the agent could not run. Expect every quote of your own saved on live to reopen with Quote Basis
      locked until Next in Customer is pressed: the copy's `SESSION_SECRET`
