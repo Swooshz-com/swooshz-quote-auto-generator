@@ -70,5 +70,10 @@ idle connections before the generator runs, and publication is a new stage.
 Only the thread that started the request sees its `RequestWork`. Deletes,
 draft and basis-chat jobs, retention, migrations, scripts and warm-up open one
 connection per block as before. Nothing outlives the request: there is no
-connection pool and no cache. `tests/test_request_work_budget.py` holds each
+connection pool and no cache. Because a rollback does not reset session-level
+PostgreSQL state, code that runs on these connections must not use any: no
+`SET` without `LOCAL`, no `set_config(..., false)`, no session advisory locks
+(use the `_xact_` forms) and no temporary tables. Each returned connection costs
+one rollback round trip when its block left a transaction open; closing it
+used not to wait. `tests/test_request_work_budget.py` holds each
 route's connection, schema-check, statement and object-read counts.
