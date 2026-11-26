@@ -232,6 +232,7 @@ branch-protection setting is changed by this contract.
 | Save, reload, Modify, interrupted duplicate and restored pricing authority | Full app smoke; full alpha smoke; saved Modify/restoration Python test | CI selects the maintained full app and alpha commands plus an isolated recovery command. Discovery includes the saved Modify/restoration test; browser selection is not a passing runtime receipt. |
 | Upload, basis review and generated XLSX | `tests.test_generate_quote`; `tests.test_quote_flow_reliability`; app smoke | Python discovery and full app smoke use synthetic inputs. No paid inference or customer files. |
 | Durable publication, protected XLSX/PDF and rollback | `tests.test_quote_publication_projection`; `tests.test_object_pdf_completion`; `tests.test_postgres_metadata_storage` | Python discovery; publication tests use local databases and synthetic object/query adapters. Disposable PostgreSQL migration coverage does not qualify the full publication journey or live Neon/R2. |
+| Database work per request (load speed) | `tests.test_request_work` (connection and schema-check rules as tables); `tests.test_request_work_budget` (each route's counts) | Discovery; SQLite always, the disposable PostgreSQL 17 service in CI. Connections, schema checks and object reads are exact on both engines, statements exact on SQLite and printed on PostgreSQL. Modelled and wall times are printed, never asserted; live latency is not measured here. |
 | PostgreSQL migration and runtime privileges | `tests.test_postgres_migration_ledger`; `tests.test_runtime_privilege_contract` | Discovery with the disposable PostgreSQL 17 service; missing local service is a dependency skip, not hosted readiness. |
 | Workbook layout and actual rendered PDF | `tests.test_generate_quote` native LibreOffice cases | Discovery after CI converter/font readiness checks. Local renderer skips leave fidelity unverified; XLSX remains the default master. |
 | Quote Templates editor (Settings) and the profile's template choice | `tests.test_quote_template_editor_model` (the page's editor model against the Python reader: a problem shows exactly when the reader refuses); `tests.test_quote_template_editor_endpoints` (preview files from the real child process: no converter, a converter that fails, a crash and a timeout; every error reference found in the server log; 6-a-minute preview limit, admin list layouts and usage, `/api/profiles` template names on one connection, from its own workspace only and before migration 013, the profile template operation and switching back to the profile's own layout); `tests.test_quote_template_generation` (a switched-back profile gives the same Excel and PDF output as an untouched one); `tests.test_quote_template_permissions`; `tests.test_webapp.WebappServerTest.test_static_quote_templates_settings_contract`; quote-templates browser suite | Discovery and the direct browser command on a synthetic SQLite database server. The PDF preview is checked only where LibreOffice is installed (required in CI). Screenshots are compared with the approved mockup by hand. |
@@ -1279,6 +1280,21 @@ S3 transport, installed performance, real PDF rendering, native viewer acceptanc
 owner UAT. Direct post-commit warning coverage uses the reachable local publication
 path; database/object generation finalises atomically and has no equivalent later
 projection-read warning branch.
+
+## Database work per request
+
+`RequestWork` (see [architecture](ARCHITECTURE.md)) gives each request or job
+stage one database connection where blocks run one after another, and one check
+per schema. `tests.test_request_work_budget` drives the list, profiles, reopen,
+downloads, save, Confirm, normalize, job start, the job worker and the job poll
+over HTTP, and fails when any count moves: connections, connections still open
+when the request ends, schema checks, statements or object reads. A lower count
+is the goal of the load-speed work: lower the expected number in the same
+change. A higher count needs a stated reason in the PR. Adding an exported quote
+must not add a connection to the list. `tests.test_request_work` covers the
+connection rules: reuse, rollback on return, a failed commit or dropped socket,
+nested blocks, other threads, the role check, idle age, the stage boundary
+before the generator and failed schema checks.
 
 ## Quote admission registry source
 

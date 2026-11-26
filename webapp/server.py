@@ -12674,6 +12674,148 @@ class ObjectArtifactDeletionPlan:
     state: str = 'prepared'
 
 
+@dataclass(eq=False)
+class _RequestWorkConnection:
+    key: tuple[Any, ...]
+    manager: Any
+    connection: Any
+    returned_at: float = 0.0
+
+
+REQUEST_WORK_CONTEXT: contextvars.ContextVar["RequestWork | None"] = contextvars.ContextVar(
+    "sqag_request_work", default=None
+)
+
+
+class RequestWork:
+    """Database work of one HTTP request or one generation job stage.
+
+    Owns the physical database connections opened while it is active and the
+    schema checks that passed. A block asking for a connection gets one that no
+    other block holds. A clean exit rolls it back, dropping uncommitted work
+    exactly as close() does, and keeps it for the next block with the same
+    database URL and session role, for at most IDLE_REUSE_SECONDS. An exception
+    leaving the block, or a failed rollback, closes that connection for good. A
+    nested block gets a second connection, so transactions, locks and visibility
+    stay as they were. Only the thread that created it sees it: other threads
+    (job workers, pools that copy the context) open their own connections as
+    before. A failed schema check is never recorded. close() closes every
+    connection it opened. Without an active RequestWork every caller behaves
+    exactly as before (retention, migrations, scripts, warm-up).
+    """
+
+    # An idle connection older than this is closed rather than reused, so a
+    # request that waited on a long outside call never meets a dropped socket.
+    IDLE_REUSE_SECONDS = 30.0
+
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self._thread_id = threading.get_ident()
+        self._clock = clock
+        self._idle: dict[tuple[Any, ...], list[_RequestWorkConnection]] = {}
+        self._open: list[_RequestWorkConnection] = []
+        self._schema_ready: set[tuple[Any, ...]] = set()
+        self._closed = False
+
+    @classmethod
+    def current(cls) -> "RequestWork | None":
+        work = REQUEST_WORK_CONTEXT.get()
+        if work is None or work._closed or work._thread_id != threading.get_ident():
+            return None
+        return work
+
+    @classmethod
+    @contextlib.contextmanager
+    def scope(cls):
+        """Run the block with one RequestWork; an active one in this thread is reused."""
+        active = cls.current()
+        if active is not None:
+            yield active
+            return
+        work = cls()
+        token = REQUEST_WORK_CONTEXT.set(work)
+        try:
+            yield work
+        finally:
+            REQUEST_WORK_CONTEXT.reset(token)
+            work.close()
+
+    @classmethod
+    def end_stage(cls) -> None:
+        """Close idle connections and forget schema results, before work that needs no database."""
+        work = cls.current()
+        if work is None:
+            return
+        idle = [held for connections in work._idle.values() for held in connections]
+        work._idle.clear()
+        work._schema_ready.clear()
+        for held in idle:
+            work._discard(held)
+
+    @property
+    def open_connections(self) -> int:
+        return len(self._open)
+
+    @contextlib.contextmanager
+    def connection(self, key: tuple[Any, ...], opener: Callable[[], Any]):
+        held = self._checkout(key, opener)
+        try:
+            yield held.connection
+        except BaseException:
+            self._discard(held)
+            raise
+        self._give_back(held)
+
+    def schema_ready(self, key: tuple[Any, ...]) -> bool:
+        return key in self._schema_ready
+
+    def record_schema_ready(self, key: tuple[Any, ...]) -> None:
+        self._schema_ready.add(key)
+
+    def close(self) -> None:
+        self._closed = True
+        self._idle.clear()
+        self._schema_ready.clear()
+        for held in list(self._open):
+            self._discard(held)
+
+    def _checkout(self, key: tuple[Any, ...], opener: Callable[[], Any]) -> _RequestWorkConnection:
+        if self._closed or self._thread_id != threading.get_ident():
+            raise RuntimeError("Request database work is not active in this thread.")
+        idle = self._idle.get(key)
+        now = self._clock()
+        while idle:
+            held = idle.pop()
+            if now - held.returned_at <= self.IDLE_REUSE_SECONDS:
+                return held
+            self._discard(held)
+        manager = opener()
+        held = _RequestWorkConnection(key, manager, manager.__enter__())
+        self._open.append(held)
+        return held
+
+    def _give_back(self, held: _RequestWorkConnection) -> None:
+        if self._closed:
+            self._discard(held)
+            return
+        try:
+            held.connection.rollback()
+        except Exception:
+            self._discard(held)
+            return
+        held.returned_at = self._clock()
+        self._idle.setdefault(held.key, []).append(held)
+
+    def _discard(self, held: _RequestWorkConnection) -> None:
+        if held in self._open:
+            self._open.remove(held)
+        try:
+            held.manager.__exit__(None, None, None)
+        except Exception:
+            # The connection is being thrown away; a failed close only means it
+            # was already gone. Any work on it was committed or is dropped.
+            pass
+
+
 class DatabaseSqagStorage:
     storage_backend = "database"
     supports_atomic_forensic_publication = True
@@ -12711,6 +12853,15 @@ class DatabaseSqagStorage:
             )
 
     def connection(self):
+        work = RequestWork.current()
+        if work is not None:
+            return work.connection(self._connection_key(), self._open_connection)
+        return self._open_connection()
+
+    def _connection_key(self) -> tuple[Any, ...]:
+        return (self.database_family, self.database_url, self.expected_session_role)
+
+    def _open_connection(self):
         if self.database_family == "postgres_compatible":
             return postgres_storage_connection(self.database_url, expected_role=self.expected_session_role)
         return sqlite_storage_connection(self.database_url)
@@ -12861,6 +13012,26 @@ class DatabaseSqagStorage:
         )
 
     def _ensure_schema(
+        self,
+        required: dict[str, set[str]],
+        *,
+        reason: str,
+        require_telemetry_successor: bool = False,
+    ) -> None:
+        work = RequestWork.current()
+        key: tuple[Any, ...] = ()
+        if work is not None:
+            key = (
+                "schema", *self._connection_key(), reason, require_telemetry_successor,
+                tuple(sorted((table, tuple(sorted(columns))) for table, columns in required.items())),
+            )
+            if work.schema_ready(key):
+                return
+        self._check_schema(required, reason=reason, require_telemetry_successor=require_telemetry_successor)
+        if work is not None:
+            work.record_schema_ready(key)
+
+    def _check_schema(
         self,
         required: dict[str, set[str]],
         *,
@@ -32905,7 +33076,9 @@ def run_job_worker(
 ) -> None:
     token = QUOTE_SPEND_CONTEXT.set(quote_spend)
     try:
-        with ai_log_tracking_scope(ai_tracking_context, auth_session=auth_session):
+        # Generation runs in request-sized stages; draft and chat workers wait on AI and open per block as before.
+        stage = RequestWork.scope() if worker in {finish_generate_job, finish_generate_pdf_job} else contextlib.nullcontext()
+        with ai_log_tracking_scope(ai_tracking_context, auth_session=auth_session), stage:
             if worker in {finish_generate_job, finish_generate_pdf_job, finish_draft_job, finish_basis_chat_job}:
                 worker(job_id, payload, auth_session=auth_session)
             else:
@@ -34823,6 +34996,8 @@ def _run_quote_job(
     if normalized_pdf_mode != "none":
         command.extend(["--pdf-mode", normalized_pdf_mode])
 
+    # No database connection stays open while the generator runs; publication is a new stage.
+    RequestWork.end_stage()
     try:
         completed = subprocess.run(
         command,
@@ -35382,6 +35557,10 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
     server_version = "SwooshzQuoteGenerator/0.1"
 
     def do_GET(self) -> None:
+        with RequestWork.scope():
+            self.handle_get_request()
+
+    def handle_get_request(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
         is_exact_health_get = path == "/api/health"
@@ -35839,6 +36018,10 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         self.send_json({"error": "Not found"}, status=404)
 
     def do_POST(self) -> None:
+        with RequestWork.scope():
+            self.handle_post_request()
+
+    def handle_post_request(self) -> None:
         if self.block_untrusted_host():
             return
         parsed = urlparse(self.path)
