@@ -14760,9 +14760,12 @@ function revisedQuoteRowForApply(row, before, line) {
   // Like every row, normalised: the kept price sets the amount for the new size (a mismatch keeps no price).
   // A line ticked back in keeps its mark, as a typed size does: the draft still saves it as excluded, and
   // Confirm restores the price only while the mark matches the line (dropUnusableReinclusions, the server).
+  // A waiting row whose price staff took away (deleted or retyped in Output) stays that way whatever Re
+  // changes, so Confirm still drops it and Output asks for a price; only a new tick or Reset Output undoes it.
+  const released = !authority && Boolean(row.reincluded_catalog_selection) && row.pricing_authority?.variant === "historical";
   return {
-    ...normalizeLineItem({ ...next, pricing_authority: authority || buildPricingAuthority("none", next) }),
-    ...(!unitChanged && row.reincluded_catalog_selection ? { reincluded_catalog_selection: row.reincluded_catalog_selection } : {}),
+    ...normalizeLineItem({ ...next, pricing_authority: authority || buildPricingAuthority(released ? "historical" : "none", next) }),
+    ...((released || !unitChanged) && row.reincluded_catalog_selection ? { reincluded_catalog_selection: row.reincluded_catalog_selection } : {}),
   };
 }
 
