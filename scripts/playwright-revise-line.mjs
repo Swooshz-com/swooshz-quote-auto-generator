@@ -10,7 +10,8 @@ const run = new SyntheticQuoteRun("revise-line");
 const LINES = [
   { id: "rv-wall", section: "Synthetic Structures", text: "Feature wall 4m W x 3m H with laminate finish", quantity: 12, unit: "sqm", tag: "Include", estimated: true },
   { id: "rv-counter", section: "Synthetic Structures", text: "Reception counter with timber top", quantity: 2, unit: "nos", tag: "Confirm" },
-  { id: "rv-door", section: "Synthetic Structures", text: "Storage room door with lock", quantity: 1, unit: "nos", tag: "Include", noRow: true },
+  { id: "rv-door", section: "Synthetic Structures", text: "Storage room door with lock", quantity: 1, unit: "nos", tag: "Include" },
+  { id: "rv-sign", section: "Synthetic Structures", text: "Wall sign with company name", quantity: 1, unit: "nos", tag: "Include" },
   { id: "rv-carpet", section: "Synthetic Floors", text: "sqm synthetic carpet tile", quantity: 36, unit: "sqm", keyword: "synthetic-floors-synthetic-carpet-tile", estimated: true },
   { id: "rv-vinyl", section: "Synthetic Floors", text: "sqm synthetic vinyl floor finish", quantity: 8, unit: "sqm", keyword: "synthetic-floors-synthetic-vinyl-floor-finish" },
   { id: "rv-cover", section: "Synthetic Floors", text: "sqm synthetic reusable floor cover", quantity: 10, unit: "sqm", keyword: "synthetic-floors-synthetic-reusable-floor-cover" },
@@ -30,10 +31,9 @@ const scenario = { basis_chat_reply: true, mark_estimates: true, raw: {
     id: line.id, tag: line.tag || "Include", text: line.text, quantity: line.quantity, unit: line.unit, confidence_pct: 95,
     quantity_estimated: Boolean(line.estimated), pricing_keyword: line.keyword || "",
   })) })),
-  line_items: LINES.filter((line) => !line.noRow).flatMap((line) => Array.from({ length: line.rows || 1 }, (_, index) => ({
-    source_basis_line_id: line.id, section: line.section, description: index ? line.text + " (second row)" : line.text,
-    quantity: line.quantity, unit: line.unit, pricing_keyword: line.keyword || "",
-  }))),
+  line_items: LINES.map((line) => ({
+    source_basis_line_id: line.id, section: line.section, description: line.text, quantity: line.quantity, unit: line.unit, pricing_keyword: line.keyword || "",
+  })),
 } };
 const IDS = [...LINES.map((line) => line.id), "standard-project-management-fee", "standard-waste-disposal"];
 
@@ -76,7 +76,9 @@ const revise = async (page, id, message, replacement, { apply = true, shot = "" 
   await page.locator("#basisChatOverlay.is-open").waitFor({ state: "visible", timeout: 15000 });
   await page.locator("#basisChatPrompt").fill(message);
   await page.locator("#basisChatSendButton").click();
-  await page.locator("#basisChatApplyButton:not([disabled])").waitFor({ state: "visible", timeout: 30000 });
+  await page.locator("#basisChatApplyButton:not([disabled])").waitFor({ state: "visible", timeout: 30000 }).catch(async (error) => {
+    throw new Error("no preview for " + id + ": " + await page.locator("#basisChatMessages").innerText(), { cause: error });
+  });
   const card = (await page.locator("#basisChatProposal").innerText()).replace(/\s+/g, " ").trim();
   if (shot) await page.locator("#basisChatOverlay .basis-chat-panel").first().screenshot({ path: path.join(run.runRoot, shot) });
   if (apply) {
@@ -97,7 +99,7 @@ const savedRows = async (sessionId) => {
       .map((line) => [line.id, { text: line.text, tag: line.tag, quantity: line.quantity, estimate: Boolean(line.quantity_estimate) }])),
     rows: Object.fromEntries(draft.lineItems.filter((row) => IDS.includes(row.source_basis_line_id))
       .map((row) => [row.source_basis_line_id, { description: row.description, variant: row.pricing_authority?.variant, price: row.pricing_authority?.price ?? null,
-        currency: row.pricing_authority?.price_currency || "", mark: Boolean(row.reincluded_catalog_selection) }])),
+        currency: row.pricing_authority?.price_currency || "", amount: row.pricing_basis_amount ?? null, mark: Boolean(row.reincluded_catalog_selection) }])),
   };
 };
 const workbookRows = (file) => {
@@ -140,6 +142,8 @@ try {
   cards.cover = await revise(page, "rv-cover", "colour should be blue", { text: "[ sqm synthetic reusable floor cover ] - blue colour", tag: "Exclude" });
   cards.counter = await revise(page, "rv-counter", "top should be marble", { text: "Reception counter with marble top" });
   cards.door = await revise(page, "rv-door", "door should be glass", { text: "Storage room glass door with lock" });
+  // Text that starts like a formula stays text in the workbook.
+  cards.sign = await revise(page, "rv-sign", "sign should be +65 6123 4567 hotline", { text: "+65 6123 4567 hotline on wall sign" });
   cards.waste = await revise(page, "standard-waste-disposal", "should be recycling at the venue", { text: "Waste disposal and recycling at the venue" });
   cards.cabinet = await revise(page, "rv-cabinet", "include this please", { text: "[ nos. synthetic storage cabinet ]", tag: "Include" });
   await run.tag(page, "rv-socket", "Include");
@@ -157,6 +161,8 @@ try {
   assert(JSON.stringify(result.reinclude.re) === JSON.stringify(["Exclude", true]) && JSON.stringify(result.reinclude.tick) === JSON.stringify(["Exclude", true]),
     "Re Include saved something the tick does not", result.reinclude);
   assert(!applied.lines["rv-wall"].estimate && applied.lines["rv-carpet"].estimate, "Est. is wrong after Apply", applied.lines);
+  // The saved row already agrees with its line: the kept price times the new size.
+  assert(applied.rows["rv-wall"].amount === 832.5, "the saved row's amount is not for the new size", applied.rows["rv-wall"]);
   // A typed price stays in the currency it was typed in (a reference-currency price: the table below).
   assert(["rv-wall", "rv-vinyl", "rv-table"].every((id) => applied.rows[id].currency === "SGD"), "a typed price changed currency", applied.rows);
 
@@ -170,6 +176,7 @@ try {
     "rv-table": { ...before["rv-table"], description: "bar table" },
     "rv-counter": { ...before["rv-counter"], description: "Reception counter with marble top", deferred: false },
     "rv-door": { ...before["rv-door"], description: "Storage room glass door with lock" },
+    "rv-sign": { ...before["rv-sign"], description: "+65 6123 4567 hotline on wall sign" },
     "standard-waste-disposal": { ...before["standard-waste-disposal"], description: "Waste disposal and recycling at the venue" },
     "rv-cabinet": { description: "nos. synthetic storage cabinet", quantity: 3, unit: "nos", variant: "catalog", price: 21.6, mode: "Priced", deferred: false },
     "rv-socket": { description: "nos. synthetic socket point", quantity: 5, unit: "nos", variant: "catalog", price: 12, mode: "Priced", deferred: false },
@@ -182,9 +189,11 @@ try {
   result.confirmed = await outputRows(page);
   same("first Confirm after Apply", result.confirmed, expected);
   const missing = await page.evaluate(() => state.outputErrors);
-  assert(JSON.stringify(missing) === JSON.stringify(["Row 1: Unit price is required.", "Row 4: Unit price is required.", "Row 5: Unit price is required."]), "Output asks for the wrong prices", missing);
+  const unpriced = await page.evaluate(() => state.outputRows.filter((row) => effectiveOutputUnitPrice(row) === null && row.price_mode !== "Included").map((row) => row.source_basis_line_id).sort());
+  assert(JSON.stringify(unpriced) === JSON.stringify(["rv-carpet", "rv-counter", "rv-door", "rv-sign"]) && missing.length === 4
+    && missing.every((text) => text.endsWith("Unit price is required.")), "Output asks for the wrong prices", { missing, unpriced });
 
-  for (const [id, price] of [["rv-carpet", "30"], ["rv-counter", "40"], ["rv-door", "70"]]) {
+  for (const [id, price] of [["rv-carpet", "30"], ["rv-counter", "40"], ["rv-door", "70"], ["rv-sign", "15"]]) {
     await typePrice(page, id, price);
     expected[id] = { ...expected[id], variant: "manual", price: Number(price) };
   }
@@ -203,14 +212,20 @@ try {
   same("second Confirm", await outputRows(page), expected);
   assert(!(await page.evaluate(() => state.outputErrors)).length, "Output still asks for a price");
 
+  // Fourteen Re edits in a minute reach the app's per-minute save limit (30), which staff never do: let it pass.
+  await page.waitForTimeout(61000);
   const download = page.waitForEvent("download", { timeout: 90000 });
   await page.locator("#sideDownloadButton").click();
   const workbook = path.join(run.runRoot, "revised.xlsx");
-  await (await download).saveAs(workbook);
+  await (await download.catch(async (error) => {
+    throw new Error("no workbook: " + JSON.stringify(await page.evaluate(() => ({ panel: state.activeSidePanel, errors: state.outputErrors,
+      text: [...document.querySelectorAll(".modal-overlay.is-open, [role=alertdialog], .status-message, .output-validation, .error")].map((node) => node.innerText).join(" | ").slice(0, 1500) }))), { cause: error });
+  })).saveAs(workbook);
   const cells = workbookRows(workbook);
   result.workbook = {};
   for (const [id, row] of Object.entries(expected)) {
-    const found = cells.filter((cell) => cell.includes(row.description));
+    // Text starting like a formula is written with a leading apostrophe (scripts/generate_quote.py).
+    const found = cells.filter((cell) => cell.includes(row.description) || cell.includes("'" + row.description));
     assert(found.length === 1, "the workbook does not hold the row once", { id, description: row.description, found });
     result.workbook[id] = found[0];
     // The workbook holds each row's amount: quantity times the unit price, or the word Included.
@@ -220,6 +235,10 @@ try {
   for (const old of ["laminate", "sqm synthetic carpet tile", "round table", "timber top", "room door with lock", "reusable floor cover", "production venue"]) {
     assert(!cells.some((cell) => cell.some((value) => value.includes(old))), "the workbook still holds old wording", old);
   }
+  const formulas = spawnSync(process.env.PYTHON || (process.platform === "win32" ? "python" : "python3"), ["-c",
+    "import sys,zipfile,re,json; z=zipfile.ZipFile(sys.argv[1]); print(json.dumps([f for n in z.namelist() if 'worksheets/sheet' in n for f in re.findall(r'<f[^>]*>([^<]*)</f>', z.read(n).decode('utf8'))]))", workbook],
+  { encoding: "utf8" });
+  assert(formulas.status === 0 && !JSON.parse(formulas.stdout).some((formula) => formula.includes("hotline") || formula.includes("6123")), "Re text became a formula", formulas.stdout);
 
   // The price rule as a table, on the app's own functions and rows of this quote, including what Re cannot
   // reach today (a new unit) and prices that are no longer valid. Each change is then sent to the server's

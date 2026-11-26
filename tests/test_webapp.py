@@ -31449,6 +31449,7 @@ eval([
   "retagBasisLine",
   "retagBasisSectionConfirmLines",
   "applyBasisTag",
+  "commitBasisTagPlan",
   "planBasisTagChanges",
 ].map(extractFunction).join("\n"));
 

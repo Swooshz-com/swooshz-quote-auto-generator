@@ -14740,7 +14740,7 @@ function revisedQuoteRowForApply(row, before, line) {
     Object.assign(next, { price_mode: "Priced", display_price: "", unit_price_override: "", catalog_unit_price: "" });
     ["effective_unit_price", "pricing_basis_amount", "approved_quote_amount"].forEach((key) => delete next[key]);
   }
-  // normalizeLineItem checks the rebuilt authority against the new row again; a mismatch keeps no price.
+  // Like every row, normalised: the kept price sets the amount for the new size (a mismatch keeps no price).
   return normalizeLineItem({ ...next, pricing_authority: authority || buildPricingAuthority("none", next) });
 }
 
