@@ -557,7 +557,8 @@ function extract(start, end) {
   assert(first >= 0 && last > first);
   return app.slice(first, last);
 }
-eval(extract("function currentReinclusionRows", "// Saved drafts keep a line")
+eval(extract("function numberOrNull", "\nfunction ")
+  + extract("function currentReinclusionRows", "// Saved drafts keep a line")
   + extract("function validQuoteDraftVersion", "function captureOriginalAnalysisSnapshot")
   + extract("function pendingPricingSelections", "function openBlockingClarifications"));
 function setup(count, ordinary = 0, version = baseline) {

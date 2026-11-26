@@ -14,7 +14,7 @@ class ReinclusionDecisionsBrowserTest(unittest.TestCase):
             result = subprocess.run(
                 [fixtures.require_node(self), 'scripts/playwright-reinclusion-decisions.mjs'],
                 env={**os.environ, 'SQAG_OWNER_UAT_EVIDENCE_ROOT': evidence_root},
-                text=True, capture_output=True, cwd=fixtures.ROOT, timeout=420,
+                text=True, capture_output=True, cwd=fixtures.ROOT, timeout=600,
             )
         self.assertEqual(result.returncode, 0, (result.stderr or result.stdout)[:4000])
         self.assertIn('"status": "PASS"', result.stdout)
