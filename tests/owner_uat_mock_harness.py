@@ -66,7 +66,10 @@ def main() -> int:
         if not (webapp.valid_openai_model_identifier(draft_configuration.model) and webapp.valid_openai_reasoning_effort(draft_configuration.reasoning_effort)): raise RuntimeError('malformed synthetic draft configuration')
         authority = webapp.exact_pricing_reference_authority(payload, auth_session=auth_session)
         if not authority.get('ok'): raise RuntimeError('fixture pricing authority did not resolve')
-        raw = json.loads(scenario_path.read_text(encoding='utf-8'))['raw']
+        scenario = json.loads(scenario_path.read_text(encoding='utf-8'))
+        raw = scenario['raw']
+        # The provider path turns the AI's quantity_estimated flags into Est. marks before admission.
+        if scenario.get('mark_estimates'): webapp.mark_ai_estimated_quantities(raw)
         mock_invocations += 1
         (Path(sys.argv[2]).parent/'mock-provider-count.json').write_text(json.dumps({'mock_invocations':mock_invocations,'real_provider_calls':0})+'\n')
         return webapp.normalize_ai_draft(raw,payload,require_confidence=True,auth_session=auth_session)
@@ -93,6 +96,15 @@ def main() -> int:
                 'message': 'Change this line?', 'replacement_line': {'tag': basis_chat_tag, 'text': line['text'], 'confidence_pct': 95},
             }}, payload, 'openrouter', auth_session=auth_session)
         webapp.request_configured_basis_chat = owner_mock_basis_chat
+    # Or the driver writes each reply's replacement_line to basis-chat-reply.json beside the scenario
+    # before it sends; the server still admits it as a provider reply.
+    if scenario_path.is_file() and json.loads(scenario_path.read_text(encoding='utf-8')).get('basis_chat_reply'):
+        def owner_mock_basis_chat_reply(payload, auth_session=None):
+            reply = json.loads((scenario_path.parent / 'basis-chat-reply.json').read_text(encoding='utf-8'))
+            return webapp.normalize_basis_chat_result({'intent': 'proposal', 'proposal': {
+                'message': 'Change this line?', 'replacement_line': reply,
+            }}, payload, 'openrouter', auth_session=auth_session)
+        webapp.request_configured_basis_chat = owner_mock_basis_chat_reply
     original_cookie_header = webapp.cookie_header_value
     webapp.cookie_header_value = lambda *args, **kwargs: original_cookie_header(
         *args, **kwargs
