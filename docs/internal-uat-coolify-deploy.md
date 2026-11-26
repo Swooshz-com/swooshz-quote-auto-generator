@@ -440,8 +440,11 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      own tick and X, the booth box is filled and every line has a quantity
      box, and fails if anything tried to write. `--click-budget` then runs
      the Quote Basis click probe (the CI click-budget job's) on the two
-     largest manifest quotes, in a separate browser that answers every save
-     itself and counts it, so nothing reaches the copy. The copy runs with
+     largest manifest quotes the login can edit, in a separate browser that
+     answers every save itself and counts it, so nothing reaches the copy. A
+     quote made by another staff member opens view only for the login: the
+     walk reads and downloads it, records `view_only` in its step and does not
+     probe it (step "click budget leaves view-only quotes"). The copy runs with
      its own generated `SESSION_SECRET`, so the browser recovery scope saved
      in every quote's Customer checkpoint differs there and Quote Basis opens
      locked ("Click Next in Customer..."), as it would for a user of the
@@ -487,9 +490,12 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      would (the owner's email and `SWOOSHZ_SQAG_REHEARSAL_UAT_LOGIN_PASSWORD`)
      and runs the owner's UAT steps for this release on the copy. Every step
      must pass before the owner is asked; a failure goes back to the builder.
-     Expect every quote saved on live to reopen with Quote Basis locked
-     until Next in Customer is pressed: the copy's `SESSION_SECRET` differs
-     from live's (see the Pass A walk above). Only that lock is expected,
+     Expect every quote of your own saved on live to reopen with Quote Basis
+     locked until Next in Customer is pressed: the copy's `SESSION_SECRET`
+     differs from live's (see the Pass A walk above). A quote made by another
+     staff member opens view only instead, with no lock: every step with
+     content opens, its files download, and nothing can be changed or
+     saved. Only that lock is expected,
      the one Pass A records as `copy_only` in the `basis_lock` of each walked
      quote; a quote locked there without `copy_only`, a quote Pass A failed
      with any other lock, or a lock that stays after Next in Customer, is a
@@ -501,8 +507,9 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      > under SWOOSHZ_SQAG_REHEARSAL_UAT_LOGIN_PASSWORD (not your live
      > password). It runs candidate <short> on a copy of live data taken at
      > <recorded time>; what you change there stays on the copy. On this copy
-     > only, a quote you reopen keeps Quote Basis locked until you press Next
-     > in Customer; live does not do this. The agent's
+     > only, a quote of yours that you reopen keeps Quote Basis locked until
+     > you press Next in Customer; live does not do this. A quote another
+     > staff member made opens view only, on the copy and on live. The agent's
      > UAT passed: <evidence link>. UAT steps: <the release's UAT list>. It
      > stays up until <hand-off time + 24 hours> unless you extend it. Reply
      > "UAT pass <short>" to deploy it to live, or tell me what failed.

@@ -204,20 +204,18 @@ class InternalPasswordIdentityContinuityTest(unittest.TestCase):
                     self.assertEqual(self.get(cookie, path + "/download/xlsx")[0], 404)
                     if alias != "admin":
                         self.assertEqual(self.http_fixture.http("DELETE", path, headers)[0], 404)
-        # Existing save recovery issues a fresh caller-owned ID on an ownership
-        # conflict. It must leave the requested session and its owner untouched.
+        # A save over another user's quote is refused (owner, 25 Nov 2026): the quote and its owner stay
+        # untouched, and no copy under a new ID is made for the caller.
         before = owner_storage._read_quote_session_metadata_for_workspace(ids[0])
         payload["quote_session"]["session_id"] = ids[0]
         headers = {"Cookie": admin_cookie, "Origin": http_fixtures.ORIGIN, "Content-Type": "application/json",
                    admin_public["csrf_header"]: admin_public["csrf_token"]}
         status, _, body = self.http_fixture.http("POST", "/api/quote-sessions", headers, json.dumps(payload))
-        self.assertEqual(status, 200)
-        new_id = json.loads(body)["quote_session"]["session_id"]
-        self.assertNotIn(new_id, ids)
+        self.assertEqual(status, 403)
+        self.assertNotIn("quote_session", json.loads(body))
         self.assertEqual(owner_storage._read_quote_session_metadata_for_workspace(ids[0]), before)
-        new_metadata, _ = owner_storage._read_quote_session_metadata_for_workspace(new_id)
-        self.assertEqual(new_metadata["owner"], {"user_id": "stable-google-subject"})
-        self.assertNotIn("created_by", new_metadata)
+        admin_list = json.loads(self.get(admin_cookie, "/api/quote-sessions")[2])["quote_sessions"]
+        self.assertEqual({row["session_id"] for row in admin_list}, set(ids))
         changes = {"SQAG_INTERNAL_WORKSPACE_ID": "workspace-identity-other"}
         with mock.patch.dict(os.environ, changes), self.http_fixture.fresh_server_if(changes):
             other, _, other_public = self.admit("admin")
@@ -262,7 +260,7 @@ class InternalPasswordIdentityContinuityTest(unittest.TestCase):
         for session_id in (ids[0], ids[2]):
             delete_as(admin_cookie, admin_public, session_id, 200, "success")
             self.assertEqual(owner_storage._read_quote_session_metadata_for_workspace(session_id), ({}, []))
-        self.assertEqual(json.loads(self.get(admin_cookie, "/api/quote-sessions")[2])["quote_sessions"][0]["session_id"], new_id)
+        self.assertEqual(json.loads(self.get(admin_cookie, "/api/quote-sessions")[2])["quote_sessions"], [])
         status, _, response = self.http_fixture.http("POST", "/api/log", headers, json.dumps({
             "event": "QUOTE SESSION DELETE ATTEMPT", "details": {"outcome": "success"},
         }))

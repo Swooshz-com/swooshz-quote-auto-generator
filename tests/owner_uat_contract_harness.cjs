@@ -82,7 +82,7 @@ if (input.mode==='reopen') {
   (async()=>{
     for(const type of ['generate','generate_pdf','draft','basis_chat']) {
       let posts=0;const options=[];
-      const c={blocked:true,commitActiveOutputEditor:value=>{options.push(value);return c.blocked?'blocked':'unchanged';},postJson:async()=>{posts++;return {ok:true,data:{job_id:'synthetic-job'}};}};
+      const c={state:{},blocked:true,commitActiveOutputEditor:value=>{options.push(value);return c.blocked?'blocked':'unchanged';},postJson:async()=>{posts++;return {ok:true,data:{job_id:'synthetic-job'}};}};
       vm.createContext(c);vm.runInContext(extract('startJob'),c);
       const rejected=await c.startJob(type,{},{});assert.equal(rejected.ok,false);assert.equal(rejected.data.status,'blocked');assert.equal(posts,0);assert.equal(options[0].commit,false);
       c.blocked=false;assert.equal((await c.startJob(type,{},{})).ok,true);assert.equal(posts,1);
