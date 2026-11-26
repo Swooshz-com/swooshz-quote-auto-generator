@@ -488,9 +488,12 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
    on live. Changes made during UAT stay on the copy and are deleted with it.
    - **Agent UAT.** The agent signs in to the copy in a browser as the owner
      would (the owner's email and `SWOOSHZ_SQAG_REHEARSAL_UAT_LOGIN_PASSWORD`)
-     and runs the owner's UAT steps for this release on the copy. Every step
-     must pass before the owner is asked; a failure goes back to the builder.
-     Expect every quote of your own saved on live to reopen with Quote Basis
+     and runs every line of the [release UAT checklist](internal-uat.md) on
+     the copy, plus this release's own UAT steps. Every line and step must
+     pass, or be recorded NOT RUN with its reason, before the owner is asked;
+     a failure goes back to the builder. The owner's UAT list is only the
+     checklist's human-eye lines, the lines the agent could not run, and any
+     release step the agent could not run. Expect every quote of your own saved on live to reopen with Quote Basis
      locked until Next in Customer is pressed: the copy's `SESSION_SECRET`
      differs from live's (see the Pass A walk above). A quote made by another
      staff member opens view only instead, with no lock: every step with
@@ -510,7 +513,7 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      > only, a quote of yours that you reopen keeps Quote Basis locked until
      > you press Next in Customer; live does not do this. A quote another
      > staff member made opens view only, on the copy and on live. The agent's
-     > UAT passed: <evidence link>. UAT steps: <the release's UAT list>. It
+     > UAT passed: <evidence link>. Please check only these: <the gaps list>. It
      > stays up until <hand-off time + 24 hours> unless you extend it. Reply
      > "UAT pass <short>" to deploy it to live, or tell me what failed.
 
