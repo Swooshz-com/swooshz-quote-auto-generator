@@ -1166,17 +1166,17 @@ function outputCatalogDescription(value = {}) {
 // after the name, as staff applied it, only while it is still the text after the dash (letter case aside).
 // The AI's own draft detail, own lines and older quotes (no field) print the name only, as before. Same rule
 // as the server's printed_basis_line_detail.
-const QUOTE_DETAIL_MAX_CHARS = 200;
 function basisLineQuoteDetail(value) {
-  const detail = typeof value === "string" ? cleanCustomerQuoteLineText(value) : "";
-  return detail.length <= QUOTE_DETAIL_MAX_CHARS ? detail : "";
+  if (typeof value !== "string" || !value) return "";
+  const detail = cleanCustomerQuoteLineText(value);
+  return detail.length <= 200 ? detail : "";
 }
 
 function printedCatalogDetail(line = {}) {
-  if (!line?.pricing_keyword) return "";
-  const detail = basisLineQuoteDetail(line.quote_detail);
+  const detail = line?.pricing_keyword ? basisLineQuoteDetail(line.quote_detail) : "";
+  if (!detail) return "";
   const written = bracketedCatalogReferenceParts(line.text || "")?.detail || "";
-  return detail && written.toLowerCase() === detail.toLowerCase() ? detail : "";
+  return written.toLowerCase() === detail.toLowerCase() ? detail : "";
 }
 
 function printedCatalogDescription(line = {}) {
