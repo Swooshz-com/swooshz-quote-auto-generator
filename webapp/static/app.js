@@ -11242,8 +11242,8 @@ function confirmOutputRowDelete() {
     hideOutputDeleteModal();
     return;
   }
-  state.outputRows.splice(index, 1);
-  state.lineItems = retainExcludedBasisPricingRows(outputRowsToLineItems());
+  const [deleted] = state.outputRows.splice(index, 1);
+  state.lineItems = releaseDeletedReinclusionPrice(retainExcludedBasisPricingRows(outputRowsToLineItems()), deleted.source_basis_line_id);
   markOutputRowsDirty();
   hideOutputDeleteModal();
   const validation = outputRowsValid();
@@ -11252,6 +11252,17 @@ function confirmOutputRowDelete() {
   renderOutputValidationMessages(validation.valid ? [] : validation.errors);
   syncControlStates();
   if (typeof queueQuoteSessionDraftStateSave === "function") queueQuoteSessionDraftStateSave({ quoteGenerated: true });
+}
+
+// Deleting a waiting line's own row in Output is staff's decision on its price. The line keeps its tick and
+// waits for Confirm as before, but no old price comes back with it: Output asks for one, as for any line
+// whose row was deleted there.
+function releaseDeletedReinclusionPrice(rows, id) {
+  if (!id) return rows;
+  return rows.map((row) => (row.source_basis_line_id === id && row.reincluded_catalog_selection
+    && !["none", "historical"].includes(row.pricing_authority?.variant)
+    ? { ...normalizeLineItem({ ...row, pricing_authority: buildPricingAuthority("historical", row) }), reincluded_catalog_selection: row.reincluded_catalog_selection }
+    : row));
 }
 
 function deleteOutputRow(index) {
@@ -13217,6 +13228,12 @@ function basisLineIsSavedExcluded(line) {
 
 function rememberReincludedCatalogueSelection(line, section, nextTag, row) {
   if (normalizeBasisTag(line.tag) !== "Exclude" || nextTag !== "Include" || !basisLineIsSavedExcluded(line)) return;
+  // The tick marks the line's own row: the draft's, saved with its exclusion, which the server proves the old
+  // price against. An older Output can still hold the row as it was before a size changed on one side.
+  const ids = new Set([line.id, line.source_line_item_id].filter(Boolean));
+  const own = basisPricingIndex ? indexedBasisEntries(basisPricingIndex.lineItems, ids)
+    : state.lineItems.filter((entry) => ids.has(entry?.source_basis_line_id));
+  if (own.length) row = own.length === 1 ? own[0] : null;
   if (!row) return;
   const key = reincludedCatalogueSelectionKey(line, section, row);
   // This is draft intent. The server checks the saved binding and revision before pricing.
@@ -14743,9 +14760,12 @@ function revisedQuoteRowForApply(row, before, line) {
   // Like every row, normalised: the kept price sets the amount for the new size (a mismatch keeps no price).
   // A line ticked back in keeps its mark, as a typed size does: the draft still saves it as excluded, and
   // Confirm restores the price only while the mark matches the line (dropUnusableReinclusions, the server).
+  // A waiting row whose price staff took away (deleted or retyped in Output) stays that way whatever Re
+  // changes, so Confirm still drops it and Output asks for a price; only a new tick or Reset Output undoes it.
+  const released = !authority && Boolean(row.reincluded_catalog_selection) && row.pricing_authority?.variant === "historical";
   return {
-    ...normalizeLineItem({ ...next, pricing_authority: authority || buildPricingAuthority("none", next) }),
-    ...(!unitChanged && row.reincluded_catalog_selection ? { reincluded_catalog_selection: row.reincluded_catalog_selection } : {}),
+    ...normalizeLineItem({ ...next, pricing_authority: authority || buildPricingAuthority(released ? "historical" : "none", next) }),
+    ...((released || !unitChanged) && row.reincluded_catalog_selection ? { reincluded_catalog_selection: row.reincluded_catalog_selection } : {}),
   };
 }
 
@@ -14945,7 +14965,10 @@ async function refreshLineItemsFromServer({ waitForPaint = false } = {}) {
     state.pricingIssues = [];
     return { ok: true, data: { status: "normalized", line_items: [] } };
   }
-  if (quoteSessionDraftStateCanSave()) dropUnusableReinclusions();
+  if (quoteSessionDraftStateCanSave()) {
+    reinclusionRowsAtLineQuantity();
+    dropUnusableReinclusions();
+  }
   let selections = quoteSessionDraftStateCanSave() ? pendingPricingSelections() : [];
   const reinclusions = state.lineItems.filter((row) => row.reincluded_catalog_selection).length;
   const reinclusionsReady = () => selections.filter((entry) => entry.reinclude).length === reinclusions;
@@ -15102,13 +15125,36 @@ function pendingPricingSelections() {
   return [...selections.values()].filter((entry) => entry.reinclude || ordinaryCount++ < 100);
 }
 
+// Confirm prices every line at its Quote Basis quantity, so a typed quantity keeps the selection. A waiting
+// row can still hold another count (the older Output's, or one typed in Output): it goes at its line's.
+function reinclusionRowsAtLineQuantity() {
+  const lines = new Map();
+  (state.quoteBasisSections || []).forEach((section) => (section.lines || []).forEach((line) => {
+    if (normalizeBasisTag(line.tag) !== "Include") return;
+    new Set([line.id, line.source_line_item_id].filter(Boolean)).forEach((id) => lines.set(id, lines.has(id) ? null : line));
+  }));
+  const rows = state.lineItems.map((row) => {
+    const line = row.reincluded_catalog_selection && row.pricing_authority?.variant === "catalog" ? lines.get(row.source_basis_line_id) : null;
+    if (!line) return row;
+    const quantity = numberOrNull(line.quantity);
+    if (quantity === null || quantity <= 0 || numberOrNull(row.quantity) === quantity
+      || normalizeUnit(row.unit || "") !== normalizeUnit(line.unit || "")) return row;
+    return { ...normalizeLineItem({ ...row, quantity }), reincluded_catalog_selection: row.reincluded_catalog_selection };
+  });
+  if (rows.some((row, index) => row !== state.lineItems[index])) state.lineItems = rows;
+}
+
 // A line ticked back in, then changed beyond its quantity, no longer matches the selection it recorded.
 // It goes to Confirm as an ordinary line: the server gives it no old price, and Output asks for one.
+// A row whose price was taken away (deleted or retyped in Output) goes too, so Confirm cannot match it
+// afresh: Confirm builds the line without a price, as for any line whose row was deleted.
 function dropUnusableReinclusions() {
   const ready = new Set(pendingPricingSelections().filter((entry) => entry.reinclude).map((entry) => entry.source_basis_line_id));
   if (!state.lineItems.some((row) => row.reincluded_catalog_selection && !ready.has(row.source_basis_line_id))) return;
-  state.lineItems = state.lineItems.map((row) => (row.reincluded_catalog_selection && !ready.has(row.source_basis_line_id)
-    ? withoutReincludedSelection(row) : row));
+  state.lineItems = state.lineItems.flatMap((row) => {
+    if (!row.reincluded_catalog_selection || ready.has(row.source_basis_line_id)) return [row];
+    return row.pricing_authority?.variant === "historical" ? [] : [withoutReincludedSelection(row)];
+  });
 }
 
 // The re-included lines the server refused before saving anything; a stale or unclear answer is none of these.

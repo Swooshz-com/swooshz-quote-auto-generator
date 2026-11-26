@@ -137,19 +137,51 @@ const finished = async (excluded = Object.keys(held)) => {
   await reopen(page, sessionId);
   return { page, sessionId };
 };
-const reExclude = async (page, id) => {
-  const target = await page.evaluate((lineId) => {
-    for (const section of state.quoteBasisSections) {
-      const index = (section.lines || []).findIndex((line) => line.id === lineId);
-      if (index >= 0) return [section.id, index];
-    }
-    return null;
-  }, id);
-  await page.locator(`#basisReviewSurface [data-revise-section="${target[0]}"][data-revise-line-index="${target[1]}"]`).click();
-  await page.locator("#basisChatPrompt").fill("Remove this line");
+const lineAt = (page, id) => page.evaluate((lineId) => {
+  for (const section of state.quoteBasisSections) {
+    const index = (section.lines || []).findIndex((line) => line.id === lineId);
+    if (index >= 0) return { at: [section.id, index], text: section.lines[index].text };
+  }
+  return null;
+}, id);
+// Re on one line, as staff do it: the selected line, a message, the preview, then Apply. The mock Re reply is
+// the scenario's tag (sections 1-5) or, once the scenario asks for it, `replacement` (section 6).
+const revise = async (page, id, message, replacement = null) => {
+  await run.openPanel(page, "basis");
+  if (replacement) await fs.writeFile(path.join(run.runRoot, "basis-chat-reply.json"), JSON.stringify({ confidence_pct: 95, ...replacement }));
+  const { at } = await lineAt(page, id);
+  await page.locator(`#basisReviewSurface [data-revise-section="${at[0]}"][data-revise-line-index="${at[1]}"]`).click();
+  await page.locator("#basisChatPrompt").fill(message);
   await page.locator("#basisChatSendButton").click();
   await page.locator("#basisChatApplyButton:not([disabled])").click({ timeout: 30000 });
   await page.locator("#basisChatOverlay").waitFor({ state: "hidden", timeout: 15000 });
+};
+const reExclude = (page, id) => revise(page, id, "Remove this line");
+// One Confirm: a refusal here means the old price was refused by name.
+const confirmOnce = async (where, page) => {
+  await run.confirm(page);
+  await page.waitForFunction(() => !appIsBusy() && !quoteSessionDraftSavePromise, null, { timeout: 60000 });
+  if (await page.evaluate(() => state.activeSidePanel) !== "output") {
+    broken.push(where + ", Confirm refused: " + (await page.locator("#aiFailureBanner").innerText()).replace(/\s+/g, " "));
+    await confirmToOutput(page);
+  }
+};
+// After Confirm, each route's line ends with its old price at the line's size ("price") or with a row that has
+// no price, for Output to ask for ("asks").
+const expectPriced = async (page, table) => {
+  const { rows, sizes } = await page.evaluate((wanted) => ({
+    rows: Object.fromEntries(state.outputRows.filter((row) => wanted.includes(row.source_basis_line_id))
+      .map((row) => [row.source_basis_line_id, { variant: row.pricing_authority?.variant || null, price: effectiveOutputUnitPrice(row), quantity: Number(row.quantity) }])),
+    sizes: Object.fromEntries(state.quoteBasisSections.flatMap((section) => section.lines || [])
+      .filter((line) => wanted.includes(line.id)).map((line) => [line.id, Number(line.quantity)])),
+  }), table.map((entry) => entry.id));
+  for (const { route, id, ends } of table) {
+    const row = rows[id];
+    const kept = ends === "price"
+      ? row?.variant === "catalog" && row.price === priceList[id] && row.quantity === sizes[id]
+      : Boolean(row) && !["catalog", "manual", "included"].includes(row.variant) && row.price === null;
+    if (!kept) broken.push(`${route}: ${id} should end with ${ends === "price" ? `its old price ${priceList[id]} at ${sizes[id]}` : "no price"}, Output holds ${JSON.stringify(row || null)}`);
+  }
 };
 
 const duplicate = async (page, sessionId) => {
@@ -359,6 +391,121 @@ try {
   await confirmToOutput(page);
   const typed = (await outputRows(page)).carpet;
   if (typed?.variant !== "manual" || typed.price !== 5) broken.push("Confirm: the typed price is " + JSON.stringify(typed || null));
+  await page.context().close();
+  await run.restartServer();
+
+  // 5. The older Output out of step with the line. The tick marks the line's own row, and Confirm prices every
+  // line at its Quote Basis size, so a size changed on one side only still gets the old price back ("price").
+  // A row whose price staff took away in Output (deleted or retyped) keeps the tick, waits as excluded, and
+  // comes back at Confirm without a price for Output to ask for, as any line whose row was deleted ("asks").
+  const OUT_OF_STEP = [
+    { route: "size typed on Quote Basis, then X", id: "carpet", basis: "9", ends: "price" },
+    { route: "size typed in Output, then X", id: "deck", before: ["quantity", "3"], ends: "price" },
+    { route: "size typed in Output after the tick", id: "graphic", after: ["quantity", "3"], ends: "price" },
+    { route: "own row deleted in Output after the tick", id: "banner", after: ["delete"], ends: "asks" },
+    { route: "own row retyped in Output after the tick", id: "spotlight6", after: ["description", "retyped words"], ends: "asks" },
+  ];
+  const stepIds = OUT_OF_STEP.map((entry) => entry.id);
+  const stepEnds = Object.fromEntries(stepIds.map((id) => [id, "Include"]));
+  const lineQuantities = () => page.evaluate((wanted) => Object.fromEntries(state.quoteBasisSections.flatMap((section) => section.lines || [])
+    .filter((line) => wanted.includes(line.id)).map((line) => [line.id, Number(line.quantity)])), stepIds);
+  ({ page, sessionId } = await build());
+  for (const id of Object.keys(notHeld)) await run.tag(page, id, "Exclude");
+  await confirmToOutput(page);
+  for (const { id, before } of OUT_OF_STEP) if (before) await editRow(id, ...before);
+  await idle(page);
+  await run.openPanel(page, "basis");
+  for (const { id, basis } of OUT_OF_STEP) {
+    if (!basis) continue;
+    await (await run.basisControl(page, id, "[data-basis-quantity-edit]")).click();
+    const input = page.locator("#basisReviewSurface .basis-quantity-text input").first();
+    await input.fill(basis);
+    await input.press("Enter");
+    await page.waitForFunction(() => !appIsBusy(), null, { timeout: 20000 });
+  }
+  for (const id of stepIds) await run.tag(page, id, "Exclude");
+  await toDashboard(page);
+  await reopen(page, sessionId);
+  for (const id of stepIds) await run.tag(page, id, "Include");
+  await idle(page);
+  await expectSaved("out of step, ticked", sessionId, stepEnds);
+  // The waiting row is the draft's own: the size typed on Quote Basis, not the older Output's.
+  const sizes = await lineQuantities();
+  const savedSizes = Object.fromEntries((await run.record(sessionId)).draft_state.lineItems
+    .filter((row) => row.reincluded_catalog_selection && stepIds.includes(row.source_basis_line_id))
+    .map((row) => [row.source_basis_line_id, Number(row.quantity)]));
+  for (const { route, id, basis } of OUT_OF_STEP) {
+    if (basis && savedSizes[id] !== sizes[id]) broken.push(`${route}: the tick marked a row of ${savedSizes[id]}, not the line's ${sizes[id]}`);
+  }
+  await run.openPanel(page, "output");
+  for (const { id, after } of OUT_OF_STEP) {
+    if (!after) continue;
+    if (after[0] !== "delete") {
+      await editRow(id, ...after);
+      continue;
+    }
+    await idle(page);
+    await page.locator(`[data-output-delete-row="${await outputIndex(id)}"]`).click();
+    await page.locator("#confirmOutputDeleteButton").click();
+  }
+  await idle(page);
+  await expectSaved("out of step, after Output edits", sessionId, stepEnds);
+  await run.openPanel(page, "basis");
+  await reload(page);
+  expect("out of step, F5", await tagsOf(page), stepEnds);
+  await confirmOnce("out of step", page);
+  await expectPriced(page, OUT_OF_STEP);
+  await page.context().close();
+
+  // 6. Once staff take a waiting row's price away, no later edit of the line brings it back: Re's new words or
+  // size, before or after a reopen, still leave Confirm without a price for Output to ask for. Only a new tick
+  // or Reset Output does. Controls: Re without the delete keeps the price the row held (R1), and Re on an
+  // ordinary line whose row was deleted asks.
+  await fs.writeFile(run.scenarioPath, JSON.stringify({ ...scenario, basis_chat_reply: true }));
+  await run.restartServer();
+  const RELEASED = [
+    { route: "own row deleted, then Re new words", id: "carpet", waits: true, del: true, re: "words", ends: "asks" },
+    { route: "own row deleted, then Re new size", id: "deck", waits: true, del: true, re: "size", ends: "asks" },
+    { route: "own row deleted, reopened, then Re new words", id: "graphic", waits: true, del: true, re: "words", reopened: true, ends: "asks" },
+    { route: "own row deleted, then X and tick again", id: "banner", waits: true, del: true, retick: true, ends: "price" },
+    { route: "control: Re new words without the delete", id: "spotlight6", waits: true, re: "words", ends: "price" },
+    { route: "control: an ordinary line's row deleted, then Re new words", id: "spotlight3", del: true, re: "words", ends: "asks" },
+  ];
+  const reviseLine = async ({ id, re }) => {
+    const { text } = await lineAt(page, id);
+    if (re === "size") await revise(page, id, "quantity should be 20 sqm", { text, quantity: 20, unit: "sqm" });
+    else await revise(page, id, "colour should be grey", { text: text + " - grey colour" });
+  };
+  const waiting = RELEASED.filter((entry) => entry.waits).map((entry) => entry.id);
+  ({ page, sessionId } = await build());
+  for (const id of Object.keys(notHeld)) await run.tag(page, id, "Exclude");
+  await confirmToOutput(page);
+  await run.openPanel(page, "basis");
+  for (const id of waiting) await run.tag(page, id, "Exclude");
+  await toDashboard(page);
+  await reopen(page, sessionId);
+  for (const id of waiting) await run.tag(page, id, "Include");
+  await idle(page);
+  await run.openPanel(page, "output");
+  for (const { id, del } of RELEASED) {
+    if (!del) continue;
+    await idle(page);
+    await page.locator(`[data-output-delete-row="${await outputIndex(id)}"]`).click();
+    await page.locator("#confirmOutputDeleteButton").click();
+  }
+  await idle(page);
+  await run.openPanel(page, "basis");
+  for (const { id, retick } of RELEASED) if (retick) for (const tag of ["Exclude", "Include"]) await run.tag(page, id, tag);
+  for (const entry of RELEASED) if (entry.re && !entry.reopened) await reviseLine(entry);
+  await idle(page);
+  await toDashboard(page);
+  await reopen(page, sessionId);
+  for (const entry of RELEASED) if (entry.reopened) await reviseLine(entry);
+  await idle(page);
+  const released = RELEASED.filter((entry) => entry.ends === "asks" && entry.waits && entry.del).map((entry) => entry.id);
+  await expectSaved("released, after Re", sessionId, Object.fromEntries(released.map((id) => [id, "Include"])));
+  await confirmOnce("released", page);
+  await expectPriced(page, RELEASED);
 
   if (broken.length) throw new Error(broken.length + " decisions were not kept:\n" + broken.join("\n"));
   run.finish({});
