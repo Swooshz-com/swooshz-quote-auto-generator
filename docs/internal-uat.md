@@ -2,10 +2,11 @@
 
 Every agent UAT before a live deploy runs every line of this checklist on the
 copy of live (release runbook [step 8.2](internal-uat-coolify-deploy.md)).
-The owner's own UAT is then only the lines marked for a human eye and any line
-the agent could not run. The list covers the app as it is on `main`: every
-screen, button, menu, setting and message staff use, in the order they use
-them, with the expected result.
+The owner's own UAT is then only the lines marked for a human eye, any line
+the agent could not run, and a fix-before-live-or-later decision on each
+failure that does not block (see Results). The list covers the app as it is
+on `main`: every screen, button, menu, setting and message staff use, in the
+order they use them, with the expected result.
 
 When a change adds, removes or renames a control or a message, the same change
 updates its line here.
@@ -22,7 +23,10 @@ updates its line here.
   once per role. Staff lines need a staff sign-in; where the copy has none,
   run them on a local server in staff password mode
   ([internal-password-auth-mode.md](internal-password-auth-mode.md)) or
-  record them NOT RUN with the reason.
+  record them NOT RUN with the reason. That server needs database storage
+  for QC-02 to QC-04: with local file storage a password-mode session lists
+  no saved profiles and cannot save, delete or export them, so those lines
+  are N/A there.
 - **Width:** `D` desktop (1440 px wide), `M` 375 px wide, `DM` both. The agent
   checks `M` in a resized browser window: nothing cut off, no sideways page
   scroll, nothing overlapping, every control reachable and usable.
@@ -64,19 +68,30 @@ Record one row per line in the run's evidence:
 - **Before marking a line `FAIL`,** check whether a planned change already
   covers it: the open tasks under the programme's parent issue (named in
   `.github/toolkit-programme.json`), their task pages and recorded decisions,
-  and their G0 plans in the evidence store. If one does, the result is
+  and their G0 plans in the evidence store. If one does and the failure is
+  not a safety or pricing failure (next bullet), the result is
   `KNOWN, PLANNED`, naming the task and slice (for example "task <number>,
-  slice R2"). It does not block the release and never goes on the owner's
-  list.
-- **A `FAIL` blocks the release** only when no plan covers it and it is
-  either new in this release or breaks a safety or pricing rule. It goes back to the
+  slice R2"). It does not block the release and stays off the owner's list.
+- **A safety or pricing failure** is never settled by a plan alone. It is
+  one where customer output shows internal cost, markup, GST workings or
+  supplier notes; a price, quantity or total is wrong; someone sees or
+  changes a quote, profile or setting their role should not reach; text
+  becomes a live Excel formula; or saved data is lost or silently dropped.
+  The lines that check these are SI-08, DB-02, DB-15, DB-17, DB-18, QC-04,
+  QB-06, QB-09, OUT-03 to OUT-10, XP-03, PR-02, PR-08, QT-07, RO-04, RO-05,
+  ER-03 and RU-01 to RU-08. When a plan covers one, the result is `FAIL`
+  with that task and slice named, and it goes on the owner's list; only the
+  owner may defer it.
+- **A `FAIL` blocks the release** when no plan covers it and it is either new
+  in this release or a safety or pricing failure. It goes back to the
   builder before the owner is asked.
 - **Any other `FAIL`** is recorded on its area's open task (or a new task, if
-  none fits). The owner decides only whether it is fixed before live or
-  later.
-- **The owner's list** is every `H` line plus every `NOT RUN` line, each in
-  one plain sentence with where to click, and the fix-before-live-or-later
-  decision for each non-blocking `FAIL`. Nothing else goes to the owner.
+  none fits).
+- **The owner's list** is every `H` line and every `NOT RUN` line, each in
+  one plain sentence with where to click, then every `FAIL` that does not
+  block (planned safety or pricing failures included, with their task and
+  slice), each with a fix-before-live-or-later decision for the owner.
+  Nothing else goes to the owner.
 
 ## Lines
 
@@ -108,14 +123,16 @@ mark; `Controls` names the ids or attributes of the controls the line uses.
 | DB-06 | Status: All, Draft, Draft Modified, Generated. | Only quotes with that status. | B | D | | `#dashboardStatusFilter` |
 | DB-07 | With more quotes than one page: Show 5, 10, 20 and All sessions; pick each Range. | The rows and the "Showing" line follow the page size and range. | B | DM | | `#dashboardPageSizeSelect`, `#dashboardRangeSelect` |
 | DB-08 | Click a run quote's row; then use Enter, Space, the arrow keys and Delete on the list. | Each row shows customer, project, Show name, Project number, Ref, Created, Total, Quote Company, Modified, Subtotal, AI spend and its status. The keys select, open (Enter on the selected row), move and ask to delete. The Selected session panel shows customer, project, Created and Modified, Created by, status, Ref, Grand Total, Subtotal, Currency / FX, Pricing Reference, Tax / Rate, Show Name, Project Number, Quote Company, the XLSX and PDF links, Duplicate Quote, Modify quote, Delete session and Clear selection. The figures match the quote's Output. | B | DM | | `#dashboardSelectedSessionPanel` |
-| DB-09 | The XLSX and PDF links of a quote with current files, one with stale files and one with none. | Current: the file downloads. Stale: the label says "(stale)". None: not a link; hovering says why. | B | D | | `.dashboard-export-link` |
+| DB-09 | The XLSX and PDF links of a quote with current files, one with stale files and one with none. | Current: a Download link; hovering says "XLSX ready" (or "PDF ready") and the file downloads. Stale with the old file kept: the link reads "XLSX (stale)" and hovering says "XLSX stale - needs regeneration". Stale with no file, or none: plain "XLSX" or "PDF", not a link; hovering says why ("XLSX needs regeneration", "PDF unavailable" or "Missing PDF"). | B | D | | `.dashboard-export-link` |
 | DB-10 | Modify quote. | "Restoring workspace" shows, then the quote opens at the step it was saved at, with its inputs, rows and totals. | B | DM | | `[data-dashboard-panel-action="modify-session"]`, `#dashboardLoadingModal` |
 | DB-11 | Duplicate Quote on a run quote. | A new draft opens with the same inputs. The original is unchanged; both show on the Dashboard. | B | D | | `[data-dashboard-panel-action="duplicate-session"]` |
 | DB-12 | Delete session on a run quote: Cancel; then again, Delete session. | "Delete quote session?" says "This deletes this quote session and its saved exports from the workspace. This cannot be undone." Cancel keeps the quote. Delete session removes the row, and its files no longer download. | B | DM | | `[data-dashboard-panel-action="delete-session"]`, `#cancelQuoteSessionDeleteButton`, `#confirmQuoteSessionDeleteButton` |
-| DB-13 | Select; tick two run quotes; Select all visible; untick back to the two; Delete selected. | Bulk selection says "2 quote sessions selected" and lists them, each with an x that takes it off the selection. Select all visible ticks every shown row. Delete selected asks once, then removes both. | B | D | | `#dashboardSelectModeButton`, `[data-dashboard-panel-action="delete-selected"]`, `[data-dashboard-remove-selected]` |
+| DB-13 | Select; tick two run quotes; Select all visible; untick back to the two; Delete selected. | Bulk selection says "2 quote sessions selected" and lists them, each with an x that takes it off the selection. Select all visible ticks every shown row. Delete selected asks once, then removes both. | B | D | | `#dashboardSelectModeButton`, `[data-dashboard-select]`, `[data-dashboard-panel-action="delete-selected"]`, `[data-dashboard-remove-selected]` |
 | DB-14 | Clear selection, and the panel's close button. | The panel goes back to "No session selected". | B | D | | `[data-dashboard-panel-action="clear-selection"]` |
 | DB-15 | Open a quote another staff member made (Modify quote). | The note "View only: this quote was made by another staff member. You can read every step and download its files, but not change it." Every step with content opens; existing Excel and PDF files download; no field, tick or button changes anything and no save is sent; nothing new is generated. | B | DM | | `#sideNextButton`, `#sideDownloadButton`, `#sideViewPdfButton` |
 | DB-16 | Sign in with a login that has no quotes (local server). | "No quote sessions yet" with a New Quote button that starts a quote. | S | DM | | `#dashboardEmptyState`, `#dashboardEmptyNewQuoteButton` |
+| DB-17 | As admin, with other staff members' quotes in the list: Select, then Select all visible. Do not press Delete selected. | Every shown row is ticked, other staff members' quotes included, and the panel lists every ticked quote before Delete selected would ask. Clear selection unticks them all. | A | D | | `#dashboardSelectModeButton`, `[data-dashboard-select]`, `[data-dashboard-panel-action="clear-selection"]` |
+| DB-18 | As admin, select a quote another staff member made and press Duplicate Quote in the Selected session panel. | The original is unchanged and still opens view only (DB-15). Duplicate Quote either opens a new draft of your own with the same inputs that you can change, or is off and says why. | A | D | | `[data-dashboard-panel-action="duplicate-session"]` |
 
 ### 3. New quote: Upload
 
@@ -139,7 +156,7 @@ mark; `Controls` names the ids or attributes of the controls the line uses.
 | CU-02 | On a quote that already has Quote Basis or Output, pick another pricing reference and press Next: Cancel; then again, Continue and Clear. Repeat after adding a reference file on Upload. | "Apply changed pricing reference?" (or "Apply changed reference files?"): "This will clear the current Quote Basis and Output." Cancel keeps the old inputs and results. Continue and Clear applies them and clears Quote Basis and Output. | B | D | | `#quoteDependencyConfirmModal`, `#cancelQuoteDependencyConfirmButton`, `#confirmQuoteDependencyChangeButton` |
 | CU-03 | Currency: each listed one, then Custom with `jpy`, then Custom with `12`. Exchange rate 1.35, then 0. | The currency and the rate (as FX) show on Output. Custom becomes `JPY`; digits are dropped. A rate of 0 or less is treated as empty and shows as `-`. | B | D | | `#quoteCurrency`, `#quoteCurrencyCustom`, `#quoteExchangeRate` |
 | CU-04 | Tax GST, then VAT; Rate 9, then 101, then -1. | The label and rate show on Output; a rate above 100 or below 0 is held at 100 or 0. | B | D | | `#quoteTaxLabel`, `#quoteTaxRate` |
-| CU-05 | Fill Client name, Client address, Attention person, Attention title, Quote date, Quotation Title, Show name and Project number. Use B, I and U (and Ctrl+B, Ctrl+I, Ctrl+U) on some text and on the date. | Each value is kept. The formatting shows in the box and in the Excel. | B | DM | | `[data-rich-command]`, `[data-date-format-command]`, `#quoteDate`, `#showName` |
+| CU-05 | Fill Client name, Client address, Attention person, Attention title, Quote date, Quotation Title, Show name and Project number. Use B, I and U (and Ctrl+B, Ctrl+I, Ctrl+U) on some text and on the date. | Each value is kept. The formatting shows in the box and in the Excel. | B | DM | | `[data-rich-command]`, `[data-date-format-command]`, `#quoteDate`, `#showName`, `#clientNameEditor`, `#clientAddressEditor`, `#clientAttentionEditor`, `#clientTitleEditor`, `#projectTitleEditor`, `#projectNumberEditor` |
 | CU-06 | Leave each required field empty in turn: pricing reference, Client name, Client address, Attention person, Attention title, Quotation Title, Show name, Quote date, Project number. | Next: Quote Company is off and its hover text names the missing field. | B | DM | | `#sideNextButton` |
 | CU-07 | Fill everything; Next: Quote Company. | Quote Company opens; the Customer step is saved. | B | DM | | `#sideNextButton` |
 | CU-08 | Reset Draft on Customer. | The Customer fields are cleared. | B | D | | `#clearCustomerButton` |
@@ -148,12 +165,12 @@ mark; `Controls` names the ids or attributes of the controls the line uses.
 
 | Line | Do | Expect | Who | Width | Eye | Controls |
 | --- | --- | --- | --- | --- | --- | --- |
-| QC-01 | Open Current Profile; pick one; Load: Cancel; then Load. | It lists Profile Templates and Saved Profiles (your own and the shared ones only). Picking says `Selected "<name>". Click Load to apply it.` `Load "<name>"?` warns it replaces the Quote Company fields; Cancel changes nothing; Load fills them and says `Loaded "<name>".` | B | DM | | `#presetSelect`, `#loadPresetButton`, `#cancelProfileLoadButton`, `#confirmProfileLoadButton` |
+| QC-01 | Open Current Profile; pick one; Load: Cancel; then Load. | It lists Profile Templates and Saved Profiles (your own and the shared ones only). Picking says `Selected "<name>". Click Load to apply it.` Load asks `Load "<name>"?` with "This will replace the current quote company fields." and `Unsaved edits in this section will be overwritten by "<name>" defaults.`; Cancel changes nothing; Load fills them and says `Loaded "<name>".` | B | DM | | `#presetSelect`, `#loadPresetButton`, `#cancelProfileLoadButton`, `#confirmProfileLoadButton` |
 | QC-02 | Save New with an empty name, then `UAT Profile`; Save New again with the same name: Cancel; then Overwrite. | "Enter a reusable profile name before saving." Then `Saved "UAT Profile".` and it is listed. The same name asks `Overwrite "UAT Profile"?`; Overwrite replaces it. | B | D | | `#savePresetButton`, `#profileNameInput`, `#cancelProfileNameButton`, `#confirmProfileNameButton`, `#cancelProfileOverwriteButton`, `#confirmProfileOverwriteButton` |
 | QC-03 | More Actions: Export Profile; Import Profile with the exported file, then with a JSON file that is not a profile; Delete Profile on `UAT Profile`: Cancel; then Delete; Delete Profile on a profile template. Open and close the menu with the keyboard too. | Export downloads `<id>.quote-company-profile.json`. Import offers it to save as your own copy; the wrong file says "The selected file does not contain importable company profile defaults." `Delete "UAT Profile"?` then Delete says `Deleted "UAT Profile".` and the quote's filled fields stay. A profile template says `Cannot delete "<name>"`: "Profile templates are read-only." | B | DM | | `#profileActionsMenuButton`, `#exportPresetButton`, `#importPresetButton`, `#importPresetFile`, `#deletePresetButton`, `#cancelProfileDeleteButton`, `#confirmProfileDeleteButton` |
 | QC-04 | As staff, save and delete a profile of your own, then try to change a shared profile; as admin, look for another user's personal profile. | Staff manage their own profiles but cannot change a shared one (its template note says "Read-only profile"). Nobody, admin included, sees another user's personal profile. | B | D | | `#presetSelect` |
 | QC-05 | Header logo: click the box, and press Enter on it; choose a PNG, then a JPEG; then try a GIF renamed to `.png`. | The logo shows in the box. The picker offers PNG and JPEG only; the renamed file is refused ("The selected logo could not be securely verified. Please try adding it again.", or on save "Profile logo must be a PNG or JPEG image."). | B | D | | `#headerLogoPreview`, `#headerLogoInput` |
-| QC-06 | Fill Header details, Terms heading, Payment terms, Notes heading, Standard notes and every Signature field, with B, I or U on some. | Each is kept and shows in the Excel and PDF. | B | DM | | `[data-rich-command]` |
+| QC-06 | Fill Header details, Terms heading, Payment terms, Notes heading, Standard notes and every Signature field, with B, I or U on some. | Each is kept and shows in the Excel and PDF. | B | DM | | `[data-rich-command]`, `#headerDetailsEditor`, `#termsHeadingEditor`, `#paymentTermsEditor`, `#notesHeadingEditor`, `#standardNotesEditor`, `#quoteCompanyNameEditor`, `#companySignatoryEditor`, `#companyTitleEditor`, `#companyDateLabelEditor`, `#acceptanceTextEditor`, `#personLabelEditor`, `#stampLabelEditor`, `#dateLabelEditor` |
 | QC-07 | Quote template, on a saved profile you can change: Workspace default, a saved template, and Profile's own layout when the profile has one. | Each pick saves at once and says `"<profile>" will use <layout> for new quotes.`; the note reads, for example, "Workspace default: Standard". The Excel follows it (XP-05). | B | D | | `#quoteTemplateSelect`, `#quoteTemplateNote` |
 | QC-08 | Reset Draft on Quote Company. | The Quote Company fields are cleared. | B | D | | `#clearQuoteCompanyButton` |
 | QC-09 | Look at the Next button. | "Start Analysis" on a new quote; "Next: Quote Basis" once the quote has a Quote Basis. | B | DM | | `#sideNextButton` |
@@ -168,7 +185,7 @@ mark; `Controls` names the ids or attributes of the controls the line uses.
 | AN-03 | `$` Run Analysis on synthetic booth images with Known details "Booth is 8 m x 9 m, 2 open sides". | "AI analysis running." with "This will take about 10 to 15 mins." and the elapsed time, then the Quote Basis draft. The AI spend line shows "Analysis / Re-Analyse", "Basis chat" and "AI spend total" amounts. The stated size is used. | B | D | | `#analysisConfirmStartButton`, `#basisAiSpend` |
 | AN-04 | `$` Run High Quality on the same quote, after the owner's OK on its cost. | As AN-03, with the High Quality cost. | A | D | | `#analysisConfirmHighQualityButton` |
 | AN-05 | `$` Re-Analyse on Quote Basis after deciding some lines. | The Start Analysis dialog opens; afterwards the decided lines keep their decisions and no line is doubled. | B | D | | `#analyseAgainButton` |
-| AN-06 | Answer the clarification questions, if the draft asks any, and Generate final Quote Basis. | Quote Basis and Output stay locked until every question is answered; then the final draft shows. | B | D | | `#basisReviewSurface` |
+| AN-06 | `$` Answer the clarification questions, if the draft asks any, and Generate final Quote Basis (a new paid analysis). | Quote Basis and Output stay locked until every question is answered; then the final draft shows. | B | D | | `#clarificationForm`, `[data-clarification-index]` |
 
 ### 7. Quote Basis
 
@@ -181,19 +198,20 @@ mark; `Controls` names the ids or attributes of the controls the line uses.
 | QB-05 | Use a line's possible pricing-reference match. | The line takes that match. | B | D | | `[data-basis-possible-match-index]` |
 | QB-06 | Click a quantity, type a new one, press Enter; another, press Escape; a third, click away mid-edit. Reopen the quote. | Enter and clicking away keep the new value; Escape restores the old one; the kept values are there after reopening. | B | DM | | `[data-basis-quantity-edit]` |
 | QB-07 | On a new quote, find Project management fee and Waste disposal: tick one, X the other; Dashboard; Modify quote; Reset Draft. | Both start at Confirm. The tick includes it at no charge (Included); X leaves it out. Both are kept on reopen; Reset Draft returns both to Confirm. | B | D | | `[data-basis-tag]`, `#resetQuoteBasisButton` |
-| QB-08 | With a booth size in Known details: on the "Booth size update" card, Discard; Re-Analyse; then Apply. | Discard keeps the current size. Apply sets the booth and floor lines to the Known details size, which stays after Reset Draft and reopening. | B | D | | `[data-known-details-size="discard"]`, `[data-known-details-size="apply"]` |
+| QB-08 | `$` With a booth size in Known details: on the "Booth size update" card, Discard; Re-Analyse (a paid analysis, as AN-05); then Apply. | Discard keeps the current size. Apply sets the booth and floor lines to the Known details size, which stays after Reset Draft and reopening. | B | D | | `[data-known-details-size="discard"]`, `[data-known-details-size="apply"]` |
 | QB-09 | Confirm Quotation Basis with a line still at Confirm; with a quantity left blank that cannot be filled; with a clarification question unanswered. | Refused with "Resolve all review lines before confirming quotation basis.", "Enter a quantity for every line before confirming quotation basis." and "Answer all clarification questions before confirming quotation basis." | B | D | | `#sideNextButton` |
 | QB-10 | Resolve every line; Confirm Quotation Basis. | "Preparing Output", then Output with one row per included line. | B | DM | | `#sideNextButton` |
 | QB-11 | Reset Draft on Quote Basis. | Every line goes back to the first analysis draft. | B | D | | `#resetQuoteBasisButton` |
 | QB-12 | On a generated quote: tick again lines that were X'd when it was saved, change a quantity, then Dashboard. | The changes save and the Dashboard opens; reopening shows them. | B | D | | `[data-basis-tag]`, `#backToDashboardButton` |
+| QB-13 | `$` Analyse a new quote whose Known details say "Booth is 6 m x 6 m" (the same as the default size). | The 6 m x 6 m size is used as stated in Known details; no line says "Booth size defaults to 6m x 6m because no clear dimensions were found". | B | D | | `#basisReviewSurface` |
 
 ### 8. Revise a line (Re)
 
 | Line | Do | Expect | Who | Width | Eye | Controls |
 | --- | --- | --- | --- | --- | --- | --- |
 | RE-01 | Re on a line; close with x; open again and click outside the panel. | "Revise basis line" opens with the line as context; both close it with no change. | B | DM | | `[data-revise-line-index]`, `#basisChatCloseButton`, `[data-basis-chat-close]` |
-| RE-02 | `$` Ask for a change (for example "make this 4 m wide"); Discard the proposal. | An answer and a proposal with Discard and Apply. Discard leaves the line as it was. | B | D | | `#basisChatPrompt`, `#basisChatSendButton`, `#basisChatKeepButton` |
-| RE-03 | `$` Ask again and Apply; Confirm Quotation Basis. | The line changes in Quote Basis and its Output row follows. A price the row already held is kept. | B | D | | `#basisChatApplyButton` |
+| RE-02 | `$` Ask for a change (for example "make this 4 m wide"); Discard the proposal. | An answer and a proposal with Discard and Apply. Discard leaves the line as it was. | B | D | | `#basisChatPrompt`, `#basisChatSendButton`, `#basisChatKeepButton`, `[data-basis-chat-action]` |
+| RE-03 | `$` Ask again and Apply; Confirm Quotation Basis. | The line changes in Quote Basis and its Output row follows. A price the row already held is kept. | B | D | | `#basisChatApplyButton`, `[data-basis-chat-action]` |
 | RE-04 | `$` On a generated quote, Re on a line and Apply, then open Output. | The Output row follows the revised line; a line ticked back keeps its tick. | B | D | | `#basisChatApplyButton` |
 
 ### 9. Output
@@ -206,7 +224,7 @@ mark; `Controls` names the ids or attributes of the controls the line uses.
 | OUT-04 | In the price editor, Included. | The row reads Included and adds nothing to the total. | B | D | | `[data-output-included-action]` |
 | OUT-05 | In the price editor, Use reference price, on a row with a catalogue price and on one without. | The catalogue price returns; without one the button is off and says "Catalogue price unavailable". | B | D | | `[data-output-reference-action]` |
 | OUT-06 | Del on a row: Cancel; then Delete. | "Delete output row?" Cancel keeps it; Delete removes it and the totals follow. | B | D | | `[data-output-delete-row]`, `#cancelOutputDeleteButton`, `#confirmOutputDeleteButton` |
-| OUT-07 | Leave a row with no price; type `abc` as a price; type `-5`. | Download Excel and View PDF stay off, and the review messages name the row: "Unit price is required." (or the pricing review message), "Unit price must be a number or Included.", "Unit price must be 0 or greater." | B | D | | `#pricingReviewMessages`, `#sideDownloadButton` |
+| OUT-07 | Type `abc` as a price and press Enter; type `-5` and press Enter; then leave a row with no price. | The price editor refuses `abc` and `-5` with "Enter a nonnegative price with exact cent precision, or cancel with Escape." and keeps the old price. A row with no price: Download Excel and View PDF stay off, and the review messages name it ("Row N: Unit price is required.", or the row's pricing review message). | B | D | | `#pricingReviewMessages`, `#sideDownloadButton` |
 | OUT-08 | Reset Draft on Output. | The rows go back to the first Output. | B | D | | `#resetOutputButton` |
 | OUT-09 | Add up the amounts. | Subtotal is the sum of the amounts, tax is the rate times the subtotal, and the grand total is their sum, to the cent. | B | D | | `#pricingMatchesBody` |
 | OUT-10 | Back to Quote Basis, change a line, Confirm Quotation Basis again. | Output follows the change; prices already set on other rows stay. | B | D | | `#sideBackButton`, `#sideNextButton` |
@@ -231,16 +249,16 @@ run; never change or delete a pricing reference the run did not make.
 
 | Line | Do | Expect | Who | Width | Eye | Controls |
 | --- | --- | --- | --- | --- | --- | --- |
-| PR-01 | Settings as admin; close with x, Cancel and a click outside; open again. | "Settings" opens on Pricing Reference, Manage. Each way closes it. | A | DM | | `#settingsButton`, `#pricingReferenceCloseButton`, `#pricingReferenceCancelButton`, `[data-pricing-reference-close]` |
+| PR-01 | Settings as admin; close with x, Cancel and a click outside; open again. | "Settings" opens on Pricing Reference, Manage. Each way closes it. | A | DM | | `#settingsButton`, `#settingsPricingTab`, `#pricingReferenceManageTab`, `#pricingReferenceCloseButton`, `#pricingReferenceCancelButton`, `[data-pricing-reference-close]` |
 | PR-02 | Settings as staff. | The button is off with "You do not have access to manage pricing references."; if Settings is reached, "No access" says the role cannot create, edit, import, delete or save pricing references, and Quote Templates is off with "Only admins can change quote templates." | S | D | | `#settingsButton`, `#pricingReferenceNoAccess` |
-| PR-03 | `$` Import: Choose File with a synthetic 4-row CSV (section, description, unit, cost, markup), then a synthetic .xlsx and a .md. | "Preparing import preview" with the elapsed time, then the preview: "No missing required info detected" or "Needs attention" with each problem (missing columns, rows that need edit, skipped rows with the reason, name already exists), and Review N Rows. Name, tax label, tax rate and currency appear once the rows are ready. | A | D | | `#pricingReferenceImportTab`, `#pricingReferenceFile`, `#pricingReferencePreview`, `#pricingReferenceMetadataSetup` |
+| PR-03 | `$` Import: Choose File with a synthetic 4-row CSV (section, description, unit, cost, markup), then a synthetic .xlsx and a .md. | "Preparing import preview" with the elapsed time, then the preview: "No missing required info detected" or "Needs attention" with each problem (missing columns, rows that need edit, skipped rows with the reason, name already exists), and Review N Rows. Name, tax label, tax rate and currency appear only after every row that needs an edit is fixed in Review N Rows (PR-05), not with the first preview. | A | D | | `#pricingReferenceImportTab`, `#pricingReferenceFile`, `#pricingReferencePreview`, `#pricingReferenceMetadataSetup` |
 | PR-04 | Fill name `UAT Catalogue`, tax GST 9, currency SGD (and Custom with a 3-letter code); Save Reference. Then import again with the same name. | Save Reference stays off, and says why on hover, until the rows and fields are valid; then "Saved successfully." and the reference is listed in Manage and on Customer. The same name is refused: `A pricing reference named "UAT Catalogue" already exists. ...` | A | D | | `#pricingReferenceName`, `#pricingReferenceTaxLabel`, `#pricingReferenceTaxRate`, `#pricingReferenceCurrency`, `#pricingReferenceCurrencyCustom`, `#pricingReferenceSaveButton` |
-| PR-05 | Review the imported rows: edit a row, Add Row, Remove a row, Undo, Done. | "Review Imported Rows" lists Section, Description, Unit, Cost, Markup, Remarks, Status and Actions. Each change shows at once; Undo reverses the last; Done returns to Settings. Status reads OK, or what is missing (for example "cost required", "markup must be above 0"). | A | DM | | `[data-pricing-reference-table-open]`, `#pricingReferenceAddRowButton`, `[data-pricing-reference-remove-row]`, `#pricingReferenceUndoButton`, `#pricingReferenceTableCloseButton` |
+| PR-05 | Review the imported rows: edit a row, Add Row, Remove a row, Undo, Done. | "Review Imported Rows" lists Section, Description, Unit, Cost, Markup, Remarks, Status and Actions. Each change shows at once; Undo reverses the last; Done returns to Settings. Status reads OK, or what is missing (for example "cost required", "markup must be above 0"). | A | DM | | `[data-pricing-reference-table-open]`, `#pricingReferenceAddRowButton`, `[data-pricing-reference-remove-row]`, `[data-preview-field]`, `#pricingReferenceUndoButton`, `#pricingReferenceTableCloseButton` |
 | PR-06 | Manage: pick `UAT Catalogue`, Review its rows, change a cost, Save Changes; reopen. | The rows load ("N rows loaded ..."); the button reads Save Changes; the change is kept after reopening. | A | D | | `#deletePricingReferenceSelect`, `[data-pricing-reference-table-open]`, `#pricingReferenceSaveButton` |
 | PR-07 | Manage: Export Selected. Import: Download Template. | Export downloads `UAT Catalogue` as an Excel workbook that imports again; Download Template downloads `pricing-reference-template.xlsx`. Each button shows only on its own tab. | A | D | | `#exportPricingReferenceButton`, `#pricingReferenceTemplateButton` |
 | PR-08 | `$` Use `UAT Catalogue` on a new quote (Customer, CU-01) and analyse. | Reference prices on Output come from `UAT Catalogue`'s rows. | A | D | | `#profileSelect` |
 | PR-09 | Manage: Delete on `UAT Catalogue`: Cancel; then Delete. Then pick a built-in or default reference. | `Delete "UAT Catalogue"?`: "This removes the saved pricing reference from this workspace. Existing quotes already generated from it are not changed." Cancel keeps it; Delete removes it from Manage and from Customer. Delete is off for built-in and default references, saying why. | A | D | | `#deletePricingReferenceButton`, `#cancelPricingReferenceDeleteButton`, `#confirmPricingReferenceDeleteButton` |
-| PR-10 | Import a file of the wrong type, a file over 10 MB and a file with no usable rows. | "Upload a .xlsx, .csv, or .md pricing reference file.", "Pricing reference file is larger than 10 MB." and "No pricing rows"; nothing is saved. | A | D | | `#pricingReferenceFile` |
+| PR-10 | Import a file of the wrong type, a file over 10 MB, and a CSV with only the template's header row (from Download Template) and no rows. Do not use an empty file or one with other columns: those go to the paid AI import. | "Upload a .xlsx, .csv, or .md pricing reference file.", "Pricing reference file is larger than 10 MB." and, for the header-only CSV, "No valid pricing rows were found." (or "No pricing rows") with no AI call; nothing is saved. | A | D | | `#pricingReferenceFile` |
 
 ### 12. Settings: quote templates
 
@@ -250,14 +268,14 @@ Run as admin with templates made in this run. Make the workspace default
 | Line | Do | Expect | Who | Width | Eye | Controls |
 | --- | --- | --- | --- | --- | --- | --- |
 | QT-01 | Settings, Quote Templates. | "Quote templates" lists Standard (Built in) and the saved templates, each with how many profiles use it ("Used by N profiles" or "Not used by any profile yet"), the Default badge on the workspace default, and "N of 10 saved". Loading shows "Loading templates..."; a failed load shows "Templates could not be loaded." with Try again. | A | DM | | `#settingsTemplatesTab`, `#qtList`, `#qtCounter`, `#qtListRetry` |
-| QT-02 | Make a copy on Standard; clear the name, then type 61 characters, then the name of another template, then `UAT Template`; Save template. | The editor opens as `Copy of Standard`. "Give the template a name.", "Keep the name to 60 characters or fewer." and "Another template already has this name." Save template then says `"UAT Template" is ready to pick in Company Profile.` and it is listed. | A | DM | | `#qtNameInput`, `#qtSaveButton` |
+| QT-02 | Make a copy on Standard; clear the name, then try to type 61 characters, then the name of another template, then `UAT Template`; Save template. | The editor opens as `Copy of Standard`. "Give the template a name."; the name box stops at 60 characters; "Another template already has this name." Save template then says `"UAT Template" is ready to pick in Company Profile.` and it is listed. | A | DM | | `#qtNameInput`, `#qtSaveButton` |
 | QT-03 | New template; make a change; Cancel; All templates. | After a change the footer says "Unsaved changes" and Cancel becomes Discard changes with "Your unsaved changes will be lost."; nothing is saved. | A | D | | `#qtNewButton`, `#qtCancelButton`, `#qtBackButton` |
 | QT-04 | In the editor: Page style (font, text size, text and heading colour, column widths, Hidden, Add column, Remove column); click each block (Logo, Company details, Client details, Quote details, Item table, Totals, Free text, Terms, Notes, Signature, Acceptance) and change its position, order, size, logo width and the item table's columns, headings and alignment; drag a column edge on the ruler; Whole page, zoom in and out. | The side panel shows the selected item's settings; changes show on the page at once; the column width follows the drag; zoom runs from 30% to 150% and changes the view only. At 375 px, tapping a block or a column letter edits it and the page scrolls sideways inside its box. | A | DM | H | `#qtPaperWrap`, `#qtSide`, `#qtZoomFit`, `#qtZoomIn`, `#qtZoomOut` |
 | QT-05 | Make the logo wider than its space, the columns too wide for the page, Totals above the item table, and a block only on hidden columns; Save template; press the status button. | Each problem is marked in red with a plain message (for example "The columns are too wide to fit across the page. Make some narrower." and "Totals must come after the item table. Move it down."). The status button reads "N things to fix" and jumps to the first; Save says "Fix the N items marked in red, then save." and saves nothing. | A | D | | `#qtStatus`, `#qtSaveError` |
 | QT-06 | Preview Excel and Preview PDF. | "The sample Excel file was downloaded." and "The sample PDF was downloaded." (`quote-template-preview.xlsx` and `.pdf`), each the template filled with sample data. | A | D | H | `#qtPreviewExcel`, `#qtPreviewPdf` |
 | QT-07 | Edit `UAT Template`, change a label to `=1+1`, Save template. | It saves; the label shows as text in previews and quotes (RU-04). | A | D | | `#qtSaveButton` |
-| QT-08 | On `UAT Template` (picked by `UAT Profile` in QC-07): Edit; the more menu's Make a copy, Make workspace default, then Delete (Cancel, then Delete template). | Edit opens it; the copy opens in the editor. Make workspace default says `"UAT Template" is now the workspace default. ...`, moves the Default badge, and Quote Company's note follows. `Delete "UAT Template"?` names the profiles that use it and says they switch to the workspace default; as the default, Standard becomes the default again. Delete template removes it; quotes already made keep their layout, and the profile's next quote uses the workspace default. | A | DM | | `qtMore-*`, `#qtDeleteCancel`, `#qtDeleteConfirm` |
-| QT-09 | Save templates up to the limit (10 unless the workspace sets another). | "Limit reached." New template and Make a copy turn off with "You have 10 saved templates. Delete one first." Delete the extra ones afterwards. | A | D | | `#qtNewButton`, `#qtLimitMessage` |
+| QT-08 | On `UAT Template` (picked by `UAT Profile` in QC-07): Edit; the more menu's Make a copy, Make workspace default, then Delete (Cancel, then Delete template). | Edit opens it; the copy opens in the editor. Make workspace default says `"UAT Template" is now the workspace default. ...`, moves the Default badge, and Quote Company's note follows. `Delete "UAT Template"?` names the profiles that use it and says they switch to the workspace default; as the default, Standard becomes the default again. Delete template removes it; quotes already made keep their layout, and the profile's next quote uses the workspace default with the note "The template chosen for this profile was deleted, so the default template was used." | A | DM | | `qtMore-*`, `#qtDeleteCancel`, `#qtDeleteConfirm` |
+| QT-09 | Save templates up to the limit (10 unless the workspace sets another). | "Limit reached." with "You have 10 saved templates, the most a workspace can keep. Delete one to add or copy another." New template turns off; Make a copy turns off and hovering says "You have 10 saved templates. Delete one first." Delete the extra ones afterwards. | A | D | | `#qtNewButton`, `#qtLimitMessage` |
 | QT-10 | Make `Standard` the workspace default again. | The Default badge is back on Standard. | A | D | | |
 
 ### 13. Reopen, reload, another browser and the recovery copy
@@ -277,7 +295,7 @@ Run as admin with templates made in this run. Make the workspace default
 
 | Line | Do | Expect | Who | Width | Eye | Controls |
 | --- | --- | --- | --- | --- | --- | --- |
-| FB-01 | Feedback in the top bar, where shown (it is hidden for signed-in staff, then N/A): Cancel; then fill Report type, Short title, Description, Impact, the optional fields and Manual reference, untick the diagnostic link, and Submit feedback. | "Report a quote issue" opens. Cancel closes it. Without a title and description it says "Add a short title and description before submitting." Submit shows "Feedback submitted. Support reference: ..." and clears the text fields. Use synthetic text only. | B | DM | | `#feedbackButton`, `#feedbackForm`, `#cancelFeedbackButton`, `#submitFeedbackButton`, `#feedbackIncludeLink` |
+| FB-01 | Feedback in the top bar, where shown (it is hidden for signed-in staff, then N/A): Cancel; then fill Report type, Short title, Description, Impact, the optional fields and Manual reference, untick the diagnostic link, and Submit feedback. | "Report a quote issue" opens. Cancel closes it. Without a title and description it says "Add a short title and description before submitting." Submit shows "Feedback submitted. Support reference: ..." and clears the text fields. Use synthetic text only. | B | DM | | `#feedbackButton`, `#feedbackForm`, `#feedbackCategory`, `#feedbackShortTitle`, `#feedbackMessage`, `#feedbackExpectedResult`, `#feedbackActualResult`, `#feedbackReproductionSteps`, `#feedbackImpact`, `#feedbackManualReference`, `#cancelFeedbackButton`, `#submitFeedbackButton`, `#feedbackIncludeLink` |
 
 ### 15. Errors and refusals
 
@@ -290,7 +308,7 @@ synthetic file); otherwise record NOT RUN.
 | ER-02 | Save after the session ended (as SI-08). | "Quote could not be saved. Please sign in again and try again." or the sign-in form with the ended note; nothing is lost. | B | D | | |
 | ER-03 | Any failure message. | It is plain, generic, and carries a support reference where the server gave one. It shows no internal names, stack traces, keys or file paths. | B | DM | | |
 | ER-04 | Analysis fails (when it happens in the run). | The red "AI analysis failed." banner with "Failed. Please try again. Contact support if this keeps happening." The quote stays as it was. | B | D | | `#aiFailureBanner` |
-| ER-05 | The Dashboard list cannot load (offline). | "Quote sessions unavailable" with the generic message, and "Sessions could not be loaded." | B | D | | `#dashboardErrorState` |
+| ER-05 | The Dashboard list cannot load (offline). | "Quote sessions unavailable" with the generic message and a support reference; it stays until the list loads again. | B | D | | `#dashboardErrorState` |
 | ER-06 | Act while the app is busy (press Next twice fast, or Download during a save). | The second press does nothing; nothing runs twice. | B | D | | |
 
 ### 16. Quoting rules
@@ -300,7 +318,7 @@ synthetic file); otherwise record NOT RUN.
 | RU-01 | Try to analyse or generate without reference images (AN-01, and the analysis request with no images). | Refused in the app ("Add at least one reference file before starting analysis." or "Please drop at least one reference file before analysis."); the server's answer is "Please upload reference images first so I can analyze the design and prepare the quote." No quote comes from text alone. | B | D | | `#sideNextButton` |
 | RU-02 | Search the app, the Excel and the PDF of a run quote for `m2`, m with a raised 2, and `sq m`. | None; square metres read `sqm`. | B | D | | |
 | RU-03 | Search the Excel and PDF for cost, markup, supplier notes or internal remarks. | None of them; only quoted prices, tax and totals. | B | D | | |
-| RU-04 | Put `=1+1`, `+1`, `-1` and `@SUM(1)` in Client name, Quotation Title, Payment terms, Standard notes, a line's text (Re) and a template label. | Each shows as plain text in the app, the Excel and the PDF; no Excel cell holds them as a formula. | B | D | | |
+| RU-04 | Put `=1+1`, `+1`, `-1` and `@SUM(1)` in Client name, Quotation Title, Payment terms, Standard notes, a template label and (`$`, through Re) a line's text. | Each shows as plain text in the app, the Excel and the PDF; no Excel cell holds them as a formula. | B | D | | |
 | RU-05 | Generate a quote. | Only the Excel is made unless View PDF is pressed (XP-08). | B | D | | |
 | RU-06 | Try to reach Output before Confirm Quotation Basis. | Refused until the basis is confirmed. | B | D | | `button[data-side-panel]` |
 | RU-07 | Leave a line with no price. | It shows in the pricing review messages, not in the customer file (OUT-07). | B | D | | `#pricingReviewMessages` |
