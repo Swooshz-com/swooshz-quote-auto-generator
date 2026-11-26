@@ -9,7 +9,7 @@ import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 from webapp import ai_gateway, server
-from tests.gateway_test_support import synthetic_configuration, json_response, FixtureHttpResponse, responses_envelope, install_mock_responses_transport
+from tests.gateway_test_support import synthetic_configuration, json_response, FixtureHttpResponse, responses_envelope, install_mock_responses_transport, revise_line_reply
 from tests import test_webapp as existing
 from tests.test_openai_draft_request_contract import synthetic_image
 from tests.test_provider_response_admission import CATALOG, draft
@@ -54,8 +54,7 @@ class GatewayOperationLifecycleTest(unittest.TestCase):
         if operation in {"draft","draft_high_quality"}:
             return draft()
         if operation=="basis_line":
-            return {"intent":"proposal","proposal":{"message":"Change the platform height?",
-                    "replacement_line":{"tag":"Confirm","text":"150mm raised platform with needle punch carpet.","confidence_pct":90}}}
+            return revise_line_reply(text="150mm raised platform with needle punch carpet.", message="Change the platform height?")
         if operation=="basis_answer":
             return {"intent":"answer","answer":"Synthetic answer"}
         if operation=="pricing_import":

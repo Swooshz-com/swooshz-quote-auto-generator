@@ -11,7 +11,7 @@ from decimal import Decimal
 from unittest import mock
 
 from scripts import verify_internal_uat_deploy_template as deploy_template
-from tests.gateway_test_support import responses_envelope, synthetic_configuration
+from tests.gateway_test_support import responses_envelope, revise_line_reply, synthetic_configuration
 from tests.test_openai_draft_request_contract import synthetic_image, synthetic_pdf
 from webapp import ai_gateway, server
 from webapp.quote_ai_spend import QuoteSpendBinding, QuoteSpendOperation
@@ -447,6 +447,8 @@ class DraftBatchParallelismTest(unittest.TestCase):
                 return {"currency": None, "items": []}
             if schema_name == "pricing_metadata_v1":
                 return {"items": []}
+            if schema_name == "revise_line_v1":
+                return revise_line_reply("answer")
             return self.response(body)
 
         self.values["OPENROUTER_DRAFT_BATCH_REASONING_EFFORT"] = "medium"

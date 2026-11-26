@@ -92,16 +92,17 @@ def main() -> int:
         def owner_mock_basis_chat(payload, auth_session=None):
             chat = payload['basis_chat']
             line = next(section for section in payload['quote_basis_sections'] if section['id'] == chat['field'])['lines'][chat['line_index']]
-            return webapp.normalize_basis_chat_result({'intent': 'proposal', 'proposal': {
-                'message': 'Change this line?', 'replacement_line': {'tag': basis_chat_tag, 'text': line['text'], 'confidence_pct': 95},
+            return webapp.normalize_basis_chat_result({'intent': 'proposal', 'answer': None, 'question': None, 'proposal': {
+                'message': 'Change this line?',
+                'replacement_line': {'tag': basis_chat_tag, 'text': line['text'], 'quantity': None, 'unit': None},
             }}, payload, 'openrouter', auth_session=auth_session)
         webapp.request_configured_basis_chat = owner_mock_basis_chat
-    # Or the driver writes each reply's replacement_line to basis-chat-reply.json beside the scenario
-    # before it sends; the server still admits it as a provider reply.
+    # Or the driver writes each reply's replacement_line (text, tag, quantity, unit) to basis-chat-reply.json
+    # beside the scenario before it sends; the server still admits it as a revise_line_v1 provider reply.
     if scenario_path.is_file() and json.loads(scenario_path.read_text(encoding='utf-8')).get('basis_chat_reply'):
         def owner_mock_basis_chat_reply(payload, auth_session=None):
             reply = json.loads((scenario_path.parent / 'basis-chat-reply.json').read_text(encoding='utf-8'))
-            return webapp.normalize_basis_chat_result({'intent': 'proposal', 'proposal': {
+            return webapp.normalize_basis_chat_result({'intent': 'proposal', 'answer': None, 'question': None, 'proposal': {
                 'message': 'Change this line?', 'replacement_line': reply,
             }}, payload, 'openrouter', auth_session=auth_session)
         webapp.request_configured_basis_chat = owner_mock_basis_chat_reply

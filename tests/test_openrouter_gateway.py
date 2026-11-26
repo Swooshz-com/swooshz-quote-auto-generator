@@ -17,7 +17,8 @@ import urllib.error
 from email.message import Message
 from unittest import mock
 from webapp import ai_gateway as gateway
-from tests.gateway_test_support import synthetic_configuration
+from webapp import ai_response_contracts
+from tests.gateway_test_support import REVISE_LINE_ANSWER_TEXT, synthetic_configuration
 
 
 
@@ -28,7 +29,8 @@ def envelope(route):
 
 def completed(route, *, text=None, **changes):
     if text is None:
-        text = '{"currency":null,"items":[]}' if route.operation == "pricing_import" else '{"items":[]}'
+        text = ('{"currency":null,"items":[]}' if route.operation == "pricing_import"
+                else REVISE_LINE_ANSWER_TEXT if route.operation == "basis_line" else '{"items":[]}')
     return {"model":route.model,"status":"completed","output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":text}]}],**changes}
 
 
@@ -438,6 +440,115 @@ class PricingGatewayContractTest(unittest.TestCase):
                     sent = json.loads(opener.open.call_args.args[0].data)
                     self.assertIs(sent["text"]["format"]["strict"], True)
                     sleep.assert_not_called()
+
+
+class ReviseLineGatewayContractTest(unittest.TestCase):
+    """#430 slice R2: every selected-line Re reply is held to the strict revise_line_v1 contract."""
+
+    def setUp(self):
+        self.config = gateway.GatewayConfiguration.capture(synthetic_configuration().get)
+        self.route = self.config.route("basis_line")
+        self.valid = {"intent": "proposal", "answer": None, "question": None, "proposal": {
+            "message": "Change it?", "replacement_line": {"text": "Synthetic panel", "tag": None, "quantity": 30, "unit": None}}}
+
+    def test_line_request_sends_the_strict_schema_and_answer_route_sends_none(self):
+        for operation in ("basis_line", "basis_answer"):
+            with self.subTest(operation=operation):
+                route = self.config.route(operation)
+                text = json.dumps(self.valid) if operation == "basis_line" else '{"intent":"answer","answer":"ok"}'
+                transport = RecordingTransport([completed(route, text=text)])
+                subject = gateway.AiGateway(self.config, credential_reader=lambda: "synthetic", transport=transport)
+                subject.request(operation, envelope(route))
+                (body, _options), = transport.calls
+                if operation == "basis_line":
+                    self.assertEqual(body["text"], ai_response_contracts.REVISE_LINE.text_format())
+                    schema = body["text"]["format"]["schema"]
+                    self.assertEqual(set(schema["required"]), {"intent", "answer", "question", "proposal"})
+                    line = schema["properties"]["proposal"]["properties"]["replacement_line"]
+                    self.assertEqual(set(line["properties"]), {"text", "tag", "quantity", "unit"})
+                    self.assertEqual(line["properties"]["tag"]["enum"], ["Include", "Exclude", None])
+                    self.assertFalse(line["additionalProperties"])
+                else:
+                    self.assertNotIn("text", body)
+        # A caller cannot supply or swap the contract itself.
+        blocked = RecordingTransport([])
+        subject = gateway.AiGateway(self.config, credential_reader=mock.Mock(), transport=blocked)
+        for supplied, keywords in ((envelope(self.route) | {"text": ai_response_contracts.REVISE_LINE.text_format()}, {}),
+                                   (envelope(self.route), {"response_contract": "revise_line_v1"})):
+            with self.assertRaises(gateway.GatewayError) as caught:
+                subject.request("basis_line", supplied, **keywords)
+            self.assertEqual(caught.exception.reason, "envelope_invalid")
+        self.assertEqual(blocked.calls, [])
+
+    def test_line_replies_outside_the_contract_fail_once_without_replay(self):
+        valid_text = json.dumps(self.valid)
+        row = self.valid["proposal"]["replacement_line"]
+
+        def reply(**changes):
+            return json.dumps({**self.valid, **changes})
+        cases = {
+            "extra_field": (reply(confidence=90), "schema_shape"),
+            "no_intent": (json.dumps({key: value for key, value in self.valid.items() if key != "intent"}), "schema_shape"),
+            "two_payloads": (reply(answer="Also an answer"), "intent_payload"),
+            "wrong_payload": (reply(intent="answer"), "intent_payload"),
+            "price": (reply(proposal={"message": "x", "replacement_line": {**row, "unit_price": 12}}), "schema_shape"),
+            "id": (reply(proposal={"message": "x", "replacement_line": {**row, "id": "row-1"}}), "schema_shape"),
+            "custom_tag": (reply(proposal={"message": "x", "replacement_line": {**row, "tag": "Custom"}}), "schema_shape"),
+            "zero_quantity": (reply(proposal={"message": "x", "replacement_line": {**row, "quantity": 0}}), "schema_shape"),
+            "blank_text": (reply(proposal={"message": "x", "replacement_line": {**row, "text": " "}}), "schema_shape"),
+            "duplicate_key": (valid_text[:-1] + ', "intent": "answer"}', "schema_json"),
+            "array": ("[" + valid_text + "]", "schema_shape"),
+            "fenced": ("```json\n" + valid_text + "\n```", "schema_json"),
+        }
+        for case, (text, contract_reason) in cases.items():
+            with self.subTest(case=case):
+                transport = RecordingTransport([completed(self.route, text=text)])
+                sleep = mock.Mock()
+                subject = gateway.AiGateway(self.config, credential_reader=lambda: "synthetic", transport=transport, sleep=sleep)
+                with self.assertRaises(gateway.GatewayError) as caught:
+                    subject.request("basis_line", envelope(self.route))
+                self.assertEqual(caught.exception.reason, "response_revise_contract")
+                self.assertEqual(caught.exception.diagnostics["response_contract_reason"], contract_reason)
+                self.assertEqual(caught.exception.diagnostics["response_contract_name"], "revise_line_v1")
+                self.assertEqual(caught.exception.diagnostics["failure_boundary"], "provider_response_contract")
+                self.assertEqual(len(transport.calls), 1)
+                sleep.assert_not_called()
+        for case, response in (
+            ("cut_off", completed(self.route, text=valid_text, status="incomplete", incomplete_details={"reason": "max_output_tokens"})),
+            ("refused", completed(self.route, text=valid_text, refusal="synthetic refusal")),
+        ):
+            with self.subTest(case=case):
+                transport = RecordingTransport([response])
+                sleep = mock.Mock()
+                subject = gateway.AiGateway(self.config, credential_reader=lambda: "synthetic", transport=transport, sleep=sleep)
+                with self.assertRaises(gateway.GatewayError):
+                    subject.request("basis_line", envelope(self.route))
+                self.assertEqual(len(transport.calls), 1)
+                sleep.assert_not_called()
+
+    def test_line_schema_rejection_is_terminal_and_transient_errors_still_retry(self):
+        error_body = {"error": {"type": "invalid_request_error", "code": "unsupported_schema",
+                                "param": "text.format.schema", "message": "synthetic_private_value"}}
+        opener = mock.Mock()
+        opener.open.side_effect = urllib.error.HTTPError(gateway.OPENROUTER_RESPONSES_URL, 422, "synthetic_private_value",
+                                                         {}, io.BytesIO(json.dumps(error_body).encode()))
+        sleep = mock.Mock()
+        subject = gateway.AiGateway(self.config, credential_reader=lambda: "synthetic",
+                                    transport=gateway.BoundedHttpsTransport(opener=opener), sleep=sleep)
+        with self.assertRaises(gateway.GatewayError) as caught:
+            subject.request("basis_line", envelope(self.route))
+        self.assertEqual(caught.exception.reason, "response_schema_rejected")
+        self.assertEqual(caught.exception.diagnostics["response_contract_name"], "revise_line_v1")
+        self.assertNotIn("synthetic_private", str(caught.exception) + json.dumps(caught.exception.diagnostics))
+        opener.open.assert_called_once()
+        sleep.assert_not_called()
+        transient = RecordingTransport([gateway.GatewayError("http_error", boundary="provider_http", retryable=True),
+                                        completed(self.route, text=json.dumps(self.valid))])
+        sleep = mock.Mock()
+        subject = gateway.AiGateway(self.config, credential_reader=lambda: "synthetic", transport=transient, sleep=sleep)
+        subject.request("basis_line", envelope(self.route))
+        self.assertEqual(len(transient.calls), 2)
+        sleep.assert_called_once_with(2.0)
 
 
 class LoopbackResponseTest(unittest.TestCase):

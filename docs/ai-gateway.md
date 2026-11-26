@@ -131,6 +131,38 @@ Each pricing call sends once. A provider schema rejection requires a
 recognised machine code or schema parameter. Qualify each configured pricing
 route on the installed build before rollout.
 
+## Re (selected-line) response contract
+
+Every Re message on a selected quote-basis line goes to the `BASIS_LINE` route;
+the browser has no local shortcut or word list, and the server decides nothing
+from the message's words. The gateway attaches the strict `revise_line_v1`
+schema to every `basis_line` request and admits the reply before the application
+uses it. The reply is one closed object with `intent` (`answer`, `clarification`
+or `proposal`) and exactly the one payload that intent names (`answer` text,
+`question` text, or `proposal` with `message` and one `replacement_line`); the
+other two are null. `replacement_line` holds only `text`, `tag` (`Include`,
+`Exclude` or null to keep the current tag), `quantity` and `unit` (null keeps
+the current value). It never carries a price, catalogue field, id or confidence.
+`max_output_tokens` is 4,000. `Ask For Changes` without a selected line stays
+answer-only on `BASIS_ANSWER` with no schema.
+
+Before any spend claim or send, the server admits the request: a message of at
+most 1,000 characters and a selector that still names the exact current row.
+A refusal returns a fixed message, logs `basis_chat_blocked` with the rule name
+and makes no AI call. After the reply, the server checks that something changed,
+that the text is at most 2,000 characters, that the quantity agrees with any
+quantity written in the text, and that every number in the proposed row was
+stated in the current row, the operator's message, Known details or the booth
+size, or is an area in sqm that is the product of two sizes in the new text.
+When the item changes, the proposed text is the whole new line: the old item's
+detail is never carried onto it. A refused reply fails once with
+`failure_code=basis_chat_reply_unusable`, a plain message and one reference;
+the `basis_chat_failed` log carries `failure_kind=model_output_invalid` and the
+refusing rule in `response_contract_reason`. Contract violations, cut-off and
+refused replies are not replayed; schema rejection by the provider is terminal.
+Transient transport errors keep the two same-route retries. Only Apply in the
+browser changes a row.
+
 ## PDF reference limits
 
 Analysis accepts PDFs and images up to 48 MiB each, 96 pages in total across PDFs and

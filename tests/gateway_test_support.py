@@ -64,3 +64,20 @@ def install_mock_responses_transport(testcase):
     def initialize(subject, *, opener=None):
         subject._opener = opener if opener is not None else SimpleNamespace(open=urllib.request.urlopen)
     testcase.enterContext(mock.patch.object(BoundedHttpsTransport, "__init__", initialize))
+
+
+def revise_line_reply(intent="proposal", *, answer=None, question=None, text=None, tag=None,
+                      quantity=None, unit=None, message="Change this line?"):
+    """A complete revise_line_v1 reply (#430 slice R2): one payload for its intent, null for the others."""
+    reply = {"intent": intent, "answer": None, "question": None, "proposal": None}
+    if intent == "answer":
+        reply["answer"] = answer or "This line needs operator confirmation."
+    elif intent == "clarification":
+        reply["question"] = question or "What should this line say instead?"
+    else:
+        reply["proposal"] = {"message": message, "replacement_line": {
+            "text": text, "tag": tag, "quantity": quantity, "unit": unit}}
+    return reply
+
+
+REVISE_LINE_ANSWER_TEXT = json.dumps(revise_line_reply("answer"))

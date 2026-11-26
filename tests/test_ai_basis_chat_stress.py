@@ -2,6 +2,7 @@ import copy
 import io
 import json
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -11,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from webapp import server as webapp
-from tests.gateway_test_support import synthetic_configuration, json_response, responses_envelope, FixtureHttpResponse, install_mock_responses_transport
+from tests.gateway_test_support import synthetic_configuration, json_response, responses_envelope, FixtureHttpResponse, install_mock_responses_transport, revise_line_reply
 from webapp.ai_gateway import OPENROUTER_RESPONSES_URL
 
 
@@ -98,24 +99,10 @@ def stress_payload() -> dict:
 
 
 def openai_response(payload: dict) -> FixtureHttpResponse:
-    intent = webapp.basis_chat_required_intent(payload)
-    if intent == "answer":
-        content = {"intent": "answer", "answer": "- **Meaning:** This line needs operator confirmation."}
-    else:
-        basis_chat = payload["basis_chat"]
-        content = {
-            "intent": "proposal",
-            "proposal": {
-                "message": "Apply this selected-line update?",
-                "replacement_line": {
-                    "tag": "Confirm",
-                    "text": "150mm raised platform with needle punch carpet.",
-                    "confidence_pct": 90,
-                },
-            },
-        }
-    operation = "basis_answer" if intent == "answer" else "basis_line"
-    return json_response("synthetic/"+operation, content)
+    if webapp.basis_chat_has_selected_line(payload):
+        return json_response("synthetic/basis_line", revise_line_reply(
+            text="150mm raised platform with needle punch carpet.", message="Apply this selected-line update?"))
+    return json_response("synthetic/basis_answer", {"intent": "answer", "answer": "- **Meaning:** This line needs operator confirmation."})
 
 
 class AIBasisChatStressTest(unittest.TestCase):
@@ -193,7 +180,6 @@ class AIBasisChatStressTest(unittest.TestCase):
 
                 body = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
                 urlopen.assert_called_once()
-                self.assertEqual(webapp.basis_chat_required_intent(payload), "answer")
                 self.assertEqual(body["model"], "synthetic/basis_answer")
                 self.assertEqual(body["reasoning"], {"effort": "high"})
                 self.assertEqual(result["status"], "answered")
@@ -376,6 +362,248 @@ class AIBasisChatStressTest(unittest.TestCase):
         )
 
         self.assertEqual(parsed, {"intent": "answer", "answer": "Safe answer."})
+
+
+
+# #430 slice R2 (INT-SQAG-202611260010): one AI route for every Re message, through the real job path.
+REVISE_SECTIONS = [
+    {"id": "walls", "title": "Walls", "lines": [{
+        "id": "wall", "tag": "Confirm", "text": "Feature wall 4m W x 3m H with laminate finish",
+        "quantity": 12, "unit": "sqm", "confidence_pct": 85}]},
+    {"id": "lighting", "title": "Lighting", "lines": [{
+        "id": "spot", "tag": "Include", "text": "[ nos. 10W LED Spotlight ] - Ceiling spotlights over the counter.",
+        "quantity": 20, "unit": "nos", "confidence_pct": 90, "pricing_keyword": "lighting-10w-led-spotlight",
+        "catalog_description": "nos. 10W LED Spotlight", "catalog_unit_price": 45}]},
+    {"id": "furniture", "title": "Furniture", "lines": [{
+        "id": "stool", "tag": "Include",
+        "text": "[ White Backless Reception Stool ] - White backless reception stools, arranged two at each reception counter.",
+        "quantity": 4, "unit": "nos", "confidence_pct": 90, "pricing_keyword": "furniture-white-backless-reception-stool",
+        "catalog_description": "White Backless Reception Stool", "catalog_unit_price": 30}]},
+    {"id": "graphics", "title": "Graphics", "lines": [{
+        "id": "logo", "tag": "Confirm", "text": "Logo signage with 3D acrylic letters on the fascia",
+        "quantity": 1, "unit": "nos", "confidence_pct": 70}]},
+    {"id": "doors", "title": "Doors", "lines": [{
+        "id": "door", "tag": "Include", "text": "White hinged door for the utility store",
+        "quantity": 1, "unit": "nos", "confidence_pct": 80}]},
+]
+WALL = "Feature wall 4m W x 3m H with laminate finish"
+SPOT = "[ nos. 10W LED Spotlight ] - Ceiling spotlights over the counter."
+STOOL = "[ White Backless Reception Stool ] - White backless reception stools, arranged two at each reception counter."
+NEW_DOOR = "White flush hinged door with digital keypad lock for the utility store."
+UNUSABLE_REPLY_MESSAGE = "The AI reply could not be used, so the line was not changed. Please say the change another way."
+TOO_LONG = "Please keep the message to 1,000 characters or fewer."
+STALE = "This line has changed since it was selected. Close Re, open it again on the line and resend."
+
+
+def proposal_reply(text, **row):
+    return revise_line_reply(text=text, **row)
+
+
+# (name, line, operator message, provider reply, expected)
+REVISE_ROUTE_CASES = [
+    # Owner UAT and agent UAT phrasings (ERR-0B5639DC, R2, R1, R3).
+    ("change to 30", "spot", "change to 30", proposal_reply(SPOT, quantity=30),
+     {"text": SPOT, "quantity": 30, "unit": "nos", "bound": True}),
+    ("quantity should be 30", "spot", "quantity should be 30", proposal_reply(SPOT, quantity=30),
+     {"text": SPOT, "quantity": 30, "unit": "nos", "bound": True}),
+    ("change the wording to", "door", f"Change the wording to: {NEW_DOOR}", proposal_reply(NEW_DOOR),
+     {"text": NEW_DOOR, "quantity": 1, "unit": "nos"}),
+    ("R1 another item, model keeps its own form", "stool", "should be 4 nos. tall rattan bar chairs with backrest",
+     proposal_reply("Tall Rattan Bar Chair with Backrest - Tall rattan bar chairs with backrests, arranged two at each reception counter."),
+     {"text": "Tall Rattan Bar Chair with Backrest - Tall rattan bar chairs with backrests, arranged two at each reception counter.",
+      "quantity": 4, "bound": False, "absent": "White backless"}),
+    ("R1 another item, whole new line", "stool", "should be tall rattan bar chairs with backrest",
+     proposal_reply("Tall rattan bar chairs with backrest"),
+     {"text": "Tall rattan bar chairs with backrest", "bound": False, "absent": "White backless"}),
+    ("same item, new detail stays bound", "stool", "colour should be black",
+     proposal_reply("[ White Backless Reception Stool ] - Black backless reception stools, arranged two at each reception counter."),
+     {"text": "[ White Backless Reception Stool ] - Black backless reception stools, arranged two at each reception counter.",
+      "bound": True}),
+    ("R3 AI logo line", "logo", "should be 3 nos. 2D backlit logo", proposal_reply("2D backlit logo", quantity=3, unit="nos"),
+     {"text": "2D backlit logo", "quantity": 3, "unit": "nos"}),
+    ("R3 AI logo line, quantity written in the text", "logo", "should be 3 nos. 2D backlit logo",
+     proposal_reply("3 nos. 2D backlit logo", quantity=3, unit="nos"), {"text": "2D backlit logo", "quantity": 3, "unit": "nos"}),
+    # G0 walk rows that were refused or answered by a local shortcut.
+    ("width from a word", "wall", "change the width to 5m", proposal_reply("Feature wall 5m W x 3m H with laminate finish", quantity=15, unit="sqm"),
+     {"text": "Feature wall 5m W x 3m H with laminate finish", "quantity": 15, "unit": "sqm"}),
+    ("size and area together", "wall", "make it 15 sqm, 5m W x 3m H",
+     proposal_reply("Feature wall 5m W x 3m H with laminate finish", quantity=15, unit="sqm"),
+     {"text": "Feature wall 5m W x 3m H with laminate finish", "quantity": 15}),
+    ("shorthand with please", "wall", "5m wide please", proposal_reply("Feature wall 5m W x 3m H with laminate finish", quantity=15, unit="sqm"),
+     {"text": "Feature wall 5m W x 3m H with laminate finish", "quantity": 15}),
+    ("with thanks", "wall", "change laminate to veneer thanks", proposal_reply("Feature wall 4m W x 3m H with veneer finish"),
+     {"text": "Feature wall 4m W x 3m H with veneer finish", "quantity": 12}),
+    ("with not", "wall", "veneer not laminate", proposal_reply("Feature wall 4m W x 3m H with veneer finish"),
+     {"text": "Feature wall 4m W x 3m H with veneer finish"}),
+    ("remove", "wall", "remove the laminate finish", proposal_reply("Feature wall 4m W x 3m H"), {"text": "Feature wall 4m W x 3m H"}),
+    ("exclude", "wall", "exclude this", proposal_reply(WALL, tag="Exclude"), {"text": WALL, "tag": "Exclude"}),
+    ("include", "wall", "include this please", proposal_reply(WALL, tag="Include"), {"text": WALL, "tag": "Include"}),
+    ("clarification", "wall", "size not correct", revise_line_reply("clarification", question="What size should the wall be?"),
+     {"clarification": "What size should the wall be?"}),
+    ("answer", "wall", "Why is the wall 12 sqm?", revise_line_reply("answer", answer="4m x 3m is 12 sqm."), {"answer": "4m x 3m is 12 sqm."}),
+    # Replies the app refuses: plain words, one reference, and the log names the rule.
+    ("number nobody stated", "wall", "make it wider", proposal_reply("Feature wall 7.5m W x 3m H with laminate finish"),
+     {"refused": "number_unstated"}),
+    ("area that is not the product", "wall", "change the width to 5m",
+     proposal_reply("Feature wall 5m W x 3m H with laminate finish", quantity=16, unit="sqm"), {"refused": "number_unstated"}),
+    ("quantity nobody stated", "spot", "a few more please", proposal_reply(SPOT, quantity=25), {"refused": "number_unstated"}),
+    ("quantity in exponent form", "spot", "a few more please", proposal_reply(SPOT, quantity=1e-05), {"refused": "number_unstated"}),
+    ("unchanged", "wall", "change laminate to veneer", proposal_reply(WALL), {"refused": "unchanged"}),
+    ("quantity conflicts with the text", "logo", "should be 3 nos. 2D backlit logo",
+     proposal_reply("3 nos. 2D backlit logo", quantity=4, unit="nos"), {"refused": "quantity_conflict"}),
+    ("text over 2,000 characters", "wall", "make it longer", proposal_reply("Feature wall " + "x" * 2000), {"refused": "text_too_long"}),
+    ("extra field", "wall", "change laminate to veneer", {**proposal_reply("Feature wall 4m W x 3m H with veneer finish"), "confidence": 90},
+     {"refused": "schema_shape"}),
+    ("two payloads", "wall", "change laminate to veneer",
+     {**proposal_reply("Feature wall 4m W x 3m H with veneer finish"), "answer": "Also an answer"}, {"refused": "intent_payload"}),
+    ("price in the row", "wall", "change laminate to veneer",
+     {**proposal_reply("x"), "proposal": {"message": "x", "replacement_line": {
+         "text": "Feature wall 4m W x 3m H with veneer finish", "tag": None, "quantity": None, "unit": None, "unit_price": 99}}},
+     {"refused": "schema_shape"}),
+]
+
+
+class ReviseLineRouteTest(unittest.TestCase):
+    """Every Re message: admitted before spend, one AI call, three outcomes, strict reply (#430 R2)."""
+
+    def setUp(self):
+        from tests import test_webapp as existing
+        self.existing = existing
+        install_mock_responses_transport(self)
+        data_root = existing.test_temp_root() / f"revise-line-route-{time.time_ns()}"
+        self.enterContext(mock.patch.dict(webapp.os.environ, {
+            "QUOTE_DATA_ROOT": str(data_root), "OPENROUTER_API_KEY": "synthetic-key", "SQAG_DISABLE_DOTENV": "1",
+            **existing.SYNTHETIC_DRAFT_CONFIG}, clear=False))
+        empty_bundled = existing.test_temp_root() / "empty-bundled-pricing"
+        empty_bundled.mkdir(parents=True, exist_ok=True)
+        pricing_root = self.enterContext(existing.local_pricing_fixture_root())
+        for name, value in (
+            ("DEFAULT_PROFILE_ID", "synthetic-exhibition-fixture-template"),
+            ("DEFAULT_PRICING_REFERENCE_ID", "synthetic-exhibition-fixture-pricing"),
+            ("BUNDLED_DEFAULT_PROFILE_ID", "synthetic-exhibition-fixture-template"),
+            ("BUNDLED_DEFAULT_PRICING_REFERENCE_ID", "synthetic-exhibition-fixture-pricing"),
+        ):
+            self.enterContext(mock.patch.object(webapp, name, value))
+        self.enterContext(mock.patch.object(webapp, "profiles_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "profiles"))
+        self.enterContext(mock.patch.object(webapp, "pricing_references_root", return_value=pricing_root))
+        self.enterContext(mock.patch.object(webapp, "bundled_pricing_references_root", return_value=empty_bundled))
+
+    def payload(self, line_id, message, **chat):
+        payload = self.existing.valid_payload()
+        payload["quote_basis_sections"] = copy.deepcopy(REVISE_SECTIONS)
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
+        section = next(section for section in REVISE_SECTIONS if section["lines"][0]["id"] == line_id)
+        line = section["lines"][0]
+        payload["basis_chat"] = {"question": message, "scope": "line", "field": section["id"], "line_index": 0,
+                                 "line": f"{line['tag']}: {line['text']}", "quantity": line["quantity"], "unit": line["unit"],
+                                 **chat}
+        return payload
+
+    def run_job(self, payload, replies):
+        model = self.existing.SYNTHETIC_DRAFT_CONFIG["OPENROUTER_BASIS_LINE_MODEL"]
+        responses = [reply if isinstance(reply, BaseException) else json_response(model, reply) for reply in replies]
+        with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=responses) as send, \
+                mock.patch.object(webapp, "claim_quote_spend", wraps=webapp.claim_quote_spend) as claim, \
+                mock.patch.object(webapp.time, "sleep"), \
+                mock.patch.object(webapp, "write_local_log", return_value=True) as logs:
+            created = webapp.create_job("basis_chat", payload)
+            job = created if created.get("status") == "blocked" else self.existing.wait_for_job(created["job_id"], timeout=10)
+        bodies = [json.loads(call.args[0].data) for call in send.call_args_list]
+        return job, bodies, claim.call_count, [(call.args[0], call.args[1]) for call in logs.call_args_list]
+
+    def test_every_re_message_takes_the_one_ai_route_with_three_outcomes(self):
+        for name, line_id, message, reply, expected in REVISE_ROUTE_CASES:
+            with self.subTest(case=name):
+                payload = self.payload(line_id, message)
+                before = copy.deepcopy(payload)
+                job, bodies, claims, logs = self.run_job(payload, [reply])
+                self.assertEqual(len(bodies), 1)
+                self.assertEqual(claims, 1)
+                self.assertEqual(payload, before)
+                result = job["result"]
+                if "refused" in expected:
+                    self.assertEqual(job["status"], "failed")
+                    self.assertEqual(result["failure_code"], "basis_chat_reply_unusable")
+                    self.assertEqual(result["errors"], [f"{UNUSABLE_REPLY_MESSAGE} Reference: {job['error_reference']}."])
+                    self.assertNotIn("proposal", result)
+                    failures = [details for event, details in logs if event == "basis_chat_failed"]
+                    self.assertEqual(len(failures), 1)
+                    self.assertEqual(failures[0]["error_reference"], job["error_reference"])
+                    self.assertEqual(failures[0]["failure_kind"], "model_output_invalid")
+                    self.assertEqual(failures[0]["response_contract_reason"], expected["refused"])
+                    self.assertNotIn("Feature wall", json.dumps(failures, default=str))
+                    self.assert_line_request(bodies[0], message)
+                    continue
+                self.assertEqual(job["status"], "completed")
+                if "answer" in expected:
+                    self.assertEqual((result["type"], result["answer"]), ("answer", expected["answer"]))
+                    self.assertNotIn("proposal", result)
+                    self.assert_line_request(bodies[0], message)
+                    continue
+                if "clarification" in expected:
+                    self.assertEqual((result["type"], result["question"]), ("clarification", expected["clarification"]))
+                    self.assertNotIn("proposal", result)
+                    self.assert_line_request(bodies[0], message)
+                    continue
+                self.assertEqual(result["type"], "proposal")
+                sections = result["proposal"]["quote_basis_sections"]
+                for section, original in zip(sections, REVISE_SECTIONS):
+                    if original["lines"][0]["id"] != line_id:
+                        self.assertEqual(section["lines"][0]["text"], original["lines"][0]["text"])
+                line = next(section["lines"][0] for section in sections if section["lines"][0]["id"] == line_id)
+                self.assertEqual(line["text"], expected["text"])
+                if "quantity" in expected:
+                    self.assertEqual(line["quantity"], expected["quantity"])
+                if "unit" in expected:
+                    self.assertEqual(line["unit"], expected["unit"])
+                if "tag" in expected:
+                    self.assertEqual(line["tag"], expected["tag"])
+                if "bound" in expected:
+                    self.assertEqual("pricing_keyword" in line, expected["bound"])
+                    self.assertEqual(bool(line.get("custom_pricing")), not expected["bound"])
+                if "absent" in expected:
+                    self.assertNotIn(expected["absent"], line["text"])
+                original = next(section["lines"][0] for section in REVISE_SECTIONS if section["lines"][0]["id"] == line_id)
+                self.assertNotIn('"unit_price"', json.dumps(line))
+                self.assertEqual(line.get("catalog_unit_price"), original.get("catalog_unit_price") if expected.get("bound") else None)
+                self.assert_line_request(bodies[0], message)
+
+    def assert_line_request(self, body, message):
+        # Checked after the outcome so a run on older code fails on behaviour first.
+        self.assertEqual(body["text"]["format"]["name"], "revise_line_v1")
+        self.assertEqual(body["max_output_tokens"], 4000)
+        prompt = body["input"][0]["content"][0]["text"]
+        self.assertIn(json.dumps(message, ensure_ascii=True), prompt)
+        self.assertNotIn("catalog_unit_price", prompt)
+
+    def test_requests_refused_before_any_spend_claim_or_ai_call(self):
+        cases = {
+            "blank message": (self.payload("wall", "   "), "message_empty", "Please type a message about the selected line."),
+            "message over 1,000 characters": (self.payload("wall", "a" * 1001), "message_too_long", TOO_LONG),
+            "selected line changed": (self.payload("wall", "change to 30", line="Confirm: An older wording"), "selected_line_stale", STALE),
+            "other row index": (self.payload("wall", "change to 30", line_index=3), "selected_line_stale", STALE),
+            "other section": (self.payload("wall", "change to 30", field="doors"), "selected_line_stale", STALE),
+            "forged selector": (self.payload("wall", "change to 30", field="walls-forged"), "selected_line_stale", STALE),
+        }
+        for name, (payload, rule, message) in cases.items():
+            with self.subTest(case=name):
+                job, bodies, claims, logs = self.run_job(payload, [])
+                self.assertEqual(job, {"status": "blocked", "errors": [message]})
+                self.assertEqual((len(bodies), claims), (0, 0))
+                self.assertIn(("basis_chat_blocked", {"failure_boundary": "request_admission", "rule": rule}), logs)
+        exactly_limit, bodies, claims, _logs = self.run_job(self.payload("wall", "a" * 1000), [revise_line_reply("answer")])
+        self.assertEqual((exactly_limit["status"], len(bodies), claims), ("completed", 1, 1))
+
+    def test_provider_failures_stay_generic_and_are_logged_once(self):
+        errors = [webapp.urllib.error.HTTPError(OPENROUTER_RESPONSES_URL, 503, "unavailable", {}, io.BytesIO(b"{}")) for _ in range(3)]
+        job, bodies, claims, logs = self.run_job(self.payload("wall", "change to 30"), errors)
+        self.assertEqual((job["status"], len(bodies)), ("failed", 3))
+        self.assertNotIn("failure_code", job["result"])
+        self.assertEqual(job["result"]["errors"], [
+            f"Failed. Please try again. Contact support if this keeps happening. Reference: {job['error_reference']}."])
+        failures = [details for event, details in logs if event == "basis_chat_failed"]
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["error_reference"], job["error_reference"])
 
 
 if __name__ == "__main__":

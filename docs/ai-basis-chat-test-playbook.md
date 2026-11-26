@@ -18,7 +18,8 @@ This playbook covers:
 
 ## Model Routing
 
-- Selected-line `Re` uses the explicit `BASIS_LINE` route; answers and other basis chat use `BASIS_ANSWER`.
+- Every selected-line `Re` message uses the explicit `BASIS_LINE` route with the strict `revise_line_v1` reply contract (see [the gateway contract](ai-gateway.md)): an answer, one clarification question, or one full selected-row proposal. There are no local shortcuts or word lists in the browser or the server. `Ask For Changes` without a selected line uses `BASIS_ANSWER` and answers only.
+- The server admits the message (at most 1,000 characters) and the selected row before any spend or AI call. A reply the app refuses shows a plain message with a reference, and the log names the rule.
 - Configure the complete six-operation catalogue and server-only credential in [the gateway contract](ai-gateway.md). There are no model defaults or credential-driven provider selection.
 - Capture model, effort and downstream endpoint once. Unknown effort, incomplete settings or a request/configuration mismatch reject before transport.
 - A failed answer route never switches to the line route, full-draft model or another provider. Text retries are bounded transient retries on the same route; malformed, refused and partial responses are not replayed.
@@ -37,7 +38,7 @@ This playbook does not cover:
 - Do not spend on live AI unless the local mocked suite passes.
 - Never accept raw JSON, Python tracebacks, provider error blobs, API keys, or internal prompt text in the browser UI.
 - Never silently mutate the quote basis. `Re` must show a proposal before applying an edit.
-- Question-style prompts should answer the user, not produce an edit proposal.
+- The AI decides the outcome from the message. A question should get an answer, an incomplete correction a clarification question, and an edit a full-row proposal; none of them changes the row before Apply.
 - Edit-style prompts without a selected `Re` line should answer with guidance to select a line, not produce a quote-scope proposal.
 
 ## Required Local Checks
@@ -47,7 +48,7 @@ Run these before any live AI test:
 ```powershell
 node --check webapp\static\app.js
 python -m py_compile webapp\server.py scripts\generate_quote.py
-python -m unittest tests.test_ai_basis_chat_stress
+python -m unittest tests.test_ai_basis_chat_stress tests.test_ai_response_contracts tests.test_openrouter_gateway
 python -m unittest discover -s tests
 npm run playwright:ai-stress
 git diff --check
@@ -91,8 +92,8 @@ Expected result:
 
 ### Wrong-shape responses
 
-- `proposal` returned for a question.
-- `answer` returned for an edit command.
+- A `Re` reply outside `revise_line_v1`: extra or missing fields, no intent, two payloads, a price, id, confidence or `Custom` tag, a quantity that conflicts with the text, unchanged rows, or a number nobody stated.
+- `proposal` returned for quote-scope `Ask For Changes`.
 - Empty JSON object.
 - JSON array instead of object.
 - Object with `proposal` but no usable `quote_basis_sections`, `quote_basis`, or `replacement_line`.

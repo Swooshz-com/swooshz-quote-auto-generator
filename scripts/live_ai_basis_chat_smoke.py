@@ -158,6 +158,17 @@ def smoke_cases(include_injection: bool, selected_cases: set[str] | None = None)
             },
         },
         {
+            "name": "re_selected_line_incomplete_correction",
+            "expect_type": "clarification",
+            "basis_chat": {
+                "question": "size not correct",
+                "scope": "line",
+                "field": "platform",
+                "line_index": 0,
+                "line": "Confirm: 100mm raised platform with needle punch carpet.",
+            },
+        },
+        {
             "name": "ask_for_changes_question",
             "expect_type": "answer",
             "basis_chat": {
@@ -170,7 +181,8 @@ def smoke_cases(include_injection: bool, selected_cases: set[str] | None = None)
         },
         {
             "name": "ask_for_changes_whole_basis_edit",
-            "expect_type": "proposal",
+            # Quote scope answers only; edits use Re on a selected line.
+            "expect_type": "answer",
             "basis_chat": {
                 "question": "include all lighting and electrical lines",
                 "scope": "quote",
@@ -210,8 +222,8 @@ def configured_provider() -> str:
 
 
 def result_summary(result: dict[str, Any]) -> str:
-    if result.get("answer"):
-        text = str(result.get("answer"))
+    if result.get("answer") or result.get("question"):
+        text = str(result.get("answer") or result.get("question"))
     else:
         proposal = result.get("proposal") if isinstance(result.get("proposal"), dict) else {}
         text = str(proposal.get("message") or "")
@@ -248,7 +260,7 @@ def run_case(case: dict[str, Any]) -> dict[str, Any]:
         "name": case["name"],
         "status": "ok" if ok else "failed",
         "expected": case["expect_type"],
-        "actual": actual_type if actual_type in {"answer", "proposal"} else "unknown",
+        "actual": actual_type if actual_type in {"answer", "clarification", "proposal"} else "unknown",
         "source": source if isinstance(source, str) and source in {"openrouter"} else "unknown",
         "elapsed_ms": round((time.monotonic() - started) * 1000),
         "forbidden_output": forbidden_output,
