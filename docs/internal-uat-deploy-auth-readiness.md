@@ -149,7 +149,7 @@ Use this shape only for local/offline validation of the gated UAT boundary:
 - No real secrets in repository files.
 
 For quote workflow coverage that does not depend on deploy auth, keep using the
-local internal UAT checklist in `docs/internal-uat.md`.
+release UAT checklist in `docs/internal-uat.md`.
 
 For an already-prepared Coolify host, use the SQAG-specific adapter in
 `docs/internal-uat-coolify-deploy.md`. Generic Hostinger/VPS/Coolify setup,
