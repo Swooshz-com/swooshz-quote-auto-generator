@@ -3750,7 +3750,7 @@ function isolatedLoadedAppEnvironment(runRoot, overrides = {}) {
     SQAG_DISABLE_DOTENV: "true",
     SQAG_STORAGE_MODE: "local",
     SQAG_ARTIFACT_STORAGE_MODE: "local",
-    ...Object.fromEntries(["DRAFT", "DRAFT_HIGH_QUALITY", "BASIS_LINE", "BASIS_ANSWER", "PRICING_IMPORT", "PRICING_METADATA"].flatMap((suffix) => [
+    ...Object.fromEntries(["DRAFT", "DRAFT_HIGH_QUALITY", "BASIS_LINE", "PRICING_IMPORT", "PRICING_METADATA"].flatMap((suffix) => [
       [`OPENROUTER_${suffix}_MODEL`, `synthetic/${suffix.toLowerCase()}`],
       [`OPENROUTER_${suffix}_REASONING_EFFORT`, "high"],
       [`OPENROUTER_${suffix}_PROVIDER_ONLY`, '["synthetic-fixture"]'],

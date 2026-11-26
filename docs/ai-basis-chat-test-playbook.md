@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Use this playbook every time we change AI prompts, quote basis handling, `Re`, `Ask For Changes`, AI provider parsing, job polling, or quote-basis UI state.
+Use this playbook every time we change AI prompts, quote basis handling, `Re`, AI provider parsing, job polling, or quote-basis UI state.
 
 The goal is to prove that confused, vague, hostile, malformed, or over-specific user prompts cannot break the quotation basis workflow. The UI may reject a request or show a clean retry message, but it must not leak raw JSON errors, corrupt the basis, silently apply changes, or leave controls stuck.
 
@@ -10,19 +10,18 @@ The goal is to prove that confused, vague, hostile, malformed, or over-specific 
 
 This playbook covers:
 
-- `Re`: per-line basis revision.
-- `Ask For Changes`: quote-basis question flow. Quote-scope edit proposals are not supported; use `Re` on a selected line.
+- `Re`: per-line basis revision, including questions about the line. There is no quote-wide chat; `Re` needs a selected line.
 - AI response admission through the configured OpenRouter text routes.
 - Quote basis proposal preview, apply, discard, and retry behavior.
 - User-facing error handling when AI returns malformed or unusable JSON.
 
 ## Model Routing
 
-- Every selected-line `Re` message uses the explicit `BASIS_LINE` route with the strict `revise_line_v1` reply contract (see [the gateway contract](ai-gateway.md)): an answer, one clarification question, or one full selected-row proposal. There are no local shortcuts or word lists in the browser or the server. `Ask For Changes` without a selected line uses `BASIS_ANSWER` and answers only.
+- Every selected-line `Re` message uses the explicit `BASIS_LINE` route with the strict `revise_line_v1` reply contract (see [the gateway contract](ai-gateway.md)): an answer, one clarification question, or one full selected-row proposal. There are no local shortcuts or word lists in the browser or the server. It is the only `Re` route and model; a request without a selected line is refused before any AI call.
 - The server admits the message (at most 1,000 characters) and the selected row before any spend or AI call. A reply the app refuses shows a plain message with a reference, and the log names the rule.
-- Configure the complete six-operation catalogue and server-only credential in [the gateway contract](ai-gateway.md). There are no model defaults or credential-driven provider selection.
+- Configure the complete operation catalogue and server-only credential in [the gateway contract](ai-gateway.md). There are no model defaults or credential-driven provider selection.
 - Capture model, effort and downstream endpoint once. Unknown effort, incomplete settings or a request/configuration mismatch reject before transport.
-- A failed answer route never switches to the line route, full-draft model or another provider. Text retries are bounded transient retries on the same route; malformed, refused and partial responses are not replayed.
+- A failed `Re` call never switches to the full-draft model or another provider. Text retries are bounded transient retries on the same route; malformed, refused and partial responses are not replayed.
 - Preserve explicit Responses fixtures, business admission, privacy-safe diagnostics and one terminal telemetry record per actual send.
 
 This playbook does not cover:
@@ -39,7 +38,7 @@ This playbook does not cover:
 - Never accept raw JSON, Python tracebacks, provider error blobs, API keys, or internal prompt text in the browser UI.
 - Never silently mutate the quote basis. `Re` must show a proposal before applying an edit.
 - The AI decides the outcome from the message. A question should get an answer, an incomplete correction a clarification question, and an edit a full-row proposal; none of them changes the row before Apply.
-- Edit-style prompts without a selected `Re` line should answer with guidance to select a line, not produce a quote-scope proposal.
+- A request without a selected line is refused before any spend or AI call.
 
 ## Required Local Checks
 
@@ -93,7 +92,6 @@ Expected result:
 ### Wrong-shape responses
 
 - A `Re` reply outside `revise_line_v1`: extra or missing fields, no intent, two payloads, a price, id, confidence or `Custom` tag, a quantity that conflicts with the text, unchanged rows, or a number nobody stated.
-- `proposal` returned for quote-scope `Ask For Changes`.
 - Empty JSON object.
 - JSON array instead of object.
 - Object with `proposal` but no usable `quote_basis_sections`, `quote_basis`, or `replacement_line`.
@@ -130,7 +128,7 @@ Expected result:
 
 ## Chaos Prompt Corpus
 
-Run these against both `Re` and `Ask For Changes` in mocked tests where possible, then sample them in live AI smoke tests.
+Run these against `Re` in mocked tests where possible, then sample them in live AI smoke tests.
 
 ### Vague prompts
 
@@ -272,17 +270,11 @@ Use the manual steps below when investigating a failure or checking live AI beha
    - Apply changes only the selected line,
    - Discard leaves the basis unchanged,
    - failed AI output shows a clean message.
-7. Click `Ask For Changes`.
-8. Submit three prompts:
-   - one question prompt,
-   - one quote-scope edit prompt that should ask the operator to use `Re` on a selected line,
-   - one malformed or hostile prompt.
-9. Confirm:
-   - questions do not create proposals,
-   - quote-scope edit prompts do not create proposals,
-   - failed responses do not corrupt state,
-   - Apply and Discard remain usable after a failure.
-10. Refresh the browser and confirm the latest safe state is still usable.
+7. Submit a question about the line and an incomplete correction ("size not correct"):
+   - the question gets an answer and the correction gets one question back,
+   - neither creates a proposal; Apply stays off,
+   - failed responses do not corrupt state; Apply and Discard remain usable after a failure.
+8. Refresh the browser and confirm the latest safe state is still usable.
 
 ## Optional Live AI Smoke Test
 
@@ -296,8 +288,7 @@ Recommended budget:
 
 Suggested split:
 
-- 5 `Re` prompts.
-- 5 `Ask For Changes` prompts.
+- 10 `Re` prompts: edits, questions and incomplete corrections.
 - For risky changes, double the count and include provider fallback if configured.
 
 Current repo command:
@@ -313,7 +304,7 @@ python scripts\live_ai_basis_chat_smoke.py --include-injection
 To rerun one failed case:
 
 ```powershell
-python scripts\live_ai_basis_chat_smoke.py --include-injection --case ask_for_changes_prompt_injection
+python scripts\live_ai_basis_chat_smoke.py --include-injection --case re_prompt_injection
 ```
 
 Pass criteria:
@@ -350,7 +341,6 @@ Use this format in PR notes or handoff comments:
 AI basis chat stress result:
 - Local checks:
 - Mocked Re cases:
-- Mocked Ask For Changes cases:
 - Browser smoke:
 - Live AI smoke:
 - Failures found:

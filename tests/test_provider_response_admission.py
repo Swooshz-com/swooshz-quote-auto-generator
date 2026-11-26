@@ -410,7 +410,7 @@ class ProviderAdapterContractTest(unittest.TestCase):
     def test_all_gateway_callers_share_completion_admission_after_one_send(self):
         configs=existing.SYNTHETIC_DRAFT_CONFIG
         cases=(("draft","DRAFT"),("high_quality","DRAFT_HIGH_QUALITY"),("line","BASIS_LINE"),
-               ("answer","BASIS_ANSWER"),("import","PRICING_IMPORT"),("metadata","PRICING_METADATA"))
+               ("import","PRICING_IMPORT"),("metadata","PRICING_METADATA"))
         for route,suffix in cases:
             for mode in ("completed","incomplete","refusal"):
                 parsed={"items":[]} if route in {"import","metadata"} else draft()
@@ -462,7 +462,7 @@ class ProviderAdapterContractTest(unittest.TestCase):
     def test_gateway_support_callers_reach_transport_and_refuse_truncation(self):
         # Retains each former support-adapter success/truncation control on its maintained protocol.
         configs=existing.SYNTHETIC_DRAFT_CONFIG
-        for operation,suffix in (("basis_line","BASIS_LINE"),("basis_answer","BASIS_ANSWER"),("pricing_import","PRICING_IMPORT"),("pricing_metadata","PRICING_METADATA")):
+        for operation,suffix in (("basis_line","BASIS_LINE"),("pricing_import","PRICING_IMPORT"),("pricing_metadata","PRICING_METADATA")):
             for status in ("completed","incomplete"):
                 model=configs["OPENROUTER_"+suffix+"_MODEL"]
                 fixture = ({"currency": None, "items": []} if operation == "pricing_import"

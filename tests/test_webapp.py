@@ -13992,40 +13992,6 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 self.assertEqual(sections[0]["lines"][1], before[0]["lines"][1])
                 self.assertEqual(payload["quote_basis_sections"], before)
 
-    def test_basis_chat_quote_scope_edit_prompt_is_answer_only(self):
-        payload = valid_payload()
-        payload["basis_chat"] = {
-            "question": "change all BRASIL graphics to GAY graphics",
-            "scope": "quote",
-            "field": "",
-            "line_index": -1,
-            "line": "",
-        }
-
-        prompt = webapp.build_basis_chat_prompt(payload)
-
-        self.assertIn('{"intent":"answer","answer":""}', prompt)
-        self.assertIn("select a specific quote-basis line", prompt)
-        self.assertIn("Do not return proposal", prompt)
-        self.assertNotIn("\"quote_basis_sections\"", prompt)
-        self.assertNotIn("\"replacement_line\"", prompt)
-
-    def test_basis_chat_answer_prompt_uses_answer_only_schema(self):
-        payload = valid_payload()
-        payload["basis_chat"] = {
-            "question": "what should I check before confirming?",
-            "scope": "quote",
-            "field": "",
-            "line_index": -1,
-            "line": "",
-        }
-
-        prompt = webapp.build_basis_chat_prompt(payload)
-
-        self.assertIn('{"intent":"answer","answer":""}', prompt)
-        self.assertIn("Do not return proposal", prompt)
-        self.assertNotIn("\"quote_basis_sections\"", prompt)
-
     def test_basis_chat_result_replaces_selected_line_and_cleans_title(self):
         payload = valid_payload()
         payload["quote_basis_sections"] = [
@@ -14629,7 +14595,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         with self.assertRaises(webapp.OpenAIAnalysisError) as context:
             webapp.normalize_basis_chat_result(parsed, payload, "openai")
 
-        self.assertIn("selected quote-basis line", str(context.exception))
+        self.assertNotIn("{", str(context.exception))
 
     def _gateway_chat_payload(self, *, line=False, question="What does this mean?"):
         payload=valid_payload()
@@ -14645,27 +14611,32 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "category_order": 1, "item_order": 1, "source_row_index": None, "warning": None, "status": None,
         }]}
 
-    def test_gateway_answer_and_quote_edit_use_explicit_answer_route(self):
-        for question in ("What does this mean?", "Include all lighting and electrical lines"):
-            payload=self._gateway_chat_payload(question=question)
-            answer="Select a specific quote-basis line and use Re to edit it."
-            response=json_response(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_BASIS_ANSWER_MODEL"], {"intent":"answer", "answer":answer})
-            with self.subTest(question=question), mock.patch.object(webapp.urllib.request,"urlopen",return_value=response) as send:
-                result=webapp.request_configured_basis_chat(payload)
-            send.assert_called_once()
-            request=send.call_args.args[0]; body=json.loads(request.data)
-            self.assertEqual(request.full_url,OPENROUTER_RESPONSES_URL)
-            self.assertEqual(body["model"],SYNTHETIC_DRAFT_CONFIG["OPENROUTER_BASIS_ANSWER_MODEL"])
-            self.assertEqual(body["reasoning"],{"effort":"high"})
-            self.assertEqual(body["max_output_tokens"],1200)
-            self.assertEqual(result["type"],"answer"); self.assertEqual(result["answer"],answer)
+    def test_gateway_question_on_a_line_is_answered_by_the_one_line_route(self):
+        payload=self._gateway_chat_payload(line=True, question="What does this mean?")
+        answer="The platform raises the floor by 100mm."
+        response=json_response(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_BASIS_LINE_MODEL"], revise_line_reply("answer", answer=answer))
+        with mock.patch.object(webapp.urllib.request,"urlopen",return_value=response) as send:
+            result=webapp.request_configured_basis_chat(payload)
+        send.assert_called_once()
+        request=send.call_args.args[0]; body=json.loads(request.data)
+        self.assertEqual(request.full_url,OPENROUTER_RESPONSES_URL)
+        self.assertEqual(body["model"],SYNTHETIC_DRAFT_CONFIG["OPENROUTER_BASIS_LINE_MODEL"])
+        self.assertEqual(body["reasoning"],{"effort":SYNTHETIC_DRAFT_CONFIG["OPENROUTER_BASIS_LINE_REASONING_EFFORT"]})
+        self.assertEqual(body["max_output_tokens"],4000)
+        self.assertEqual(result["type"],"answer"); self.assertEqual(result["answer"],answer)
+        # The effort is read from the route setting only (owner: medium is tested later in agent UAT).
+        values=synthetic_configuration(credential="synthetic-key",overrides={"OPENROUTER_BASIS_LINE_REASONING_EFFORT":"medium"})
+        with mock.patch.object(webapp,"read_dotenv_value",side_effect=values.get), \
+                mock.patch.object(webapp.urllib.request,"urlopen",return_value=json_response(values["OPENROUTER_BASIS_LINE_MODEL"], revise_line_reply("answer", answer=answer))) as send:
+            webapp.request_configured_basis_chat(self._gateway_chat_payload(line=True, question="What does this mean?"))
+        self.assertEqual(json.loads(send.call_args.args[0].data)["reasoning"],{"effort":"medium"})
 
     def test_gateway_selected_line_preserves_proposal_and_json_prompt(self):
         payload=self._gateway_chat_payload(line=True,question="change 100mm to 150mm")
         parsed=revise_line_reply(text="150mm raised platform with needle punch carpet.", message="Change the platform height to 150mm?")
         response=json_response(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_BASIS_LINE_MODEL"],parsed)
         with mock.patch.object(webapp.urllib.request,"urlopen",return_value=response) as send:
-            result=webapp.answer_basis_chat(payload)
+            result=webapp.request_configured_basis_chat(payload)
         send.assert_called_once(); body=json.loads(send.call_args.args[0].data)
         self.assertEqual(body["model"],SYNTHETIC_DRAFT_CONFIG["OPENROUTER_BASIS_LINE_MODEL"])
         self.assertEqual(body["text"]["format"]["name"],"revise_line_v1")
@@ -14750,7 +14721,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         error=webapp.urllib.error.HTTPError(OPENROUTER_RESPONSES_URL,401,"PRIVATE_HTTP",{},io.BytesIO(b'{"error":{"message":"PRIVATE_BODY"}}'))
         for response in (FixtureHttpResponse(responses_envelope(model,"not valid json")),error):
             with self.subTest(kind=type(response).__name__),mock.patch.object(webapp.urllib.request,"urlopen",side_effect=[response]) as send,mock.patch.object(webapp,"write_local_log") as logs,mock.patch.object(webapp.time,"sleep") as sleep:
-                with self.assertRaises(webapp.OpenAIAnalysisError) as caught:webapp.answer_basis_chat(payload)
+                with self.assertRaises(webapp.OpenAIAnalysisError) as caught:webapp.request_configured_basis_chat(payload)
             send.assert_called_once();sleep.assert_not_called()
             body=json.loads(send.call_args.args[0].data)
             self.assertEqual(body["model"],model);self.assertEqual(body["reasoning"],{"effort":"high"})
@@ -14759,9 +14730,9 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             self.assertNotIn("PRIVATE",str(caught.exception)+json.dumps([call.args for call in logs.call_args_list],default=str))
 
     def test_gateway_basis_facade_validation_keeps_zero_send_and_model_privacy(self):
-        values=synthetic_configuration(credential="synthetic-key",overrides={"OPENROUTER_BASIS_ANSWER_MODEL":"PRIVATE_CANARY/model.invalid"})
+        values=synthetic_configuration(credential="synthetic-key",overrides={"OPENROUTER_BASIS_LINE_MODEL":"PRIVATE_CANARY/model.invalid"})
         with mock.patch.object(webapp,"read_dotenv_value",side_effect=values.get),mock.patch.object(webapp.urllib.request,"urlopen") as send,mock.patch.object(webapp,"write_local_log") as logs:
-            with self.assertRaises(webapp.OpenAIAnalysisError) as caught:webapp.answer_basis_chat(self._gateway_chat_payload())
+            with self.assertRaises(webapp.OpenAIAnalysisError) as caught:webapp.request_configured_basis_chat(self._gateway_chat_payload(line=True))
         send.assert_not_called()
         self.assertEqual(caught.exception.diagnostics["failure_boundary"],"request_validation")
         self.assertEqual(caught.exception.diagnostics["attempt_number"],0)
@@ -14777,7 +14748,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
     def test_basis_chat_without_provider_does_not_use_local_fallback(self):
         with mock.patch.object(webapp,"read_dotenv_value",side_effect=synthetic_configuration().get),mock.patch.object(webapp.urllib.request,"urlopen") as send:
-            with self.assertRaises(webapp.OpenAIAnalysisError):webapp.answer_basis_chat(self._gateway_chat_payload())
+            with self.assertRaises(webapp.OpenAIAnalysisError):webapp.request_configured_basis_chat(self._gateway_chat_payload(line=True))
         send.assert_not_called()
 
     def test_safe_error_messages_redacts_keys_headers_and_env_assignments(self):

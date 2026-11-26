@@ -387,7 +387,7 @@ class ImageObservationGatewayTest(unittest.TestCase):
             ("unread chunked tail", limit + 1, True, 0, "response_size"),
         )
         for operation, status, case in product(
-            ("draft", "draft_high_quality", "basis_line", "basis_answer"), (200, 400, 503), cases,
+            ("draft", "draft_high_quality", "basis_line"), (200, 400, 503), cases,
         ):
             label, size, chunked, missing, body_failure = case
             with self.subTest(operation=operation, status=status, case=label):
@@ -461,7 +461,7 @@ class ImageObservationGatewayTest(unittest.TestCase):
             ("complete trailer", b'0;fixture="done"\r\nX-Test: sample\r\n\r\n', b"", None),
         )
         for operation, status, case in product(
-            ("draft", "draft_high_quality", "basis_line", "basis_answer"), (200, 400, 503), cases,
+            ("draft", "draft_high_quality", "basis_line"), (200, 400, 503), cases,
         ):
             label, tail, headers, failure = case
             with self.subTest(operation=operation, status=status, case=label):
@@ -504,7 +504,7 @@ class ImageObservationGatewayTest(unittest.TestCase):
             b"Transfer-Encoding: gzip, chunked\r\n",
             b"Transfer-Encoding: identity\r\n",
         )
-        for operation, status, extra in product(("draft", "basis_answer"), (200, 503), headers):
+        for operation, status, extra in product(("draft", "basis_line"), (200, 503), headers):
             with self.subTest(operation=operation, status=status, extra=extra):
                 gateway, _, _, telemetry, spend = self.gateway(images="true")
                 route = gateway.configuration.route(operation)
@@ -539,7 +539,7 @@ class ImageObservationGatewayTest(unittest.TestCase):
         cases = (
             ("draft", True), ("draft_high_quality", True),
             ("draft", False), ("draft_high_quality", False),
-            ("basis_line", False), ("basis_answer", False),
+            ("basis_line", False),
         )
         for (operation, draft_batch), status in product(cases, (101, 103, 199, 204, 205, 304)):
             with self.subTest(operation=operation, draft_batch=draft_batch, status=status):
@@ -707,7 +707,7 @@ class ImageObservationGatewayTest(unittest.TestCase):
 
     def test_partial_bodies_never_retry_even_on_retry_eligible_routes(self):
         for operation, status, interruption in product(
-            ("basis_line", "basis_answer"), (200, 503),
+            ("basis_line",), (200, 503),
             ("fixed_length", None, ConnectionResetError, TimeoutError),
         ):
             with self.subTest(operation=operation, status=status, interruption=interruption):
@@ -742,7 +742,7 @@ class ImageObservationGatewayTest(unittest.TestCase):
 
     def test_basis_retries_pre_response_failures_and_complete_transient_http_errors(self):
         for operation, failure in product(
-            ("basis_line", "basis_answer"), (ConnectionResetError, TimeoutError, urllib.error.HTTPError),
+            ("basis_line",), (ConnectionResetError, TimeoutError, urllib.error.HTTPError),
         ):
             with self.subTest(operation=operation, failure=failure):
                 gateway, _, _, telemetry, spend = self.gateway()

@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import datetime as dt
 import io
 import json
@@ -1044,13 +1045,16 @@ class TelemetryProducerTest(unittest.TestCase):
         values=synthetic_configuration(credential="synthetic-key")
         auth_session={"auth_mode":server.INTERNAL_AUTH_MODE,"user":{"subject":"telemetry-test","account":"workspace-alpha","internal_role":"admin"}}
         failure=server.urllib.error.HTTPError("https://openrouter.ai/api/v1/responses",400,"private message",{},io.BytesIO(b'{}'))
+        sections=[{"id":"platform","title":"Platform","lines":[{"tag":"Confirm","text":"100mm raised platform"}]}]
+        chat={"quote_basis_sections":sections,"quote_basis":server.quote_basis_from_sections(sections),
+              "basis_chat":{"question":"What does this mean?","scope":"line","field":"platform","line_index":0,"line":"Confirm: 100mm raised platform"}}
         with mock.patch.object(server,"read_dotenv_value",side_effect=values.get), mock.patch.dict(os.environ,{"APP_MODE":"local"}), mock.patch.object(server.urllib.request,"urlopen",side_effect=failure) as send, mock.patch.object(server,"write_local_log") as logs, mock.patch.object(server,"forensic_store_for_auth_session",return_value=contextlib.nullcontext(self.store)), server.ai_log_tracking_scope({},auth_session=auth_session):
             with self.assertRaises(server.OpenAIAnalysisError) as first:
-                server.request_configured_basis_chat({"basis_chat":{"question":"What does this mean?","scope":"quote","line":""}})
+                server.request_configured_basis_chat(copy.deepcopy(chat))
             self.assertEqual(first.exception.diagnostics["attempt_number"],1)
-            values["OPENROUTER_BASIS_ANSWER_MODEL"]="PRIVATE_CANARY/model\ninvalid"
+            values["OPENROUTER_BASIS_LINE_MODEL"]="PRIVATE_CANARY/model\ninvalid"
             with self.assertRaises(server.OpenAIAnalysisError) as second:
-                server.request_configured_basis_chat({"basis_chat":{"question":"What does this mean?","scope":"quote","line":""}})
+                server.request_configured_basis_chat(copy.deepcopy(chat))
             self.assertEqual(second.exception.diagnostics["failure_boundary"],"request_validation")
             self.assertEqual(second.exception.diagnostics["attempt_number"],0)
         self.assertEqual(send.call_count,1)

@@ -460,7 +460,7 @@ class DraftBatchParallelismTest(unittest.TestCase):
             body = {"model": route.model, "input": [{"role": "user", "content": [{"type": "input_text", "text": "Synthetic request"}]}],
                     "reasoning": {"effort": route.effort}}
             gateway.request(operation, body)
-        self.assertEqual(len(transport.calls), 6)
+        self.assertEqual(len(transport.calls), len(ai_gateway.ROUTE_KEYS))
         self.assertTrue(all(body["reasoning"] == {"effort": "high"} for body in transport.calls))
 
     def test_synthesis_failure_retains_reason_usage_and_one_terminal_per_send(self):

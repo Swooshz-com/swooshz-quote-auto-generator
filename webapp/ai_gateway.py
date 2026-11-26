@@ -24,7 +24,7 @@ from webapp.pricing_response_contracts import PRICING_RESPONSE_CONTRACTS
 OPENROUTER_RESPONSES_URL = "https://openrouter.ai/api/v1/responses"
 ROUTE_KEYS = MappingProxyType({
     "draft": "DRAFT", "draft_high_quality": "DRAFT_HIGH_QUALITY",
-    "basis_line": "BASIS_LINE", "basis_answer": "BASIS_ANSWER",
+    "basis_line": "BASIS_LINE",
     "pricing_import": "PRICING_IMPORT", "pricing_metadata": "PRICING_METADATA",
 })
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -725,7 +725,7 @@ class AiGateway:
         credential=self._credential_reader()
         if not isinstance(credential,str) or not credential or len(credential)>4096 or any(c.isspace() or ord(c)<32 or ord(c)>126 for c in credential):
             raise GatewayError("credential_missing")
-        delays=(2.0,5.0) if operation in {"basis_line","basis_answer"} else ()
+        delays=(2.0,5.0) if operation == "basis_line" else ()
         spend = self._quote_spend
         if spend is not None and not spend.tracks(operation):
             spend = None

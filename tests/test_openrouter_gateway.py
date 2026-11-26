@@ -241,7 +241,7 @@ class OpenRouterGatewayTest(unittest.TestCase):
     def test_G10_full_one_send_text_bounded_retry_and_no_partial_replay(self):
         config=self.config()
         for operation in gateway.ROUTE_KEYS:
-            route=config.route(operation); allowed=3 if operation in {"basis_line","basis_answer"} else 1
+            route=config.route(operation); allowed=3 if operation=="basis_line" else 1
             transport=RecordingTransport([gateway.GatewayError("connection_failed",boundary="provider_transport",retryable=True) for _ in range(3)])
             sleep=mock.Mock(); subject=gateway.AiGateway(config,credential_reader=lambda:"synthetic",transport=transport,sleep=sleep)
             with self.assertRaises(gateway.GatewayError): subject.request(operation,envelope(route))
@@ -298,7 +298,7 @@ class OpenRouterGatewayTest(unittest.TestCase):
                         transport=gateway.BoundedHttpsTransport(opener=opener),sleep=delays.append,telemetry=lambda *args:records.append(args))
                     with self.subTest(operation=operation,status=status,payload=value),self.assertRaises(gateway.GatewayError):
                         subject.request(operation,envelope(route))
-                    expected=3 if operation in {"basis_line","basis_answer"} else 1
+                    expected=3 if operation=="basis_line" else 1
                     self.assertEqual(opener.open.call_count,expected)
                     self.assertEqual(delays,[2.0,5.0] if expected==3 else [])
                     self.assertEqual([row[1] for row in records],list(range(1,expected+1)))
@@ -451,25 +451,21 @@ class ReviseLineGatewayContractTest(unittest.TestCase):
         self.valid = {"intent": "proposal", "answer": None, "question": None, "proposal": {
             "message": "Change it?", "replacement_line": {"text": "Synthetic panel", "tag": None, "quantity": 30, "unit": None}}}
 
-    def test_line_request_sends_the_strict_schema_and_answer_route_sends_none(self):
-        for operation in ("basis_line", "basis_answer"):
-            with self.subTest(operation=operation):
-                route = self.config.route(operation)
-                text = json.dumps(self.valid) if operation == "basis_line" else '{"intent":"answer","answer":"ok"}'
-                transport = RecordingTransport([completed(route, text=text)])
-                subject = gateway.AiGateway(self.config, credential_reader=lambda: "synthetic", transport=transport)
-                subject.request(operation, envelope(route))
-                (body, _options), = transport.calls
-                if operation == "basis_line":
-                    self.assertEqual(body["text"], ai_response_contracts.REVISE_LINE.text_format())
-                    schema = body["text"]["format"]["schema"]
-                    self.assertEqual(set(schema["required"]), {"intent", "answer", "question", "proposal"})
-                    line = schema["properties"]["proposal"]["properties"]["replacement_line"]
-                    self.assertEqual(set(line["properties"]), {"text", "tag", "quantity", "unit"})
-                    self.assertEqual(line["properties"]["tag"]["enum"], ["Include", "Exclude", None])
-                    self.assertFalse(line["additionalProperties"])
-                else:
-                    self.assertNotIn("text", body)
+    def test_line_request_sends_the_strict_schema_and_there_is_no_second_re_route(self):
+        transport = RecordingTransport([completed(self.route, text=json.dumps(self.valid))])
+        subject = gateway.AiGateway(self.config, credential_reader=lambda: "synthetic", transport=transport)
+        subject.request("basis_line", envelope(self.route))
+        (body, _options), = transport.calls
+        self.assertEqual(body["text"], ai_response_contracts.REVISE_LINE.text_format())
+        schema = body["text"]["format"]["schema"]
+        self.assertEqual(set(schema["required"]), {"intent", "answer", "question", "proposal"})
+        line = schema["properties"]["proposal"]["properties"]["replacement_line"]
+        self.assertEqual(set(line["properties"]), {"text", "tag", "quantity", "unit"})
+        self.assertEqual(line["properties"]["tag"]["enum"], ["Include", "Exclude", None])
+        self.assertFalse(line["additionalProperties"])
+        # Owner (INT-SQAG-202611260011): one AI route and one model for Re.
+        self.assertNotIn("basis_answer", gateway.ROUTE_KEYS)
+        self.assertNotIn("OPENROUTER_BASIS_ANSWER_MODEL", synthetic_configuration())
         # A caller cannot supply or swap the contract itself.
         blocked = RecordingTransport([])
         subject = gateway.AiGateway(self.config, credential_reader=mock.Mock(), transport=blocked)
@@ -710,13 +706,13 @@ class LoopbackResponseTest(unittest.TestCase):
             ("interim complete", interim + b"\r\n" + status + header + b"\r\n", False, "http_error", 3),
             ("final complete", status + header + b"\r\n", False, "http_error", 3),
         )
-        for operation in ("basis_line", "basis_answer"):
+        for operation in ("basis_line",):
             for name, reply, hold_open, reason, sends in cases:
                 with self.subTest(operation=operation, name=name):
                     self.request(operation, reply, hold_open=hold_open, reason=reason, sends=sends)
 
     def test_only_valid_body_framing_exposes_cost_and_allows_retry(self):
-        for operation in ("draft", "draft_high_quality", "basis_line", "basis_answer"):
+        for operation in ("draft", "draft_high_quality", "basis_line"):
             basis = operation.startswith("basis_")
             status = b"503 Service Unavailable" if basis else b"200 OK"
             route = self.config.route(operation)
@@ -750,7 +746,7 @@ class LoopbackResponseTest(unittest.TestCase):
 
     def test_tls_close_alert_required_only_for_close_delimited_reply(self):
         observation = '{"observations":["Synthetic observation"]}'
-        for operation in ("draft", "draft_high_quality", "basis_line", "basis_answer"):
+        for operation in ("draft", "draft_high_quality", "basis_line"):
             route = self.config.route(operation)
             image = operation.startswith("draft")
             value = completed(route) if image else {"model": route.model, "error_type": "provider_unavailable"}
@@ -780,7 +776,7 @@ class LoopbackResponseTest(unittest.TestCase):
                                  hold_open=hold_open)
 
     def test_orderly_close_with_explicit_incomplete_status_never_retries(self):
-        for operation in ("basis_line", "basis_answer"):
+        for operation in ("basis_line",):
             route = self.config.route(operation)
             payload = json.dumps({"model": route.model, "status": "incomplete", "incomplete_details": None,
                                   "error_type": "provider_unavailable", "usage": {"cost": 0.125}}).encode()

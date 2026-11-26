@@ -95,7 +95,7 @@ def main() -> int:
             return webapp.normalize_basis_chat_result({'intent': 'proposal', 'answer': None, 'question': None, 'proposal': {
                 'message': 'Change this line?',
                 'replacement_line': {'tag': basis_chat_tag, 'text': line['text'], 'quantity': None, 'unit': None},
-            }}, payload, 'openrouter', auth_session=auth_session)
+            }}, payload, 'openrouter')
         webapp.request_configured_basis_chat = owner_mock_basis_chat
     # Or the driver writes each reply's replacement_line (text, tag, quantity, unit) to basis-chat-reply.json
     # beside the scenario before it sends; the server still admits it as a revise_line_v1 provider reply.
@@ -104,7 +104,7 @@ def main() -> int:
             reply = json.loads((scenario_path.parent / 'basis-chat-reply.json').read_text(encoding='utf-8'))
             return webapp.normalize_basis_chat_result({'intent': 'proposal', 'answer': None, 'question': None, 'proposal': {
                 'message': 'Change this line?', 'replacement_line': reply,
-            }}, payload, 'openrouter', auth_session=auth_session)
+            }}, payload, 'openrouter')
         webapp.request_configured_basis_chat = owner_mock_basis_chat_reply
     original_cookie_header = webapp.cookie_header_value
     webapp.cookie_header_value = lambda *args, **kwargs: original_cookie_header(
