@@ -542,6 +542,57 @@ test("seed, verify, reopen and live-readonly pass against a local database-stora
   return runAllProfiles(t, "database");
 });
 
+// A quote another staff member made opens view only for the walk's login (#209): Pass A reads and
+// downloads it, records it as view only and probes only a quote the login can edit. SQLite keeps the
+// quotes with their owners as live does, without a PostgreSQL service.
+test("Pass A records a quote of another login as view only and probes an editable one", { timeout: 600000 }, async () => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "sqag-rehearsal-view-only-"));
+  const dirs = Object.fromEntries(["data", "output", "tmp", "logs", "pricing", "results"].map((name) => [name, path.join(base, name)]));
+  await Promise.all(Object.values(dirs).map((dir) => fs.mkdir(dir, { recursive: true })));
+  const harness = await startHarness(dirs, "sqlite");
+  const front = await loggingProxy(harness.origin);
+  try {
+    const result = async (profile, extra, name, code = 0, login = {}) => {
+      const file = path.join(dirs.results, `${name}.json`);
+      const outcome = await run(["--profile", profile, "--base-url", front.origin, "--allow-loopback-http", "--result", file, ...extra], login);
+      const parsed = JSON.parse(await fs.readFile(file, "utf8"));
+      const failed = parsed.steps.filter((entry) => entry.status === "fail").map((entry) => `${entry.name}: ${entry.error}`);
+      assert.equal(outcome.code, code, `${name} exit ${outcome.code}: ${failed.join(" | ") || parsed.error || outcome.stderr}`);
+      return parsed;
+    };
+    const seedArgs = (name) => ["--ai-ok", "--ai-ledger", path.join(dirs.results, `${name}-ai-ledger.json`)];
+    const own = (await result("seed", seedArgs("admin"), "seed")).seed;
+    // The operator seeds quotes of their own on the same app: generated ones are open to the admin, view only.
+    const operator = { SQAG_REHEARSAL_LOGIN_EMAIL: "alpha-operator" + "@" + "example.test", SQAG_REHEARSAL_LOGIN_PASSWORD: "synthetic-browser-operator-password" };
+    const others = (await result("seed", seedArgs("operator"), "seed-operator", 0, operator)).seed;
+    const manifestFile = path.join(dirs.results, "live-cases.json");
+    const committed = JSON.parse(await fs.readFile(path.join(root, "deploy", "rehearsal", "live-cases.json"), "utf8"));
+    await fs.writeFile(manifestFile, JSON.stringify({
+      ...committed,
+      approval: { approved: true, approved_at: "2026-11-20", record: "0000000" },
+      newest_own_quotes: 0,
+      cases: [{ id: others.published_session_id, reasons: ["generated"] }, { id: own.published_session_id, reasons: ["generated"] }],
+    }));
+    front.log.length = 0;
+    await harnessSessionSecret(harness.origin, true);
+    const passA = await result("live-readonly", ["--manifest", manifestFile, "--download-files", "--click-budget"], "pass-a");
+    await harnessSessionSecret(harness.origin, false);
+    assert.deepEqual(front.log.filter((line) => !/^(GET|HEAD) /.test(line)), ["POST /login"], "Pass A sent a write to the server");
+    const step = (name) => passA.steps.find((entry) => entry.name === name);
+    const viewed = step("quote 1 reopens read-only").detail;
+    assert.deepEqual([viewed.id, viewed.view_only, viewed.basis_lock, viewed.files.xlsx.downloaded], [others.published_session_id, true, undefined, true]);
+    assert.equal(step("quote 2 reopens read-only").detail.view_only, undefined);
+    assert.deepEqual(step("click budget leaves view-only quotes")?.detail, { view_only: 1 });
+    const probed = passA.steps.filter((entry) => /^click budget on quote [0-9]+$/.test(entry.name));
+    assert.deepEqual(probed.map((entry) => [entry.status, entry.detail.id]), [["pass", own.published_session_id]]);
+    assert.ok(probed[0].detail.samples.length >= 4, JSON.stringify(probed[0].detail.samples));
+  } finally {
+    front.proxy.close();
+    await harness.stop();
+    await fs.rm(base, { recursive: true, force: true });
+  }
+});
+
 test("the pricing-reference save waits up to 120 s for AI enrichment", () => {
   // The d07c910 rehearsal's save took about 36 s; the old 30 s limit failed it.
   assert.equal(PRICING_SAVE_TIMEOUT_MS, 120000);

@@ -356,6 +356,8 @@ const state = {
   pricingMatches: [],
   pricingIssues: [],
   savedExclusions: null,
+  // A quote made by another staff member, open for reading (the server's view_only). Nothing on it is saved.
+  quoteViewOnly: false,
   activeJob: null,
   quoteCommercialTouched: {
     quoteCurrency: false,
@@ -4136,7 +4138,7 @@ function applyWorkspaceViewState(saved = {}, options = {}) {
   const quoteRestored = options.quoteRestored === true;
   state.activeAppView = saved.activeAppView === "quote" && quoteRestored ? "quote" : "dashboard";
   if (state.activeAppView === "quote" && SIDE_PANEL_SEQUENCE.includes(saved.activeSidePanel)) {
-    setSidePanel(checkpointGatedSidePanel(saved.activeSidePanel), { force: true });
+    setSidePanel(state.quoteViewOnly ? saved.activeSidePanel : checkpointGatedSidePanel(saved.activeSidePanel), { force: true });
   }
   const overlay = normalizeRestorableOverlay(saved.restorableOverlay);
   state.restorableOverlay = quoteRestored || overlay === "pricing_reference_settings" ? overlay : "";
@@ -4471,6 +4473,7 @@ function buildSessionSnapshot() {
     quoteSessionId: state.quoteSessionId,
     generationContext: currentGenerationContext(),
     quoteSessionDraftSaveStarted: state.quoteSessionDraftSaveStarted,
+    ...(state.quoteViewOnly ? { quoteViewOnly: true } : {}),
     customerStepCheckpoint: state.customerStepCheckpoint,
     quoteSessionRestoredSessionId: state.quoteSessionRestoredSessionId,
     quoteSessionRestoredDraftKey: state.quoteSessionRestoredDraftKey,
@@ -4731,7 +4734,7 @@ function restoredQuoteSessionSidePanel(saved = {}, options = {}) {
     : SIDE_PANEL_SEQUENCE.includes(saved.activeSidePanel)
     ? saved.activeSidePanel
     : furthestQuoteSessionSidePanel(saved);
-  return checkpointGatedSidePanel(panel);
+  return options.viewOnly === true ? panel : checkpointGatedSidePanel(panel);
 }
 
 function quoteCommercialStrictDataEqual(left, right, depth = 0) {
@@ -4975,6 +4978,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
     ? restoredState.generationContext : {};
   const savedRunMatchesSession = safeQuoteSessionId(savedGenerationContext.session_id || "") === targetSessionId;
   transitionGenerationContext(targetSessionId, savedRunMatchesSession ? savedGenerationContext.run_id : "");
+  state.quoteViewOnly = options.viewOnly === true || (isOwnedBrowserSnapshot && savedState.quoteViewOnly === true);
   state.quoteSessionDraftSaveStarted = Boolean(restoredState.quoteSessionDraftSaveStarted || options.sessionId);
   state.customerStepCheckpoint = isPlainObject(restoredState.customerStepCheckpoint)
     ? { ...restoredState.customerStepCheckpoint } : null;
@@ -5201,7 +5205,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   } else {
     clearAiFailureBanner();
   }
-  const restoredPanel = restoredQuoteSessionSidePanel(restoredState, options);
+  const restoredPanel = restoredQuoteSessionSidePanel(restoredState, { ...options, viewOnly: state.quoteViewOnly });
   setSidePanel(restoredPanel, { force: true });
   renderQuoteCommercialReviewState();
   if (!state.authenticationRecoveryRequested && !state.isSigningOut && !state.isRecoveryScopeTransitioning) try {
@@ -6190,6 +6194,7 @@ async function startNewQuote() {
 
 function resetCurrentQuoteDraftState() {
   if (commitActiveOutputEditor() === "blocked") return false;
+  state.quoteViewOnly = false;
   invalidateAuthorityProfileRequests();
   clearQuoteSessionDraftSaveTimer();
   transitionGenerationContext("", "");
@@ -9907,11 +9912,14 @@ function updateDownloadButton() {
   const freshFile = downloadFileIsFresh(state.downloadFile) ? state.downloadFile : null;
   const freshPdfFile = elements.sideViewPdfButton && pdfFileIsFresh(state.pdfFile) ? state.pdfFile : null;
   const validation = outputRowsValid();
-  const enabled = state.activeSidePanel === "output"
+  const ready = state.activeSidePanel === "output"
     && validation.valid
     && !quoteCommercialReviewRequired()
     && !state.isGenerating
     && !state.isPreparingOutput;
+  // Opened to read: only a file that is already there can be downloaded, nothing is generated.
+  const enabled = ready && (!state.quoteViewOnly || Boolean(freshFile));
+  const pdfEnabled = ready && (!state.quoteViewOnly || Boolean(freshPdfFile));
   if (elements.sideDownloadButton) {
     elements.sideDownloadButton.classList.toggle("is-disabled", !enabled);
     elements.sideDownloadButton.setAttribute("aria-disabled", String(!enabled));
@@ -9921,10 +9929,10 @@ function updateDownloadButton() {
     elements.sideDownloadButton.textContent = "Download Excel";
   }
   if (elements.sideViewPdfButton) {
-    elements.sideViewPdfButton.classList.toggle("is-disabled", !enabled);
-    elements.sideViewPdfButton.setAttribute("aria-disabled", String(!enabled));
-    elements.sideViewPdfButton.tabIndex = enabled ? 0 : -1;
-    elements.sideViewPdfButton.href = enabled && freshPdfFile?.url ? freshPdfFile.url : "#";
+    elements.sideViewPdfButton.classList.toggle("is-disabled", !pdfEnabled);
+    elements.sideViewPdfButton.setAttribute("aria-disabled", String(!pdfEnabled));
+    elements.sideViewPdfButton.tabIndex = pdfEnabled ? 0 : -1;
+    elements.sideViewPdfButton.href = pdfEnabled && freshPdfFile?.url ? freshPdfFile.url : "#";
     elements.sideViewPdfButton.textContent = "View PDF";
   }
 }
@@ -11677,7 +11685,7 @@ async function applyOutputReferencePricing(button) {
 }
 
 function openOutputCellEditor(cell, options = {}) {
-  if (appIsBusy()) return;
+  if (appIsBusy() || state.quoteViewOnly) return;
   if (!cell || cell.querySelector("[data-output-editor-field]")) return;
   let index = Number(cell.dataset.outputRow);
   if (!state.outputRows[index]) return;
@@ -15754,7 +15762,7 @@ function quoteDraftHasOutputState() {
 }
 
 function quoteSessionDraftStateCanSave() {
-  if (state.authenticationRecoveryRequested) return false;
+  if (state.authenticationRecoveryRequested || state.quoteViewOnly) return false;
   return Boolean(
     state.quoteSessionDraftSaveStarted
     && !state.isRecoveryScopeTransitioning,
@@ -15949,6 +15957,7 @@ function currentQuoteSessionPayload(options = {}) {
 }
 
 async function saveCurrentQuoteSession(options = {}) {
+  if (state.quoteViewOnly) return null;
   if (commitActiveOutputEditor({ commit: options.commitEditor !== false }) === "blocked") return null;
   if (options.saveFailure) options.saveFailure.failure = null;
   let requestedSessionId = safeQuoteSessionId(options.sessionId || state.quoteSessionId || "");
@@ -16327,7 +16336,8 @@ async function deleteQuoteSessionRecord(sessionId = "") {
 }
 
 async function discardCurrentQuoteDraftSession() {
-  if (commitActiveOutputEditor() === "blocked") return false;
+  // Discarding deletes the quote on the server: never one opened only to read.
+  if (state.quoteViewOnly || commitActiveOutputEditor() === "blocked") return false;
   await deleteQuoteSessionRecord(state.quoteSessionId);
   clearSessionState();
   resetCurrentQuoteDraftState();
@@ -16369,7 +16379,7 @@ async function returnToDashboard() {
   if (state.authenticationRecoveryRequested) return recoverRequiredAuthentication(401, { status: "auth_required" });
   if (commitActiveOutputEditor() === "blocked") return false;
   if (appIsBusy()) return;
-  if (state.pricingDraftVersion === false) {
+  if (state.pricingDraftVersion === false || state.quoteViewOnly) {
     clearQuoteSessionDraftSaveTimer();
     saveSessionState();
     showDashboard();
@@ -17081,6 +17091,7 @@ async function modifyDashboardQuote(sessionId, options = {}) {
       serverDraftVersion: hasServerDraft ? detailedSession.draft_version : "",
       serverPricingLedger: detailedSession.pricing_ledger,
       serverFiles: hasServerDraft ? draftFiles : null,
+      viewOnly: detailedSession.view_only === true,
     });
     if (!restored) {
       finishDashboardOperation();
@@ -18047,6 +18058,7 @@ function delay(ms) {
 }
 
 async function startJob(type, payload, options = {}) {
+  if (state.quoteViewOnly) return { ok: false, data: { status: "blocked", errors: [VIEW_ONLY_QUOTE_NOTE] } };
   // Synchronization may have awaited: admit again at the actual dispatch boundary.
   if (commitActiveOutputEditor({ commit: false }) === "blocked") {
     return { ok: false, data: { status: "blocked", errors: ["Resolve the pending output price or cancel it with Escape before continuing."] } };
@@ -18537,7 +18549,7 @@ function adoptGenerationOutputRows(data = {}, inputRows = state.lineItems, optio
 
 async function handleGenerate(options = {}) {
   if (commitActiveOutputEditor() === "blocked") return false;
-  if (state.isGenerating) return;
+  if (state.isGenerating || state.quoteViewOnly) return;
   if (quoteCommercialReviewRequired()) {
     showBlockedAction(QUOTE_COMMERCIAL_REVIEW_MESSAGE, { details: false });
     syncControlStates();
@@ -19178,6 +19190,12 @@ async function advanceCustomerStep() {
 
 function sidePanelBlockReason(panelName) {
   if (panelName === "images") return "";
+  if (state.quoteViewOnly) {
+    // Every step that has content opens for reading; the Customer step is only locked for who can edit it.
+    if (panelName === "basis" && !hasSubmittedQuoteBasis()) return "This quote has no Quote Basis yet.";
+    if (panelName === "output" && !quoteOutputProgressForNavigation()) return "This quote has no Output yet.";
+    return "";
+  }
   if (!hasReferenceFilesForNavigation()) return "Add reference files before opening this step.";
   if (["quote_company", "basis", "output"].includes(panelName)
     && !customerStepCheckpointIsCurrent()) {
@@ -19241,13 +19259,13 @@ function setSidePanel(panelName, options = {}) {
   }
   const [title, eyebrow, subtitle] = panelTitles[nextPanel] || panelTitles.images;
   state.activeSidePanel = nextPanel;
-  if (nextPanel === "customer" && previousPanel !== "customer") {
+  if (nextPanel === "customer" && previousPanel !== "customer" && !state.quoteViewOnly) {
     initializeFreshPricingReferenceForCustomer();
   }
   document.body.dataset.sidePanel = state.activeSidePanel;
   elements.sideDrawerTitle.textContent = title;
   elements.sideDrawerEyebrow.textContent = eyebrow;
-  elements.sideDrawerSubtitle.textContent = subtitle || "";
+  elements.sideDrawerSubtitle.textContent = state.quoteViewOnly ? VIEW_ONLY_QUOTE_NOTE : subtitle || "";
   document.querySelectorAll("button[data-side-panel]").forEach((button) => {
     button.classList.toggle("is-active", button.dataset.sidePanel === state.activeSidePanel);
   });
@@ -19320,10 +19338,10 @@ function updateSidePanelNav() {
       || state.lineItems?.length
       || state.outputRows?.length
       || state.originalOutputRows?.length
-    ) ? "Next: Quote Basis" : currentGenerator().analyzeLabel,
+    ) || state.quoteViewOnly ? "Next: Quote Basis" : currentGenerator().analyzeLabel,
     basis: "Confirm Quotation Basis",
   };
-  elements.sideNextButton.textContent = nextLabels[state.activeSidePanel] || "Next";
+  elements.sideNextButton.textContent = (!(state.quoteViewOnly && isBasisStep) && nextLabels[state.activeSidePanel]) || "Next";
   elements.sideNextButton.classList.add("primary-button");
   elements.sideNextButton.classList.remove("secondary-button");
   const nextPanel = SIDE_PANEL_SEQUENCE[Math.min(index + 1, lastIndex)];
@@ -19331,6 +19349,8 @@ function updateSidePanelNav() {
   let nextBlockReason = "";
   if (busy) {
     nextBlockReason = appBusyTitle();
+  } else if (state.quoteViewOnly) {
+    nextBlockReason = sidePanelBlockReason(nextPanel);
   } else if (isQuoteCompanyStep) {
     nextBlockReason = startAnalysisBlockReason();
   } else if (isBasisStep) {
@@ -19354,6 +19374,72 @@ function goToPreviousSidePanel() {
   if (index <= 0) return;
   setSidePanel(SIDE_PANEL_SEQUENCE[index - 1]);
 }
+
+const VIEW_ONLY_QUOTE_NOTE = "View only: this quote was made by another staff member. You can read every step and download its files, but not change it.";
+
+// Keeps the quote workspace readable and unchanged while state.quoteViewOnly is set: its controls are
+// disabled, and any click, typing, paste or drop outside the allowed ones stops here. It follows the
+// page's own redraws, so a control drawn or enabled later is disabled too, and gives every control its
+// earlier state back when an editable quote opens.
+class ViewOnlyQuoteGuard {
+  static ALLOWED = "button[data-side-panel], #sideBackButton, #sideNextButton, #sideDownloadButton, #sideViewPdfButton, summary, a[href]:not([href='#'])";
+  static CONTROLS = "button, input, select, textarea, [contenteditable='true']";
+  static EVENTS = ["click", "dblclick", "keydown", "beforeinput", "input", "change", "paste", "drop", "dragover", "submit"];
+  static EDIT_KEYS = new Set(["Enter", " ", "F2", "Delete", "Backspace"]);
+
+  // resync gives the app's own controls back their state once the guard lets them go.
+  constructor(root, isViewOnly, resync) {
+    this.root = root;
+    this.isViewOnly = isViewOnly;
+    this.resync = resync;
+    this.locked = new Map();
+  }
+
+  bind() {
+    ViewOnlyQuoteGuard.EVENTS.forEach((type) => this.root.addEventListener(type, (event) => this.stop(event), true));
+    new MutationObserver(() => this.sync()).observe(this.root, {
+      subtree: true, childList: true, attributes: true, attributeFilter: ["disabled", "contenteditable", "class"],
+    });
+    this.sync();
+  }
+
+  stop(event) {
+    if (!this.isViewOnly() || event.target.closest?.(ViewOnlyQuoteGuard.ALLOWED)) return;
+    if (event.type === "keydown" && !ViewOnlyQuoteGuard.EDIT_KEYS.has(event.key)) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }
+
+  sync() {
+    if (!this.isViewOnly()) {
+      if (!this.locked.size) return;
+      this.locked.forEach((restore) => restore());
+      this.locked.clear();
+      // A control the app disabled itself meanwhile (Reset Draft with nothing to reset) stays disabled.
+      this.resync();
+      return;
+    }
+    this.root.querySelectorAll(ViewOnlyQuoteGuard.CONTROLS).forEach((control) => {
+      if (!control.matches(ViewOnlyQuoteGuard.ALLOWED)) this.lock(control);
+    });
+  }
+
+  lock(control) {
+    if (control.isContentEditable) {
+      if (!this.locked.has(control)) this.locked.set(control, () => control.setAttribute("contenteditable", "true"));
+      control.setAttribute("contenteditable", "false");
+      return;
+    }
+    if (control.disabled) return;
+    if (!this.locked.has(control)) this.locked.set(control, () => { control.disabled = false; });
+    control.disabled = true;
+  }
+}
+
+const viewOnlyQuoteGuard = new ViewOnlyQuoteGuard(elements.quoteFlowPanel, () => state.quoteViewOnly, () => {
+  syncControlStates();
+  updatePresetButtons();
+});
 
 function showQuoteNotSavedModal(message) {
   showExcelGeneratingModal({ eyebrow: "Quote workspace", title: "Quote not saved", message });
@@ -19401,6 +19487,7 @@ async function goToNextSidePanel(options = {}) {
   if (appIsBusy() || state.customerStepCheckpointSaveBusy) return false;
   if (commitActiveOutputEditor() === "blocked") return false;
   const index = activeSidePanelIndex();
+  if (state.quoteViewOnly) return setSidePanel(SIDE_PANEL_SEQUENCE[Math.min(index + 1, SIDE_PANEL_SEQUENCE.length - 1)], { notify: true });
   if (elements.sideNextButton?.getAttribute("aria-disabled") === "true") {
     const reason = elements.sideNextButton.title || "This step is not ready yet.";
     elements.sideNextButton.title = "";
@@ -19534,6 +19621,7 @@ function handleBeforeUnload(event) {
 
 function wireEvents() {
   quoteTemplatesSettings.bind();
+  viewOnlyQuoteGuard.bind();
   if (elements.topbarLogoutLink) {
     elements.topbarLogoutLink.addEventListener("click", async (event) => {
       event.preventDefault();
@@ -19679,6 +19767,10 @@ function wireEvents() {
       return;
     }
     if (commitActiveOutputEditor() === "blocked") return;
+    if (state.quoteViewOnly) {
+      await downloadCurrentExcelFile();
+      return;
+    }
     showExcelGeneratingModal(generationLoadingModalOptions(false));
     await waitForUiPaint();
     try {

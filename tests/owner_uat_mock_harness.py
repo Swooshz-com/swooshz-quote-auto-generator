@@ -17,15 +17,21 @@ sys.path.insert(0, str(ROOT))
 from webapp import server as webapp
 
 
-from tests.internal_password_browser_harness import HarnessHandler, configure_auth_env
+from tests.internal_password_browser_harness import (
+    HarnessClock, HarnessHandler, configure_auth_env, configure_sqlite_storage, parse_storage,
+)
 
 
 def main() -> int:
+    # --storage sqlite keeps quotes with their owners in a database, as live does; the default is files.
+    storage, sys.argv[1:] = parse_storage(sys.argv[1:])
     configure_auth_env()
     os.environ.update({
         'SQAG_DISABLE_DOTENV':'1','QUOTE_DATA_ROOT':sys.argv[2],'QUOTE_OUTPUT_ROOT':sys.argv[3],
         'QUOTE_TMP_ROOT':sys.argv[4],'QUOTE_LOG_ROOT':sys.argv[5],
         'SQAG_LOCAL_PRICING_REFERENCES_ROOT':sys.argv[6],'OPENROUTER_API_KEY':'','DEEPSEEK_API_KEY':''})
+    if storage == 'sqlite':
+        configure_sqlite_storage()
     _alpha_default=webapp.default_runtime_workspace
     def _alpha_workspace():
         value=_alpha_default()
@@ -74,6 +80,9 @@ def main() -> int:
         webapp.configured_ai_gateway = lambda feature, *args, **kwargs: (
             None if feature == 'pricing_reference_import' else original_gateway(feature, *args, **kwargs))
         webapp.request_openai_pricing_catalog_import = lambda *_args, **_kwargs: webapp.PRICING_IMPORT.admit(pricing_import)
+    if storage == 'sqlite':
+        # Saving the seed reference would ask the AI for matching terms; the fixture rows already have them.
+        webapp.ai_pricing_reference_metadata_enrichment = lambda _filename, items, **_kwargs: (items, [])
     # And the Re chat: the reply keeps the selected line's words and gives it this tag.
     basis_chat_tag = json.loads(scenario_path.read_text(encoding='utf-8')).get('basis_chat_tag') if scenario_path.is_file() else None
     if basis_chat_tag:
@@ -89,7 +98,10 @@ def main() -> int:
         *args, **kwargs
     ).replace("; Secure", "")
 
+    clock = HarnessClock()
     server = webapp.ThreadingHTTPServer(("127.0.0.1", 0), HarnessHandler)
+    server.internal_auth = webapp.InternalAuthState(clock=clock)
+    server.harness_clock = clock
     host, port = server.server_address
     base_url = f"http://{host}:{port}"
     print(base_url, flush=True)

@@ -28,7 +28,9 @@ export class SyntheticQuoteRun {
     this.pageErrors = [];
   }
 
-  async start(scenario) {
+  // storage "sqlite" keeps quotes with their owners in a database, as live does.
+  async start(scenario, { storage = "file" } = {}) {
+    this.storage = storage;
     for (const key of Object.keys(process.env)) {
       if (/(API_KEY|TOKEN|SECRET|CREDENTIAL)/i.test(key)) process.env[key] = "";
     }
@@ -49,7 +51,7 @@ export class SyntheticQuoteRun {
 
   async startServer() {
     const { data, output, temp, logs, pricing, profiles } = this.dirs;
-    const child = spawn(python, [path.join(sourceRoot, "tests/owner_uat_mock_harness.py"), sourceRoot, data, output, temp, logs, pricing, profiles, this.scenarioPath], {
+    const child = spawn(python, [path.join(sourceRoot, "tests/owner_uat_mock_harness.py"), sourceRoot, data, output, temp, logs, pricing, profiles, this.scenarioPath, "--storage", this.storage], {
       cwd: sourceRoot, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env, SQAG_DISABLE_DOTENV: "1", PYTHONUNBUFFERED: "1" },
     });
@@ -67,6 +69,37 @@ export class SyntheticQuoteRun {
     this.server = { child, baseUrl, boundary: new SyntheticBrowserBoundary(baseUrl) };
   }
 
+  // A write as the signed-in user of this page, through the app's own API.
+  async api(page, method, route, data) {
+    const session = await (await page.request.get(this.server.baseUrl + "/api/session")).json();
+    const response = await page.request.fetch(this.server.baseUrl + route, {
+      method, data, headers: { [session.csrf_header]: session.csrf_token, Origin: this.server.baseUrl },
+    });
+    return { status: response.status(), body: await response.json().catch(() => ({})) };
+  }
+
+  // Database storage has no bundled packs: an admin saves the pricing reference and the company profile.
+  async seedDatabase() {
+    const page = await this.signedInPage();
+    const catalog = JSON.parse(await fs.readFile(path.join(this.dirs.pricing, fixtureId, "pricing-catalog.json"), "utf8"));
+    const reference = await this.api(page, "POST", "/api/settings/pricing-references", {
+      id: "synthetic-reference", label: "Synthetic Reference", tax: { label: "GST", rate: 0.09 }, currency: "SGD", items: catalog.items,
+    });
+    assert(reference.status === 200, "the pricing reference was not saved", reference);
+    const layout = await fs.readFile(path.join(this.dirs.profiles, profileId, "quotation-layout.xlsx"));
+    const profile = await this.api(page, "POST", "/api/settings/profiles", {
+      operation: "create", id: "synthetic-profile", label: "Synthetic Profile", defaults: {},
+      pack: { quotation_layout: { filename: "quotation-layout.xlsx", data_url: "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + layout.toString("base64") } },
+    });
+    assert(profile.status === 200, "the company profile was not saved", profile);
+    const shared = await this.api(page, "POST", "/api/settings/profiles", {
+      operation: "access", id: profile.body.profile.id, revision: profile.body.profile.revision, access: { version: 1, owner_user_id: null, visibility: "shared" },
+    });
+    assert(shared.status === 200, "the company profile was not shared", shared);
+    this.companyPreset = "company:" + profile.body.profile.id;
+    await page.context().close();
+  }
+
   // The app restarts on the same data, which also starts its per-minute request limits afresh.
   async restartServer() {
     const { child, boundary } = this.server;
@@ -77,11 +110,11 @@ export class SyntheticQuoteRun {
   }
 
   // A fresh browser, as on another computer.
-  async signedInPage() {
+  async signedInPage({ operator = false } = {}) {
     const context = await this.server.boundary.newContext(this.browser, { viewport: { width: 1280, height: 900 }, acceptDownloads: true });
     const page = await context.newPage();
     page.on("pageerror", (error) => this.pageErrors.push(error.message));
-    await signIn(page, this.server.baseUrl);
+    await signIn(page, this.server.baseUrl, ...(operator ? ["alpha-operator" + "@" + "example.test", "synthetic-browser-operator-password"] : []));
     return page;
   }
 
@@ -111,7 +144,8 @@ export class SyntheticQuoteRun {
     await page.locator("#quoteDate").fill(new Date().toISOString().slice(0, 10));
     await page.locator("#sideNextButton").click();
     await page.locator("#quoteCompanyPanel").waitFor({ state: "visible" });
-    const preset = await page.locator("#presetSelect option").evaluateAll((options, id) => options.map((option) => option.value).find((value) => value.startsWith("profile:" + id + ":")), profileId);
+    const preset = this.companyPreset
+      || await page.locator("#presetSelect option").evaluateAll((options, id) => options.map((option) => option.value).find((value) => value.startsWith("profile:" + id + ":")), profileId);
     await page.locator("#presetSelect").selectOption(preset);
     await page.locator("#loadPresetButton").click();
     await page.locator("#confirmProfileLoadButton").click();
