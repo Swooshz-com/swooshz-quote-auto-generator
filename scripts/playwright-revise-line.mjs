@@ -26,6 +26,8 @@ const LINES = [
   { id: "rv-panel", section: "Synthetic Graphics", text: "nos. synthetic printed system panel", quantity: 4, unit: "nos", keyword: "synthetic-graphics-synthetic-printed-system-panel" },
   { id: "rv-decal", section: "Synthetic Graphics", text: "nos. synthetic counter decal", quantity: 6, unit: "nos", keyword: "synthetic-graphics-synthetic-counter-decal" },
   { id: "rv-spot", section: "Synthetic Lighting And AV", text: "nos. synthetic spotlight 3 inch", quantity: 7, unit: "nos", keyword: "synthetic-lighting-and-av-synthetic-spotlight-3-inch" },
+  // The AI's own draft detail: it never prints by itself, also after Re changes only the size.
+  { id: "rv-deck", section: "Synthetic Floors", text: "[ sqm synthetic raised deck panel ] - Charcoal edge", quantity: 10, unit: "sqm", keyword: "synthetic-floors-synthetic-raised-deck-panel" },
 ];
 const TICKED_BACK = ["rv-panel", "rv-decal", "rv-spot"];
 const slug = (text) => text.toLowerCase().replace(/[^a-z0-9]+/g, "-");
@@ -101,7 +103,7 @@ const savedRows = async (sessionId) => {
   const { draft_state: draft } = await run.record(sessionId);
   return {
     lines: Object.fromEntries(draft.quoteBasisSections.flatMap((section) => section.lines).filter((line) => IDS.includes(line.id))
-      .map((line) => [line.id, { text: line.text, tag: line.tag, quantity: line.quantity, estimate: Boolean(line.quantity_estimate) }])),
+      .map((line) => [line.id, { text: line.text, tag: line.tag, quantity: line.quantity, estimate: Boolean(line.quantity_estimate), detail: line.quote_detail || "" }])),
     rows: Object.fromEntries(draft.lineItems.filter((row) => IDS.includes(row.source_basis_line_id))
       .map((row) => [row.source_basis_line_id, { description: row.description, variant: row.pricing_authority?.variant, price: row.pricing_authority?.price ?? null,
         currency: row.pricing_authority?.price_currency || "", amount: row.pricing_basis_amount ?? null, mark: Boolean(row.reincluded_catalog_selection) }])),
@@ -173,6 +175,10 @@ try {
   assert(!applied.lines["rv-wall"].estimate && applied.lines["rv-carpet"].estimate, "Est. is wrong after Apply", applied.lines);
   // The saved row already agrees with its line: the kept price times the new size.
   assert(applied.rows["rv-wall"].amount === 832.5, "the saved row's amount is not for the new size", applied.rows["rv-wall"]);
+  // A detail Re added to a catalogue line is saved on the line (quote_detail); another item or none has none.
+  result.details = Object.fromEntries(["rv-banner", "rv-vinyl", "rv-decal", "rv-carpet", "rv-deck", "rv-cover"].map((id) => [id, applied.lines[id].detail]));
+  assert(JSON.stringify(result.details) === JSON.stringify({ "rv-banner": "black colour", "rv-vinyl": "matt finish", "rv-decal": "black colour", "rv-carpet": "", "rv-deck": "", "rv-cover": "blue colour" }),
+    "the saved Re details are wrong", result.details);
   // A typed price stays in the currency it was typed in (a reference-currency price: the table below).
   assert(["rv-wall", "rv-vinyl", "rv-table"].every((id) => applied.rows[id].currency === "SGD"), "a typed price changed currency", applied.rows);
   // A line ticked back in and then revised is still saved as excluded with its tick until Confirm, on this
@@ -192,13 +198,21 @@ try {
   assert(JSON.stringify(result.tickedBack.reopened) === JSON.stringify(Object.fromEntries(TICKED_BACK.map((id) => [id, ["Include", true]]))),
     "the reopened quote lost a tick waiting for Confirm", result.tickedBack);
   assert(JSON.stringify(waiting(await savedRows(sessionId))) === JSON.stringify(wanted), "the reopen saved a waiting line as included");
+  const reopenedLines = (await savedRows(sessionId)).lines;
+  assert(reopenedLines["rv-banner"].detail === "black colour" && reopenedLines["rv-vinyl"].detail === "matt finish", "the reopen lost a Re detail", reopenedLines);
+  // Only the size of a line with the AI's own draft detail: still the name alone.
+  const deckText = (await basisLine(page, "rv-deck")).text;
+  cards.deck = await revise(page, "rv-deck", "quantity should be 12 sqm", { text: deckText, quantity: 12, unit: "sqm" });
+  assert(!cards.deck.includes(NOTICE), "the catalogue notice is wrong", cards.deck);
 
   await toOutput(page);
   const expected = {
     ...Object.fromEntries(SIBLINGS.map((id) => [id, before[id]])),
     "rv-wall": { ...before["rv-wall"], description: "Feature wall 4m W x 3m H with veneer finish", quantity: 15 },
-    "rv-vinyl": before["rv-vinyl"],
-    "rv-banner": before["rv-banner"],
+    // A Re detail on a catalogue line prints after the name; its price is the one it held.
+    "rv-vinyl": { ...before["rv-vinyl"], description: "sqm synthetic vinyl floor finish - matt finish" },
+    "rv-banner": { ...before["rv-banner"], description: "sqm synthetic hanging banner - black colour" },
+    "rv-deck": { ...before["rv-deck"], quantity: 12 },
     "rv-carpet": { ...before["rv-carpet"], description: "red rug", variant: "none", price: null },
     "rv-table": { ...before["rv-table"], description: "bar table" },
     "rv-counter": { ...before["rv-counter"], description: "Reception counter with marble top", deferred: false },
@@ -209,7 +223,7 @@ try {
     "rv-socket": { description: "nos. synthetic socket point", quantity: 5, unit: "nos", variant: "catalog", price: 12, mode: "Priced", deferred: false },
     // Ticked back in, revised, reopened: the same item gets its catalogue price back; another item asks again.
     "rv-panel": { description: "nos. synthetic printed system panel", quantity: 5, unit: "nos", variant: "catalog", price: 28.8, mode: "Priced", deferred: false },
-    "rv-decal": { description: "nos. synthetic counter decal", quantity: 6, unit: "nos", variant: "catalog", price: 8.75, mode: "Priced", deferred: false },
+    "rv-decal": { description: "nos. synthetic counter decal - black colour", quantity: 6, unit: "nos", variant: "catalog", price: 8.75, mode: "Priced", deferred: false },
     "rv-spot": { description: "wall washer", quantity: 7, unit: "nos", variant: "none", price: null, mode: "Priced", deferred: false },
   };
   const same = (where, actual, wanted) => {
@@ -263,7 +277,7 @@ try {
     const amount = row.mode === "Priced" ? String(Math.round(row.quantity * row.price * 100) / 100) : "Included";
     assert(found[0].some((cell) => (row.mode === "Priced" ? Number(cell) === Number(amount) : cell === amount)), "the workbook amount differs", { id, row: found[0], amount });
   }
-  for (const old of ["laminate", "sqm synthetic carpet tile", "round table", "timber top", "room door with lock", "reusable floor cover", "production venue"]) {
+  for (const old of ["Charcoal", "laminate", "sqm synthetic carpet tile", "round table", "timber top", "room door with lock", "reusable floor cover", "production venue"]) {
     assert(!cells.some((cell) => cell.some((value) => value.includes(old))), "the workbook still holds old wording", old);
   }
   const formulas = spawnSync(process.env.PYTHON || (process.platform === "win32" ? "python" : "python3"), ["-c",
@@ -369,6 +383,49 @@ try {
     if (table["server includedStale " + change]?.mode !== "Priced") wrong.push(["includedStale", change, "server mode", table["server includedStale " + change]]);
   }
   assert(!wrong.length, "the price rule differs from its table", wrong);
+
+  // The print rule on the page's own functions: every other way a row is built prints the same (a duplicated
+  // quote rebuilds its rows from the saved ones), a forged or stale detail prints the name only, and a chosen
+  // Possible match or Reset drops the detail. Last, as it changes the quote on screen.
+  result.printRule = await page.evaluate(() => {
+    const ids = ["rv-banner", "rv-vinyl", "rv-decal", "rv-deck", "rv-wall"];
+    const lineOf = (id) => state.quoteBasisSections.flatMap((section) => section.lines).find((line) => line.id === id);
+    const rebuilt = Object.fromEntries(state.lineItems.map(outputRowFromLineItem)
+      .filter((row) => ids.includes(row.source_basis_line_id)).map((row) => [row.source_basis_line_id, row.description]));
+    const banner = lineOf("rv-banner");
+    const forged = {
+      otherDetail: printedCatalogDescription({ ...banner, quote_detail: "white" }),
+      noField: printedCatalogDescription({ ...banner, quote_detail: undefined }),
+      ownLine: printedCatalogDescription({ ...lineOf("rv-wall"), quote_detail: "veneer finish" }),
+      tooLong: printedCatalogDescription({ ...banner, text: "[ sqm synthetic hanging banner ] - " + "x".repeat(201), quote_detail: "x".repeat(201) }),
+      letterCase: printedCatalogDescription({ ...banner, text: "[ sqm synthetic hanging banner ] - Black colour" }),
+    };
+    const at = (id) => {
+      for (const section of state.quoteBasisSections) {
+        const index = section.lines.findIndex((line) => line.id === id);
+        if (index >= 0) return [section.id, index];
+      }
+      return null;
+    };
+    const [sectionId, index] = at("rv-banner");
+    state.quoteBasisSections.find((section) => section.id === sectionId).lines[index].possible_pricing_matches = [
+      { pricing_keyword: "synthetic-graphics-synthetic-printed-wall-graphic", description: "sqm synthetic printed wall graphic", unit: "sqm" }];
+    applyPossiblePricingMatch(sectionId, index, 0);
+    const matched = lineOf("rv-banner");
+    const possibleMatch = { detail: matched.quote_detail || "", printed: printedCatalogDescription(matched) };
+    resetQuoteBasisToOriginal();
+    const reset = state.quoteBasisSections.flatMap((section) => section.lines).filter((line) => line.quote_detail).map((line) => line.id);
+    return { rebuilt, forged, possibleMatch, reset };
+  });
+  const rule = result.printRule;
+  const sorted = (record) => JSON.stringify(Object.entries(record).sort(([a], [b]) => a.localeCompare(b)));
+  assert(sorted(rule.rebuilt) === sorted({ "rv-wall": "Feature wall 4m W x 3m H with veneer finish", "rv-vinyl": "sqm synthetic vinyl floor finish - matt finish",
+    "rv-banner": "sqm synthetic hanging banner - black colour", "rv-decal": "nos. synthetic counter decal - black colour", "rv-deck": "sqm synthetic raised deck panel" }),
+  "rows rebuilt from the saved ones print differently", rule.rebuilt);
+  assert(Object.entries(rule.forged).every(([kind, text]) => text === (kind === "ownLine" ? "Feature wall 4m W x 3m H with veneer finish"
+    : kind === "letterCase" ? "sqm synthetic hanging banner - black colour" : "sqm synthetic hanging banner")), "a forged or stale detail printed", rule.forged);
+  assert(!rule.possibleMatch.detail && !rule.possibleMatch.printed.includes("black"), "a chosen match kept the old item's detail", rule.possibleMatch);
+  assert(!rule.reset.length, "Reset kept a Re detail", rule.reset);
 
   run.finish(result);
 } catch (error) {

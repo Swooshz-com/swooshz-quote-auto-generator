@@ -1162,6 +1162,42 @@ function outputCatalogDescription(value = {}) {
   return cleanCustomerQuoteLineText(value.text || value.description || "");
 }
 
+// A detail staff applied through Re to a catalogue line (#430): kept as the line's quote_detail and printed
+// after the name, as staff applied it, only while it is still the text after the dash (letter case aside).
+// The AI's own draft detail, own lines and older quotes (no field) print the name only, as before. Same rule
+// as the server's printed_basis_line_detail.
+const QUOTE_DETAIL_MAX_CHARS = 200;
+function basisLineQuoteDetail(value) {
+  const detail = typeof value === "string" ? cleanCustomerQuoteLineText(value) : "";
+  return detail.length <= QUOTE_DETAIL_MAX_CHARS ? detail : "";
+}
+
+function printedCatalogDetail(line = {}) {
+  if (!line?.pricing_keyword) return "";
+  const detail = basisLineQuoteDetail(line.quote_detail);
+  const written = bracketedCatalogReferenceParts(line.text || "")?.detail || "";
+  return detail && written.toLowerCase() === detail.toLowerCase() ? detail : "";
+}
+
+function printedCatalogDescription(line = {}) {
+  const name = outputCatalogDescription(line);
+  const detail = printedCatalogDetail(line);
+  return name && detail ? `${name} - ${detail}` : name;
+}
+
+// A quote row prints its line's detail while the row is still that line's catalogue item.
+function printedRowDescription(row = {}) {
+  const name = outputCatalogDescription(row);
+  const id = String(row.source_basis_line_id || "").trim();
+  if (!id || !name) return name;
+  const lines = (Array.isArray(state.quoteBasisSections) ? state.quoteBasisSections : [])
+    .flatMap((section) => section?.lines || [])
+    .filter((line) => line && [line.id, line.source_line_item_id].map((value) => String(value || "").trim()).includes(id));
+  if (lines.length !== 1 || String(lines[0].pricing_keyword || "") !== String(row.pricing_keyword || "")) return name;
+  const detail = printedCatalogDetail(lines[0]);
+  return detail ? `${name} - ${detail}` : name;
+}
+
 function leadingNumber(value = "") {
   const match = String(value ?? "").replaceAll(",", "").trim().match(/^-?\d+(?:\.\d+)?/);
   if (!match) return null;
@@ -7423,6 +7459,8 @@ function normalizeBasisLines(line = "") {
       if (quantityParts.unit) next.unit = quantityParts.unit;
       const estimate = normalizedQuantityEstimate(line.quantity_estimate);
       if (estimate && next.quantity !== undefined) next.quantity_estimate = estimate;
+      const quoteDetail = basisLineQuoteDetail(line.quote_detail);
+      if (quoteDetail) next.quote_detail = quoteDetail;
       if (line.booth_profile === true) next.booth_profile = true;
       if (confidence !== null) next.confidence = confidence;
       if (hasCustomPricing || normalizeBasisTag(parsed.tag) === "Custom") next.custom_pricing = true;
@@ -10481,7 +10519,7 @@ function inheritBasisOutputFieldsForEntry(row = {}, basisEntry = null) {
   }
   if (line.pricing_keyword) {
     next.pricing_keyword = line.pricing_keyword;
-    const description = outputCatalogDescription(line);
+    const description = printedCatalogDescription(line);
     if (description) next.description = description;
   }
   if (line.catalog_description && (line.pricing_keyword || !next.catalog_description)) {
@@ -10547,7 +10585,7 @@ function outputRowFromBasisEntry(basisEntry = null) {
   const customPricing = isCustomPricingBasisLine(line);
   const text = String(line.text || "").trim();
   if (!text) return null;
-  const description = customPricing ? text : outputCatalogDescription(line);
+  const description = customPricing ? text : printedCatalogDescription(line);
   return normalizeOutputRow({
     section: normalizeCategoryTitle(section.title || section.id || "Quote Basis"),
     description,
@@ -10622,7 +10660,7 @@ function includedBasisOutputRows(existingRows = []) {
 
 function outputRowFromLineItem(item = {}) {
   const normalized = normalizeLineItem(item);
-  const description = normalized.pricing_keyword ? outputCatalogDescription(normalized) : normalized.description;
+  const description = normalized.pricing_keyword ? printedRowDescription(normalized) : normalized.description;
   const lifecycle = String(state.quoteCommercialLifecycle || "");
   const snapshotLifecycle = String(state.quoteCommercialSnapshot?.lifecycle || "");
   const recoveredCommercial = ["EXISTING", "RECOVERED"].includes(lifecycle)
@@ -12411,6 +12449,8 @@ function applyBasisCatalogueQuantity(sectionId, lineIndex, itemId, value) {
     pricing_reference_description: item.description,
     catalog_unit_price: item.price,
   };
+  // Another catalogue item drops the detail applied to the old one.
+  if (String(currentLine.pricing_keyword || "") !== String(item.id)) delete nextLine.quote_detail;
   delete nextLine.custom_pricing;
   delete nextLine.custom_confirmed;
   delete nextLine.custom;
@@ -12431,7 +12471,7 @@ function applyBasisCatalogueQuantity(sectionId, lineIndex, itemId, value) {
   const nextRow = normalizeLineItem({
     ...previousRow,
     section: previousRow.section || section.title,
-    description: outputCatalogDescription(nextLine),
+    description: printedCatalogDescription(nextLine),
     quantity: text,
     unit: item.unit,
     price_mode: "Priced",
@@ -13105,6 +13145,8 @@ function applyPossiblePricingMatch(sectionId, lineIndex, matchIndex) {
   delete nextLine.pricing_status;
   delete nextLine.possible_pricing_matches;
   delete nextLine.possible_catalog_matches;
+  // A chosen match is a new catalogue item: a detail applied to the old one no longer prints.
+  delete nextLine.quote_detail;
   section.lines[lineNumber] = nextLine;
   state.quoteBasisSections = sections;
   state.quoteBasis = quoteBasisFromSections(sections);
@@ -14722,7 +14764,7 @@ function revisedQuoteRowForApply(row, before, line) {
     next.status = "custom";
     ["catalog_description", "pricing_reference_description", "catalog_unit_price"].forEach((key) => delete next[key]);
   }
-  if (reworded) next.description = isCustomPricingBasisLine(line) ? String(line.text || "").trim() : outputCatalogDescription(line);
+  if (reworded) next.description = isCustomPricingBasisLine(line) ? String(line.text || "").trim() : printedCatalogDescription(line);
   const unitChanged = canonicalPricingAuthorityUnit(next.unit) !== canonicalPricingAuthorityUnit(row.unit || "");
   // Only the tag changed: the row stays as it is and the tick decides its price.
   if (!reworded && !unitChanged && numberOrNull(next.quantity) === numberOrNull(row.quantity)) return row;

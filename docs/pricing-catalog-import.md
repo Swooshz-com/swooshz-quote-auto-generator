@@ -56,6 +56,8 @@ Import cleanup has two layers:
 
 After save, the pricing reference text is authoritative. Later quote-basis and output logic must use the saved customer-facing description word for word.
 
+A catalogue line prints that description alone, with one exception: a detail staff added through `Re` (kept on the line as `quote_detail`) prints after it as "description - detail" while it is still the line's text after the dash. The AI's own draft details never print by themselves.
+
 AI provider routing:
 
 - Import normalisation uses the explicit `PRICING_IMPORT` route; matching metadata before and after save uses `PRICING_METADATA`.

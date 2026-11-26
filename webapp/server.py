@@ -5998,6 +5998,41 @@ def normalized_quantity_estimate(value: Any) -> dict[str, Any] | None:
     return {"quantity": int(quantity) if quantity.is_integer() else quantity, "unit": unit[:40]}
 
 
+QUOTE_DETAIL_MAX_CHARS = 200
+
+
+def basis_line_quote_detail(value: Any) -> str:
+    """A detail staff applied through Re to a catalogue line (#430): cleaned, at most 200 characters, else none."""
+    detail = clean_customer_quote_line_text(value) if isinstance(value, str) else ""
+    return detail if len(detail) <= QUOTE_DETAIL_MAX_CHARS else ""
+
+
+def printed_basis_line_detail(line: dict[str, Any]) -> str:
+    """The detail printed after a catalogue line's name: only one staff applied through Re (`quote_detail`),
+    and only while it is still the text after the dash (letter case aside: the catalogue pass capitalises a
+    line's detail), so any other rewrite stops it printing. It prints as staff applied it. The AI's own
+    draft detail, own lines and older quotes (no field) print as before."""
+    if not isinstance(line, dict) or not clean_text(line.get("pricing_keyword")):
+        return ""
+    detail = basis_line_quote_detail(line.get("quote_detail"))
+    parts = bracketed_catalog_reference_parts(line.get("text"))
+    return detail if detail and parts and parts[1].lower() == detail.lower() else ""
+
+
+def printed_basis_line_details_by_row(payload: dict[str, Any]) -> dict[str, tuple[str, str]]:
+    """Row id -> (catalogue item, printed detail) for the quote's lines with a Re detail; one line per id only."""
+    found: dict[str, list[tuple[str, str]]] = {}
+    sections = payload.get("quote_basis_sections") if isinstance(payload, dict) else None
+    for section in sections if isinstance(sections, list) else []:
+        raw_lines = section.get("lines") if isinstance(section, dict) else None
+        for raw_line in raw_lines if isinstance(raw_lines, list) else []:
+            for line in normalize_basis_lines(raw_line) if isinstance(raw_line, dict) else []:
+                ids = {safe_resource_id(line.get(key), "") for key in ("id", "source_line_item_id")} - {""}
+                for line_id in ids:
+                    found.setdefault(line_id, []).append((clean_text(line.get("pricing_keyword")), printed_basis_line_detail(line)))
+    return {line_id: entries[0] for line_id, entries in found.items() if len(entries) == 1 and entries[0][1]}
+
+
 def normalize_basis_lines(value: Any) -> list[dict[str, Any]]:
     if isinstance(value, dict):
         value = canonicalize_primary_order_fields(value)
@@ -6036,6 +6071,9 @@ def normalize_basis_lines(value: Any) -> list[dict[str, Any]]:
                 line["quantity_estimate"] = estimate
             if value.get("booth_profile") is True:
                 line["booth_profile"] = True
+            quote_detail = basis_line_quote_detail(value.get("quote_detail"))
+            if quote_detail:
+                line["quote_detail"] = quote_detail
             pricing_keyword = clean_text(value.get("pricing_keyword"))
             if pricing_keyword:
                 line["pricing_keyword"] = pricing_keyword
@@ -21187,6 +21225,7 @@ def normalize_line_items(
         else {}
     )
     catalog_items = list(catalog_lookup.values())
+    printed_details = printed_basis_line_details_by_row(payload)
     items: list[dict[str, Any]] = []
     for raw in raw_items:
         if not isinstance(raw, dict):
@@ -21370,8 +21409,13 @@ def normalize_line_items(
             unit = quantity_parts["unit"] if quantity_parts.get("from_text_prefix") else raw_unit
         catalog_reference_description = clean_text(catalog_item.get("pricing_reference_description")) if catalog_item else ""
         catalog_description = clean_customer_quote_line_text(catalog_item.get("description")) if catalog_item else ""
+        printed = printed_details.get(safe_resource_id(raw.get("source_basis_line_id"), "")) if catalog_item else None
+        printed_name = clean_customer_quote_line_text(catalog_reference_description or catalog_description)
         description = (
-            display_description_from_catalog_reference(catalog_reference_description or catalog_description, raw_description or catalog_description)
+            # A Re detail on this row's line prints exactly as staff applied it (#430).
+            f"[ {printed_name} ] - {printed[1]}"
+            if printed and printed[0] == clean_text(catalog_item.get("id")) and raw_description == f"{printed_name} - {printed[1]}"
+            else display_description_from_catalog_reference(catalog_reference_description or catalog_description, raw_description or catalog_description)
             if catalog_item
             else raw_description
         )
@@ -23080,6 +23124,61 @@ def unbind_replacement_if_catalog_reference_changed(
         replacement.pop(key, None)
 
 
+def classify_replacement_catalog_detail(
+    payload: dict[str, Any],
+    current_line: dict[str, Any],
+    replacement: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> None:
+    """Re on a catalogue line that changes the text after the dash (#430): the same item keeps its catalogue
+    link and records the detail as `quote_detail` (printed after the name); a detail naming another item or a
+    conflicting material, colour or shape makes it a different item, worded in full and priced again. The
+    test is the catalogue check Confirm already applies, on both written forms ("[ name ] - detail" and the
+    printed "name - detail"). A changed name was already unbound by
+    unbind_replacement_if_catalog_reference_changed."""
+    keyword = clean_text(replacement.get("pricing_keyword"))
+    current_parts = bracketed_catalog_reference_parts(current_line.get("text"))
+    parts = bracketed_catalog_reference_parts(replacement.get("text"))
+    if keyword and not parts and current_parts:
+        # "name - detail" written without brackets: the same name keeps the catalogue's written form.
+        unbracketed = replacement_catalog_reference_parts_for_current(current_parts, replacement.get("text"))
+        if unbracketed and comparable_catalog_description_key(unbracketed[0]) == comparable_catalog_description_key(current_parts[0]):
+            parts = (current_parts[0], unbracketed[1])
+            replacement["text"] = f"[ {parts[0]} ] - {parts[1]}" if parts[1] else f"[ {parts[0]} ]"
+    if not keyword or not parts:
+        replacement.pop("quote_detail", None)
+        return
+    name, detail = parts
+    # The same detail (letter case aside) keeps what the line had: an AI draft detail still does not print.
+    if detail.lower() == (current_parts[1] if current_parts else "").lower():
+        return
+    if len(detail) > QUOTE_DETAIL_MAX_CHARS:
+        raise OpenAIAnalysisError("AI basis chat returned a detail that is too long.")
+    lookup = pricing_catalog_runtime_lookup_for_payload(payload, profile_id_from_payload(payload), auth_session=auth_session)
+    item = lookup.get(keyword)
+    written = (f"[ {name} ] - {detail}", f"{name} - {detail}") if detail else (f"[ {name} ]", name)
+    if item and not any(catalog_line_contradicts_item(text, item, catalog_items=list(lookup.values())) for text in written):
+        if detail:
+            replacement["quote_detail"] = detail
+        else:
+            replacement.pop("quote_detail", None)
+        return
+    replacement["text"] = unbracketed_catalog_reference_text(name, detail)
+    replacement["custom_pricing"] = True
+    if normalize_basis_tag(replacement.get("tag")) in {"Include", "Custom"}:
+        replacement["custom_confirmed"] = True
+    for key in (
+        "pricing_keyword",
+        "catalog_description",
+        "pricing_reference_description",
+        "catalog_unit_price",
+        "pricing_tag",
+        "pricing_status",
+        "quote_detail",
+    ):
+        replacement.pop(key, None)
+
+
 def validate_basis_chat_replacement_line(
     payload: dict[str, Any],
     current_line: dict[str, Any],
@@ -24490,7 +24589,9 @@ def line_items_aligned_to_quote_basis(
             or ((catalog_item or {}).get("description"))
         )
         if catalog_reference:
-            return clean_customer_quote_line_text(catalog_reference)
+            name = clean_customer_quote_line_text(catalog_reference)
+            detail = printed_basis_line_detail(line)
+            return f"{name} - {detail}" if name and detail else name
         bracketed = bracketed_catalog_reference_parts(line.get("text"))
         if bracketed:
             return clean_customer_quote_line_text(bracketed[1] or bracketed[0])
@@ -26210,6 +26311,7 @@ def replacement_line_sections(
     preserve_basis_chat_quantity(basis_chat, current_line, replacement)
     unbind_replacement_if_catalog_reference_changed(current_line, replacement)
     validate_basis_chat_replacement_line(payload, current_line, replacement)
+    classify_replacement_catalog_detail(payload, current_line, replacement, auth_session=auth_session)
 
     next_sections = copy.deepcopy(sections)
     next_sections[section_index]["lines"][line_index] = replacement
@@ -26872,6 +26974,12 @@ def normalize_ai_draft(
 ) -> dict[str, Any]:
     parsed = admit_provider_quote_draft(parsed, require_confidence=require_confidence)
     parsed = separate_booth_profile_lines(copy.deepcopy(parsed))
+    # Only staff set a printed detail, through Re (#430); the AI's own draft detail never prints by itself.
+    sections = parsed.get("quote_basis_sections") if isinstance(parsed, dict) else None
+    for section in sections if isinstance(sections, list) else []:
+        for line in section.get("lines") if isinstance(section, dict) and isinstance(section.get("lines"), list) else []:
+            if isinstance(line, dict):
+                line.pop("quote_detail", None)
     has_payload_context = payload is not None
     payload = copy.deepcopy(payload) if isinstance(payload, dict) else {}
     if has_payload_context and pricing_reference_snapshot_for_payload(payload) is None:

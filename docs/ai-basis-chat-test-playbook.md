@@ -37,6 +37,7 @@ This playbook does not cover:
 - Do not spend on live AI unless the local mocked suite passes.
 - Never accept raw JSON, Python tracebacks, provider error blobs, API keys, or internal prompt text in the browser UI.
 - Never silently mutate the quote basis. `Re` must show a proposal before applying an edit.
+- A detail `Re` adds to a catalogue line prints after the catalogue name only while the item stays the same (the server's catalogue check); a detail naming another item makes the line a different item, worded in full and priced again.
 - Question-style prompts should answer the user, not produce an edit proposal.
 - Edit-style prompts without a selected `Re` line should answer with guidance to select a line, not produce a quote-scope proposal.
 

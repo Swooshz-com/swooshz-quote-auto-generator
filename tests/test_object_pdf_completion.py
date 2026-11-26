@@ -265,5 +265,35 @@ class ObjectPdfCompletionTest(unittest.TestCase):
                 self.assertFalse(job_tmp.exists())
 
 
+class ReviseDetailPdfTest(unittest.TestCase):
+    """The PDF job makes its PDF from the workbook with the same rows: a Re detail on a catalogue line prints
+    there after the name (#430), the AI's own draft detail does not."""
+
+    def setUp(self):
+        from tests import test_revise_print_rule as rule
+        self.rule = rule.RevisePrintRuleWorkbookTest("test_excel_and_a_saved_template_print_the_detail")
+        self.rule.setUp()
+        self.addCleanup(self.rule.doCleanups)
+
+    def test_revise_detail_prints_in_the_pdf(self):
+        import pypdfium2 as pdfium
+
+        result, command = self.rule.generate_rows(None, pdf_mode="workbook")
+        self.assertEqual(command[command.index("--pdf-mode") + 1], "workbook")
+        pdf = Path(result["output_dir"]) / "quotation.pdf"
+        if not pdf.exists():
+            message = "No PDF exporter (LibreOffice or Excel) here; hosted CI must render the Re detail PDF."
+            if os.environ.get("CI", "").lower() in {"1", "true", "yes"}:
+                self.fail(message)
+            self.skipTest(message)
+        document = pdfium.PdfDocument(str(pdf))
+        try:
+            text = " ".join(" ".join((page.get_textpage().get_text_range() or "").split()) for page in document)
+        finally:
+            document.close()
+        self.assertIn("sqm synthetic hanging banner - black colour", text)
+        self.assertIn("sqm synthetic hanging banner - =1+2", text)
+        self.assertNotIn("Charcoal", text)
+
 if __name__ == "__main__":
     unittest.main()
