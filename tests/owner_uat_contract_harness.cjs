@@ -93,7 +93,7 @@ if (input.mode==='reopen') {
   const vm = require('node:vm');
   const code = ['validQuoteDraftVersion', 'validPricingLedgerReceipt', 'unchangedDraftLedgerMatches', 'pricingSelectionRefusalReason',
     'selectedCatalogueAuthorityMatches', 'pricingSelectionAcknowledgement', 'rememberPricingSelectionAcknowledgement',
-    'requireQuoteDraftReopen', 'currentReinclusionRows', 'normalizeBasisTag', 'refreshLineItemsFromServer', 'dropUnusableReinclusions', 'refusedReinclusions', 'withoutReincludedSelection',
+    'requireQuoteDraftReopen', 'currentReinclusionRows', 'normalizeBasisTag', 'refreshLineItemsFromServer', 'reinclusionRowsAtLineQuantity', 'dropUnusableReinclusions', 'refusedReinclusions', 'withoutReincludedSelection',
     'saveQuoteSessionDraftState', 'queueQuoteSessionDraftStateSave',
     'clearQuoteSessionDraftSaveTimer', 'resumeBlockedOutputDraftSave'].map(extract).join('\n');
   const turn = () => new Promise(resolve => setImmediate(resolve));

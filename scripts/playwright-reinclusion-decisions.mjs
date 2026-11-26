@@ -359,6 +359,85 @@ try {
   await confirmToOutput(page);
   const typed = (await outputRows(page)).carpet;
   if (typed?.variant !== "manual" || typed.price !== 5) broken.push("Confirm: the typed price is " + JSON.stringify(typed || null));
+  await page.context().close();
+  await run.restartServer();
+
+  // 5. The older Output out of step with the line. The tick marks the line's own row, and Confirm prices every
+  // line at its Quote Basis size, so a size changed on one side only still gets the old price back ("price").
+  // A row whose price staff took away in Output (deleted or retyped) keeps the tick, waits as excluded, and
+  // comes back at Confirm without a price for Output to ask for, as any line whose row was deleted ("asks").
+  const OUT_OF_STEP = [
+    { route: "size typed on Quote Basis, then X", id: "carpet", basis: "9", ends: "price" },
+    { route: "size typed in Output, then X", id: "deck", before: ["quantity", "3"], ends: "price" },
+    { route: "size typed in Output after the tick", id: "graphic", after: ["quantity", "3"], ends: "price" },
+    { route: "own row deleted in Output after the tick", id: "banner", after: ["delete"], ends: "asks" },
+    { route: "own row retyped in Output after the tick", id: "spotlight6", after: ["description", "retyped words"], ends: "asks" },
+  ];
+  const stepIds = OUT_OF_STEP.map((entry) => entry.id);
+  const stepEnds = Object.fromEntries(stepIds.map((id) => [id, "Include"]));
+  const lineQuantities = () => page.evaluate((wanted) => Object.fromEntries(state.quoteBasisSections.flatMap((section) => section.lines || [])
+    .filter((line) => wanted.includes(line.id)).map((line) => [line.id, Number(line.quantity)])), stepIds);
+  ({ page, sessionId } = await build());
+  for (const id of Object.keys(notHeld)) await run.tag(page, id, "Exclude");
+  await confirmToOutput(page);
+  for (const { id, before } of OUT_OF_STEP) if (before) await editRow(id, ...before);
+  await idle(page);
+  await run.openPanel(page, "basis");
+  for (const { id, basis } of OUT_OF_STEP) {
+    if (!basis) continue;
+    await (await run.basisControl(page, id, "[data-basis-quantity-edit]")).click();
+    const input = page.locator("#basisReviewSurface .basis-quantity-text input").first();
+    await input.fill(basis);
+    await input.press("Enter");
+    await page.waitForFunction(() => !appIsBusy(), null, { timeout: 20000 });
+  }
+  for (const id of stepIds) await run.tag(page, id, "Exclude");
+  await toDashboard(page);
+  await reopen(page, sessionId);
+  for (const id of stepIds) await run.tag(page, id, "Include");
+  await idle(page);
+  await expectSaved("out of step, ticked", sessionId, stepEnds);
+  // The waiting row is the draft's own: the size typed on Quote Basis, not the older Output's.
+  const sizes = await lineQuantities();
+  const savedSizes = Object.fromEntries((await run.record(sessionId)).draft_state.lineItems
+    .filter((row) => row.reincluded_catalog_selection && stepIds.includes(row.source_basis_line_id))
+    .map((row) => [row.source_basis_line_id, Number(row.quantity)]));
+  for (const { route, id, basis } of OUT_OF_STEP) {
+    if (basis && savedSizes[id] !== sizes[id]) broken.push(`${route}: the tick marked a row of ${savedSizes[id]}, not the line's ${sizes[id]}`);
+  }
+  await run.openPanel(page, "output");
+  for (const { id, after } of OUT_OF_STEP) {
+    if (!after) continue;
+    if (after[0] !== "delete") {
+      await editRow(id, ...after);
+      continue;
+    }
+    await idle(page);
+    await page.locator(`[data-output-delete-row="${await outputIndex(id)}"]`).click();
+    await page.locator("#confirmOutputDeleteButton").click();
+  }
+  await idle(page);
+  await expectSaved("out of step, after Output edits", sessionId, stepEnds);
+  await run.openPanel(page, "basis");
+  await reload(page);
+  expect("out of step, F5", await tagsOf(page), stepEnds);
+  // One Confirm: a refusal here means the old price was refused by name.
+  await run.confirm(page);
+  await page.waitForFunction(() => !appIsBusy() && !quoteSessionDraftSavePromise, null, { timeout: 60000 });
+  if (await page.evaluate(() => state.activeSidePanel) !== "output") {
+    broken.push("out of step, Confirm refused: " + (await page.locator("#aiFailureBanner").innerText()).replace(/\s+/g, " "));
+    await confirmToOutput(page);
+  }
+  const stepRows = await page.evaluate((wanted) => Object.fromEntries(state.outputRows.filter((row) => wanted.includes(row.source_basis_line_id))
+    .map((row) => [row.source_basis_line_id, { variant: row.pricing_authority?.variant || null, price: effectiveOutputUnitPrice(row), quantity: Number(row.quantity) }])), stepIds);
+  const confirmedSizes = await lineQuantities();
+  for (const { route, id, ends } of OUT_OF_STEP) {
+    const row = stepRows[id];
+    const kept = ends === "price"
+      ? row?.variant === "catalog" && row.price === priceList[id] && row.quantity === confirmedSizes[id]
+      : Boolean(row) && !["catalog", "manual", "included"].includes(row.variant) && row.price === null;
+    if (!kept) broken.push(`${route}: ${id} should end with ${ends === "price" ? `its old price ${priceList[id]} at ${confirmedSizes[id]}` : "no price"}, Output holds ${JSON.stringify(row || null)}`);
+  }
 
   if (broken.length) throw new Error(broken.length + " decisions were not kept:\n" + broken.join("\n"));
   run.finish({});
