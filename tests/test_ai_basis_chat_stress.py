@@ -24,7 +24,7 @@ RE_CHAOS_PROMPTS = [
     "change line to =HYPERLINK(\"http://bad.example\",\"click\")",
 ]
 
-ASK_FOR_CHANGES_CHAOS_PROMPTS = [
+NO_SELECTED_LINE_PROMPTS = [
     "what does this mean?",
     "include all lighting and electrical lines",
     "delete everything",
@@ -172,7 +172,7 @@ class AIBasisChatStressTest(unittest.TestCase):
 
     def test_requests_without_a_selected_line_never_reach_the_ai(self):
         # Owner (INT-SQAG-202611260011): Re is one route; there is no separate quote-wide question route.
-        for prompt in ASK_FOR_CHANGES_CHAOS_PROMPTS:
+        for prompt in NO_SELECTED_LINE_PROMPTS:
             with self.subTest(prompt=prompt):
                 payload = stress_payload()
                 payload["basis_chat"] = {"question": prompt, "scope": "quote", "field": "", "line_index": -1, "line": ""}
@@ -328,6 +328,10 @@ REVISE_ROUTE_CASES = [
      {"text": "Feature wall 5m W x 3m H with laminate finish", "quantity": 15}),
     ("shorthand with please", "wall", "5m wide please", proposal_reply("Feature wall 5m W x 3m H with laminate finish", quantity=15, unit="sqm"),
      {"text": "Feature wall 5m W x 3m H with laminate finish", "quantity": 15}),
+    # G2 F2: words such as "secret" or "token" are ordinary booth wording and go to the AI like any other message.
+    ("word the old browser list refused", "door", "add a secret door to the store room",
+     proposal_reply("White hinged door for the utility store, with a secret door to the store room"),
+     {"text": "White hinged door for the utility store, with a secret door to the store room", "quantity": 1}),
     ("with thanks", "wall", "change laminate to veneer thanks", proposal_reply("Feature wall 4m W x 3m H with veneer finish"),
      {"text": "Feature wall 4m W x 3m H with veneer finish", "quantity": 12}),
     ("with not", "wall", "veneer not laminate", proposal_reply("Feature wall 4m W x 3m H with veneer finish"),
@@ -490,6 +494,8 @@ class ReviseLineRouteTest(unittest.TestCase):
                 self.assertEqual(job, {"status": "blocked", "errors": [message]})
                 self.assertEqual((len(bodies), claims), (0, 0))
                 self.assertIn(("basis_chat_blocked", {"failure_boundary": "request_admission", "rule": rule}), logs)
+                # The log's own meaning names every rule it can carry (G2 L1).
+                self.assertIn(rule, webapp.log_meaning("basis_chat_blocked", {"rule": rule}, "test"))
         exactly_limit, bodies, claims, _logs = self.run_job(self.payload("wall", "a" * 1000), [revise_line_reply("answer")])
         self.assertEqual((exactly_limit["status"], len(bodies), claims), ("completed", 1, 1))
 

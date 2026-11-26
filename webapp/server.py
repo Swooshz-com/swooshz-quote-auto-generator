@@ -1611,7 +1611,7 @@ def log_meaning(event: str, details: dict[str, Any], context: str) -> str:
     elif event == "quote_template_preview_failed":
         meaning = "The quote template preview could not be made. Match the browser-visible error reference to this log entry; details.exit_code is the preview process exit code when it ran to the end."
     elif event == "basis_chat_blocked":
-        meaning = "A Re message was refused before any AI call or spend. details.rule names the rule: message_empty, message_too_long or selected_line_stale."
+        meaning = "A Re message was refused before any AI call or spend. details.rule names the rule: selected_line_missing, message_empty, message_too_long or selected_line_stale."
     elif event == "draft_blocked":
         meaning = "AI draft analysis was blocked before provider calls, usually because images or required quote details were missing."
     elif event in {

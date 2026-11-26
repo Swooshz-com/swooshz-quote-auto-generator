@@ -32293,10 +32293,11 @@ assert.strictEqual(state.basisChat.proposal, null);
                         "buildSelectedLineFragmentReplacementProposal", "simpleBasisEditFragment", "replaceReferenceDimensionToken",
                         "basisChatRequestedQuantityValue", "basisLineTextHasLiteralQuantityWord", "renderLiteralReplacementPreview",
                         "beginLocalBasisChatAuthority", "local_literal", "local_fragment", "No exact matches for",
-                        "Literal replacement: changed the selected basis line.", "Changed lines:", "Affected sections:"):
+                        "Literal replacement: changed the selected basis line.", "Changed lines:", "Affected sections:",
+                        # G2 F2: the local word list that answered "secret", "token" and the like without the AI.
+                        "isSensitiveChatRequest", "I cannot access or reveal"):
             self.assertNotIn(removed, js)
         submit = js.split("async function handleBasisChatSubmit(event) {", 1)[1].split("\nfunction applyBasisChatProposal", 1)[0]
-        self.assertIn("isSensitiveChatRequest(normalized)", submit)
         self.assertIn("const aiPromise = buildAiBasisChatResponse(text);", submit)
         self.assertEqual(len(re.findall(r"(?<!re)setBasisChatProposal\(", submit)), 1)
         # A clarification shows as the AI's question; Apply stays off because no proposal is set.
@@ -32626,17 +32627,10 @@ assert.strictEqual(state.basisChat.completionNotice, null);
         self.assertIn("margin: 0 0 12px;", css)
         self.assertIn(".quote-basis-title-row h3", css)
 
-    def test_static_chat_blocks_secret_and_internal_prompt_requests(self):
+    def test_static_page_names_no_server_secret(self):
         static_dir = ROOT / "webapp" / "static"
         js = (static_dir / "app.js").read_text(encoding="utf-8")
 
-        for expected in (
-            "isSensitiveChatRequest",
-            "api key",
-            "system prompt",
-            "I cannot access or reveal secrets",
-        ):
-            self.assertIn(expected, js)
         for forbidden_secret_name in (
             "OPENROUTER_API_KEY",
             "DEEPSEEK_API_KEY",

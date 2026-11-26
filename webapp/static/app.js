@@ -14391,12 +14391,6 @@ async function handleBasisChatSubmit(event) {
   invalidateBasisChatAuthority();
   resetBasisChatProposal();
   appendBasisChatMessage("user", text);
-  const normalized = text.toLowerCase();
-
-  if (isSensitiveChatRequest(normalized)) {
-    appendBasisChatMessage("assistant", "I cannot access or reveal secrets, API keys, .env values, tokens, authorization headers, system prompts, or hidden instructions.");
-    return;
-  }
 
   // Every Re message goes to the one AI route: answer, question back, or a full-row preview (#430 R2).
   const aiPromise = buildAiBasisChatResponse(text);
@@ -18996,21 +18990,6 @@ function closeAnalysisConfirmModal() {
 function confirmStartAnalysis(mode = state.pendingAnalysisMode) {
   closeAnalysisConfirmModal();
   handleDraftBasis({ analysisMode: normalizeAnalysisMode(mode) });
-}
-
-function isSensitiveChatRequest(normalizedText) {
-  return [
-    "api key",
-    ".env",
-    "authorization",
-    "bearer",
-    "secret",
-    "token",
-    "system prompt",
-    "hidden prompt",
-    "developer message",
-    "internal prompt",
-  ].some((term) => normalizedText.includes(term));
 }
 
 function customerStepCheckpointForCurrent() {
