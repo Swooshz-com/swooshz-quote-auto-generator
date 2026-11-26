@@ -31449,6 +31449,7 @@ eval([
   "retagBasisLine",
   "retagBasisSectionConfirmLines",
   "applyBasisTag",
+  "commitBasisTagPlan",
   "planBasisTagChanges",
 ].map(extractFunction).join("\n"));
 
@@ -32225,8 +32226,12 @@ eval([
   "canonicalBasisChatAuthorityOwner",
   "basisChatProposalAlias",
   "canonicalTargetOnlyBasisChatProposal",
+  "basisQuantityText",
+  "applyRevisedRow",
   "applyBasisChatProposal",
 ].map(extractFunction).join("\n"));
+function appendBasisChatMessage(role, text) { state.messages = [...(state.messages || []), text]; }
+const originalSections = JSON.parse(JSON.stringify(state.quoteBasisSections));
 
 state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
 const proposalOrigin = basisChatProposalOrigin();
@@ -32293,6 +32298,38 @@ assert.strictEqual(state.quoteBasisSections[1].section_order, 2);
 assert.deepStrictEqual(state.outputRows, []);
 assert.strictEqual(state.overlayClosed, true);
 assert.strictEqual(state.synced, true);
+// No quote row for the line: Apply adds none, and Output builds it from the line as before.
+assert.deepStrictEqual(state.lineItems, []);
+
+// Two quote rows for the selected line: Apply refuses as stale and changes nothing.
+state.quoteBasisSections = JSON.parse(JSON.stringify(originalSections));
+state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
+const twoRows = [
+  { source_basis_line_id: "engineer-endorsement", description: "Professional Engineer Endorsement for structure above 4m", quantity: 1, unit: "lot" },
+  { source_basis_line_id: "engineer-endorsement", description: "Endorsement site visit", quantity: 1, unit: "lot" },
+];
+state.lineItems = JSON.parse(JSON.stringify(twoRows));
+state.outputRows = [{ source_basis_line_id: "engineer-endorsement" }];
+state.basisConfirmed = true;
+state.overlayClosed = false;
+const twoRowOrigin = basisChatProposalOrigin();
+const twoRowLineage = canonicalBasisChatLineage({ ...lineage, lineageId: "lineage-two-rows", clientOperationId: "operation-two-rows" });
+const twoRowToken = mintBasisChatRuntimeAuthority("running", twoRowOrigin, twoRowLineage);
+state.basisChat.authorityOwner = canonicalBasisChatAuthorityOwner({ status: "running", origin: twoRowOrigin, lineage: twoRowLineage });
+state.basisChat.proposal = canonicalTargetOnlyBasisChatProposal({
+  message: "Update endorsement height.",
+  quoteBasis: quoteBasisFromSections(proposedSections),
+  quoteBasisSections: proposedSections,
+}, twoRowOrigin, twoRowLineage, twoRowToken);
+state.basisChat.authorityOwner = canonicalBasisChatAuthorityOwner({ status: "proposal", origin: twoRowOrigin, lineage: twoRowLineage });
+applyBasisChatProposal();
+assert.deepStrictEqual(state.messages, ["This proposal is stale. Please request the line change again."]);
+assert.deepStrictEqual(state.quoteBasisSections, originalSections);
+assert.deepStrictEqual(state.lineItems, twoRows);
+assert.deepStrictEqual(state.outputRows, [{ source_basis_line_id: "engineer-endorsement" }]);
+assert.strictEqual(state.basisConfirmed, true);
+assert.strictEqual(state.overlayClosed, false);
+assert.strictEqual(state.basisChat.proposal, null);
 """
         completed = subprocess.run(
             [node, "-e", script],

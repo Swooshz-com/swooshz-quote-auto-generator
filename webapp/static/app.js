@@ -13240,7 +13240,11 @@ function applyBasisTag(sectionId, nextTag, lineIndex = null, group = null) {
   if (appIsBusy()) return;
   // Read every row through one index, then release it before state changes and the re-render.
   const plan = withBasisPricingIndex(() => planBasisTagChanges(sectionId, nextTag, lineIndex, group));
-  if (!plan) return;
+  if (plan) commitBasisTagPlan(plan);
+}
+
+// The tick and X, and Re's Include or Exclude after Apply, all save a tag change through here.
+function commitBasisTagPlan(plan) {
   const { sections, deferralChanged, pricingChanges, changedLineIds } = plan;
   const outputsCleared = deferralChanged && Boolean(state.outputRows.length || state.originalOutputRows.length);
   if (pricingChanges.size) {
@@ -13939,8 +13943,16 @@ function proposalLineDelta(proposal) {
   const section = nextSections.find((item) => item.id === state.basisChat.sectionId);
   const nextLine = section?.lines?.[state.basisChat.lineIndex];
   const currentLine = selectedBasisLine() || parseBasisLine(state.basisChat.line);
-  if (!nextLine || !currentLine || nextLine.text === currentLine.text && nextLine.tag === currentLine.tag) return null;
+  if (!nextLine || !currentLine) return null;
+  const currentQuantity = basisQuantityDisplayLabel(currentLine);
+  const nextQuantity = basisQuantityDisplayLabel(nextLine);
+  if (nextLine.text === currentLine.text && nextLine.tag === currentLine.tag && nextQuantity === currentQuantity) return null;
+  const ids = new Set([currentLine.id, currentLine.source_line_item_id].filter(Boolean));
+  const linked = (state.lineItems || []).filter((row) => ids.has(row?.source_basis_line_id));
   return {
+    currentQuantity,
+    nextQuantity,
+    dropsCataloguePrice: revisedLineDropsCataloguePrice(currentLine, nextLine, linked.length === 1 ? linked[0] : null),
     currentTag: normalizeBasisTag(currentLine.tag),
     currentConfidence: normalizeConfidence(currentLine.confidence ?? currentLine.confidence_pct),
     currentPricingReferenceDescription: currentLine.pricing_reference_description || "",
@@ -13983,13 +13995,14 @@ function renderBasisChatProposalCard(proposal, changedFields = []) {
       <div class="basis-chat-compare">
         <div class="basis-chat-compare-card">
           <span>Current</span>
-          <p><strong>${escapeHtml(basisLinePillLabel({ tag: delta.currentTag, confidence: delta.currentConfidence, pricing_reference_description: delta.currentPricingReferenceDescription }))}</strong> ${escapeHtml(delta.currentText)}</p>
+          <p><strong>${escapeHtml(basisLinePillLabel({ tag: delta.currentTag, confidence: delta.currentConfidence, pricing_reference_description: delta.currentPricingReferenceDescription }))}</strong> ${escapeHtml([delta.currentQuantity, delta.currentText].filter(Boolean).join(" "))}</p>
         </div>
         <div class="basis-chat-compare-card is-proposed">
           <span>Proposed</span>
-          <p><strong>${escapeHtml(basisLinePillLabel({ tag: delta.nextTag, confidence: delta.nextConfidence, pricing_reference_description: delta.nextPricingReferenceDescription }))}</strong> ${escapeHtml(delta.nextText)}</p>
+          <p><strong>${escapeHtml(basisLinePillLabel({ tag: delta.nextTag, confidence: delta.nextConfidence, pricing_reference_description: delta.nextPricingReferenceDescription }))}</strong> ${escapeHtml([delta.nextQuantity, delta.nextText].filter(Boolean).join(" "))}</p>
         </div>
       </div>
+      ${delta.dropsCataloguePrice ? `<p class="basis-chat-proposal-summary">This is no longer the same catalogue item, so its catalogue price will not be kept.</p>` : ""}
     ` : `
       <p class="basis-chat-proposal-summary">This proposal updates the selected basis line and keeps existing line items available for review.</p>
     `}
@@ -14632,10 +14645,17 @@ function applyBasisChatProposal() {
     appendBasisChatMessage("assistant", "This proposal is stale. Please request the line change again.");
     return;
   }
+  const revised = applyRevisedRow(admitted);
+  if (!revised) {
+    invalidateBasisChatAuthority();
+    resetBasisChatProposal();
+    appendBasisChatMessage("assistant", "This proposal is stale. Please request the line change again.");
+    return;
+  }
   state.basisConfirmed = false;
-  state.quoteBasisSections = admitted.quoteBasisSections;
-  state.quoteBasis = admitted.quoteBasis;
-  state.lineItems = Array.isArray(state.lineItems) ? state.lineItems : [];
+  state.quoteBasisSections = revised.sections;
+  state.quoteBasis = quoteBasisFromSections(revised.sections);
+  state.lineItems = revised.lineItems;
   state.outputRows = [];
   state.originalOutputRows = [];
   state.outputErrors = [];
@@ -14649,6 +14669,91 @@ function applyBasisChatProposal() {
   resetBasisChatProposal();
   closeBasisChatOverlay();
   syncControlStates();
+  // Include or Exclude is the line's own tick or X, so the saved tag, mark and price are the tick's.
+  if (revised.nextTag) {
+    const plan = withBasisPricingIndex(() => planBasisTagChanges(revised.sectionId, revised.nextTag, revised.lineIndex));
+    if (plan) commitBasisTagPlan(plan);
+  }
+}
+
+// Apply changes the selected line and its one quote row together, so Confirm, the saved quote and
+// Excel read the new wording. More than one row is refused as stale; with none, Output builds the row
+// from the line as before. Every other line and row is left exactly as it was.
+function applyRevisedRow(admitted) {
+  const { sectionId, lineIndex } = admitted._origin.selector;
+  const before = admitted._origin.quoteBasisSections.find((section) => section.id === sectionId)?.lines?.[lineIndex];
+  const sections = cloneQuoteBasisSections(admitted.quoteBasisSections);
+  const proposed = sections.find((section) => section.id === sectionId)?.lines?.[lineIndex];
+  if (!before || !proposed) return null;
+  const ids = new Set([before.id, before.source_line_item_id].filter(Boolean));
+  const linked = (Array.isArray(state.lineItems) ? state.lineItems : []).filter((row) => ids.has(row?.source_basis_line_id));
+  if (linked.length > 1) return null;
+  const currentTag = normalizeBasisTag(before.tag);
+  const proposedTag = normalizeBasisTag(proposed.tag);
+  const tickTag = proposedTag !== currentTag && ["Include", "Custom", "Exclude"].includes(proposedTag) ? proposedTag : null;
+  // A changed size is the operator's own, so it is no longer an estimate.
+  const resized = basisQuantityText(proposed.quantity) !== basisQuantityText(before.quantity)
+    || normalizeUnit(proposed.unit || "") !== normalizeUnit(before.unit || "");
+  const { quantity_estimate, ...measured } = proposed;
+  const line = { ...(resized ? measured : proposed), ...(tickTag ? { tag: before.tag } : {}) };
+  sections.find((section) => section.id === sectionId).lines[lineIndex] = line;
+  const lineItems = linked.length
+    ? state.lineItems.map((row) => (row === linked[0] ? revisedQuoteRowForApply(row, before, line) : row))
+    : (Array.isArray(state.lineItems) ? state.lineItems : []);
+  return { sections, lineItems, sectionId, lineIndex, nextTag: tickTag };
+}
+
+// The row keeps only a price it already held, checked against the row before the change: a typed
+// price and Included stay, a catalogue price stays for the same item; a new unit, another item and a
+// price to be discussed (its receipt names the old line) ask again. Nothing comes from the proposal.
+function revisedQuoteRowForApply(row, before, line) {
+  const reference = currentPricingReference();
+  const held = normalizeOutputPricingAuthority(row.pricing_authority, row, { reference });
+  const { pricing_authority, deferred_pricing, unmatched_pricing_offer, ...rest } = row;
+  const next = {
+    ...rest,
+    quantity: basisQuantityText(line.quantity) !== "" ? line.quantity : row.quantity,
+    unit: normalizeUnit(line.unit || "") || row.unit,
+  };
+  const differentItem = Boolean(row.pricing_keyword) && String(line.pricing_keyword || "") !== String(row.pricing_keyword);
+  const reworded = line.text !== before.text || differentItem;
+  if (differentItem) {
+    next.pricing_keyword = "";
+    next.status = "custom";
+    ["catalog_description", "pricing_reference_description", "catalog_unit_price"].forEach((key) => delete next[key]);
+  }
+  if (reworded) next.description = isCustomPricingBasisLine(line) ? String(line.text || "").trim() : outputCatalogDescription(line);
+  const unitChanged = canonicalPricingAuthorityUnit(next.unit) !== canonicalPricingAuthorityUnit(row.unit || "");
+  // Only the tag changed: the row stays as it is and the tick decides its price.
+  if (!reworded && !unitChanged && numberOrNull(next.quantity) === numberOrNull(row.quantity)) return row;
+  let authority = null;
+  if (held?.variant === "included") {
+    authority = buildPricingAuthority("included", next, { reference });
+  } else if (held?.variant === "manual" && !unitChanged) {
+    authority = buildPricingAuthority("manual", next, { reference, price: held.price,
+      ...(Object.prototype.hasOwnProperty.call(held, "price_currency") ? { priceCurrency: held.price_currency } : {}) });
+  } else if (held?.variant === "catalog" && !unitChanged && !differentItem) {
+    authority = buildPricingAuthority("catalog", next, { reference, price: held.price,
+      catalogItem: pricingReferenceCatalogItem(reference, held.catalog_item_id) });
+  }
+  if (!authority) {
+    Object.assign(next, { price_mode: "Priced", display_price: "", unit_price_override: "", catalog_unit_price: "" });
+    ["effective_unit_price", "pricing_basis_amount", "approved_quote_amount"].forEach((key) => delete next[key]);
+  }
+  // Like every row, normalised: the kept price sets the amount for the new size (a mismatch keeps no price).
+  // A line ticked back in keeps its mark, as a typed size does: the draft still saves it as excluded, and
+  // Confirm restores the price only while the mark matches the line (dropUnusableReinclusions, the server).
+  return {
+    ...normalizeLineItem({ ...next, pricing_authority: authority || buildPricingAuthority("none", next) }),
+    ...(!unitChanged && row.reincluded_catalog_selection ? { reincluded_catalog_selection: row.reincluded_catalog_selection } : {}),
+  };
+}
+
+// A catalogue line Re turns into another item loses its catalogue price (a typed price and Included stay).
+function revisedLineDropsCataloguePrice(before, after, row = null) {
+  if (!before?.pricing_keyword || String(after?.pricing_keyword || "") === String(before.pricing_keyword)) return false;
+  const held = row ? normalizeOutputPricingAuthority(row.pricing_authority, row) : null;
+  return !["manual", "included"].includes(held?.variant);
 }
 
 function keepCurrentBasis() {
