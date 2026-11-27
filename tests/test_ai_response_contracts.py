@@ -110,7 +110,7 @@ class ContractDefinitionTest(unittest.TestCase):
         root = fmt['schema']
         self.assertEqual(set(root['required']), {'project', 'quote_basis_sections', 'line_items', 'analysis_findings'})
         line = root['properties']['quote_basis_sections']['items']['properties']['lines']['items']
-        self.assertEqual(set(line['required']), {'id', 'tag', 'text', 'confidence_pct', 'quantity', 'unit', 'quantity_estimated', 'booth_profile', 'pricing_keyword'})
+        self.assertEqual(set(line['required']), {'id', 'tag', 'text', 'confidence_pct', 'quantity', 'unit', 'quantity_estimated', 'booth_profile', 'pricing_keyword', 'model_part_ids'})
         self.assertEqual(line['properties']['quantity_estimated']['type'], ['boolean', 'null'])
         self.assertEqual(line['properties']['confidence_pct']['type'], 'integer')
         self.assertEqual(line['properties']['quantity']['type'], ['number', 'null'])
