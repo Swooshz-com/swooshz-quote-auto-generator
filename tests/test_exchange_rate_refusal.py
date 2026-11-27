@@ -12,7 +12,7 @@ from tests import test_webapp as fixtures
 
 webapp = fixtures.webapp
 INVALID_RATES = (0, -1, "abc", "", None)
-REFUSED = {"status": "blocked", "errors": ["Enter an exchange rate above 0 on the Customer step."]}
+REFUSED = {"status": "blocked", "errors": ["Enter an exchange rate above 0 on the Customer step."], "reason_code": "exchange_rate_invalid"}
 
 
 def request(runner, method: str, path: str, body: dict | None = None, headers: dict | None = None):

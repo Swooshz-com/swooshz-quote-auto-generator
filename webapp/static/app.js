@@ -551,7 +551,9 @@ const elements = {
   outputSourceLabel: qs("#outputSourceLabel"),
   outputTotalLines: qs("#outputTotalLines"),
   outputQuoteExchangeRate: qs("#outputQuoteExchangeRate"),
-  messageList: qs("#messageList"),
+  stepMessagePopup: qs("#stepMessagePopup"),
+  stepMessagePopupMessages: qs("#stepMessagePopupMessages"),
+  stepMessagePopupClose: qs("#stepMessagePopupClose"),
   matchSummary: qs("#matchSummary"),
   pricingMatchesBody: qs("#pricingMatchesBody"),
   pricingTableWrap: qs("#pricingTableWrap"),
@@ -1623,6 +1625,8 @@ function startAnalysisElapsedTimer(startedAt = activeJobStartedAt()) {
 }
 
 const GENERIC_FAILURE_MESSAGE = "Failed. Please try again. Contact support if this keeps happening.";
+// An analysis that found nothing quotable in the uploads (owner, #250): AGENTS.md's request for booth renders.
+const NO_QUOTE_BASIS_MESSAGE = "Please upload the booth render images first so I can analyze the design and prepare the quote. This analysis was still charged.";
 // Fixed Re texts the server may send; any other server text is never shown (#430 R2).
 const BASIS_CHAT_REPLY_UNUSABLE_CODE = "basis_chat_reply_unusable";
 const BASIS_CHAT_REPLY_UNUSABLE_MESSAGE = "The AI reply could not be used, so the line was not changed. Please say the change another way.";
@@ -1690,6 +1694,10 @@ function aiAnalysisInvalidReferenceMessage(data = {}) {
 
 // A failed analysis that hit a reference limit (such as PDF pages) says which limit; else the generic failure.
 function analysisJobFailureMessage(data = {}) {
+  if (data && typeof data === "object" && data.reason_code === "no_quote_basis") {
+    const reference = errorReferenceFrom(data);
+    return reference ? `${NO_QUOTE_BASIS_MESSAGE} Reference: ${reference}.` : NO_QUOTE_BASIS_MESSAGE;
+  }
   const limitMessage = data && typeof data === "object" && typeof data.limit_message === "string" ? data.limit_message.trim() : "";
   if (!limitMessage) return genericFailureMessage(data);
   const reference = errorReferenceFrom(data);
@@ -1729,9 +1737,11 @@ function showAiRunningBanner(message = ANALYSIS_WAIT_ESTIMATE, startedAt = activ
   startAnalysisElapsedTimer(startedAt);
 }
 
+// A failed analysis is an error in the step message popup, not a banner in the page (owner, #250).
 function showAiFailureBanner(message = GENERIC_FAILURE_MESSAGE) {
   const detail = String(message || "").replace(/^AI analysis failed\.?\s*/i, "").trim() || GENERIC_FAILURE_MESSAGE;
-  setAiStatusBanner("failure", "AI analysis failed.", detail);
+  clearAiFailureBanner();
+  renderMessages([detail.startsWith(NO_QUOTE_BASIS_MESSAGE) ? detail : `AI analysis failed. ${detail}`], "error");
 }
 
 function showAiBlockedBanner(message = "Complete the required details, then retry analysis.", title = "AI analysis blocked.") {
@@ -9880,13 +9890,76 @@ function setResultStatus(label, tone = "") {
   if (tone) elements.resultStatus.classList.add(tone);
 }
 
+// Step messages show in the shared bottom-right popup (owner, #250): an error stays until its X is pressed, anything
+// else fades by itself. An empty list clears a message that is not an error.
 function renderMessages(messages = [], tone = "") {
   // The page is already leaving for sign-in; a failure here would only flash.
   if (tone === "error" && authenticationRecoveryNavigating()) return;
-  elements.messageList.innerHTML = messages
-    .map((message) => `<div class="message ${tone}">${escapeHtml(message)}</div>`)
-    .join("");
+  stepMessagePopup.show(messages, tone);
 }
+
+class StepMessagePopup {
+  static FADE_AFTER_MS = 6000;
+  static FADE_OUT_MS = 300;
+
+  constructor({ popup, list, closeButton }) {
+    this.popup = popup;
+    this.list = list;
+    this.closeButton = closeButton;
+    this.tone = "";
+    this.timers = [];
+  }
+
+  bind() {
+    this.closeButton?.addEventListener("click", () => this.close());
+  }
+
+  show(messages = [], tone = "") {
+    const texts = (Array.isArray(messages) ? messages : [messages]).map((message) => String(message || "").trim()).filter(Boolean);
+    const error = tone === "error";
+    if (!texts.length) {
+      if (this.tone !== "error") this.close();
+      return;
+    }
+    // A newer warning never hides an error staff have not closed.
+    if (this.tone === "error" && !error) return;
+    if (!this.popup || !this.list) return;
+    this.clearTimers();
+    this.tone = error ? "error" : "warn";
+    this.list.innerHTML = texts.map((text) => `<p>${escapeHtml(text)}</p>`).join("");
+    this.popup.classList.toggle("is-error", error);
+    this.popup.classList.remove("is-fading");
+    this.popup.setAttribute("role", error ? "alert" : "status");
+    this.popup.setAttribute("aria-live", error ? "assertive" : "polite");
+    this.popup.hidden = false;
+    if (!error) {
+      this.timers.push(window.setTimeout(() => {
+        this.popup.classList.add("is-fading");
+        this.timers.push(window.setTimeout(() => this.close(), StepMessagePopup.FADE_OUT_MS));
+      }, StepMessagePopup.FADE_AFTER_MS));
+    }
+  }
+
+  close() {
+    this.clearTimers();
+    this.tone = "";
+    if (!this.popup) return;
+    this.popup.hidden = true;
+    this.popup.classList.remove("is-error", "is-fading");
+    if (this.list) this.list.innerHTML = "";
+  }
+
+  clearTimers() {
+    this.timers.forEach((timer) => window.clearTimeout(timer));
+    this.timers = [];
+  }
+}
+
+const stepMessagePopup = new StepMessagePopup({
+  popup: elements.stepMessagePopup,
+  list: elements.stepMessagePopupMessages,
+  closeButton: elements.stepMessagePopupClose,
+});
 
 function postCommitProjectionWarningFrom(data = {}) {
   const warning = data?.post_commit_projection;
@@ -16147,6 +16220,7 @@ function quoteSessionSaveFailureFrom(result = {}) {
     page_unloading: data.page_unloading === true,
     review_reason: review?.reason_code || "",
     draft_stale: data.status === "conflict" && data.reason_code === "quote_draft_stale",
+    exchange_rate_invalid: data.reason_code === "exchange_rate_invalid",
   };
 }
 
@@ -16158,6 +16232,8 @@ function quoteSessionDraftSynchronizationFailureMessage(failure = null) {
     message = "Quote could not be saved with a verified acknowledgement. Reopen the saved quote before trying again.";
   } else if (QUOTE_COMMERCIAL_REVIEW_REASONS.has(failure?.review_reason)) {
     message = QUOTE_COMMERCIAL_REVIEW_MESSAGE;
+  } else if (failure?.exchange_rate_invalid) {
+    message = "Quote could not be saved. Enter an exchange rate above 0 on the Customer step.";
   } else if (failure?.fetch_failed) {
     message = "Quote could not be saved because the connection was interrupted. Please try again.";
   } else if (failure?.status === 400) {
@@ -18328,8 +18404,10 @@ async function handleDraftBasis(options = {}) {
     applyDraftPricingReferenceReview(polled.data.result || polled.data);
     const errors = polled.data.errors || polled.data.result?.errors || ["Draft failed."];
     const wasBlocked = polled.data.status === "blocked";
-    setWorkflowStage(wasBlocked ? "details_review" : "ready_to_analyze");
-    if (wasBlocked) {
+    // An analysis that found nothing quotable asks for booth renders, as an error in the popup (#250).
+    const noQuoteBasis = (polled.data.result || polled.data).reason_code === "no_quote_basis";
+    setWorkflowStage(wasBlocked && !noQuoteBasis ? "details_review" : "ready_to_analyze");
+    if (wasBlocked && !noQuoteBasis) {
       showAiBlockedBanner(errors.join(" "));
     } else {
       showAiFailureBanner(analysisJobFailureMessage(polled.data.result || polled.data));
@@ -19169,7 +19247,7 @@ async function advanceCustomerStep() {
     });
     if (!saved || safeQuoteSessionId(saved.session_id) !== checkpoint.sessionId) {
       if (saveFailure.failure) {
-        renderMessages([quoteSessionDraftSynchronizationFailureMessage(saveFailure.failure)], "warn");
+        renderMessages([quoteSessionDraftSynchronizationFailureMessage(saveFailure.failure)], "error");
       }
       return false;
     }
@@ -19711,6 +19789,7 @@ function handleBeforeUnload(event) {
 function wireEvents() {
   quoteTemplatesSettings.bind();
   viewOnlyQuoteGuard.bind();
+  stepMessagePopup.bind();
   if (elements.topbarLogoutLink) {
     elements.topbarLogoutLink.addEventListener("click", async (event) => {
       event.preventDefault();

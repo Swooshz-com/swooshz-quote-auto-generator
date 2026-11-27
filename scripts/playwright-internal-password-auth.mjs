@@ -416,9 +416,9 @@ try {
       const failures = [];
       await idlePage.exposeFunction("recordVisibleFailure", text => failures.push(text));
       await idlePage.evaluate(() => new MutationObserver(() => {
-        const text = elements.messageList.textContent.trim();
+        const text = elements.stepMessagePopupMessages.textContent.trim();
         if (text) window.recordVisibleFailure(text);
-      }).observe(elements.messageList, { childList: true, subtree: true }));
+      }).observe(elements.stepMessagePopupMessages, { childList: true, subtree: true }));
       const outcome = act(idlePage).then(value => ({ value }), error => ({ error: String(error).slice(0, 300) }));
       await idlePage.waitForURL(base + "/login").catch(async error => {
         throw new Error(label + " did not reach sign-in: " + JSON.stringify(await Promise.race([outcome, Promise.resolve("pending")])) + " " + error.message.split(String.fromCharCode(10))[0]);
@@ -468,9 +468,9 @@ try {
       const failures = [];
       await idlePage.exposeFunction("recordVisibleFailure", text => failures.push(text));
       await idlePage.evaluate(() => new MutationObserver(() => {
-        const text = elements.messageList.textContent.trim();
+        const text = elements.stepMessagePopupMessages.textContent.trim();
         if (text) window.recordVisibleFailure(text);
-      }).observe(elements.messageList, { childList: true, subtree: true }));
+      }).observe(elements.stepMessagePopupMessages, { childList: true, subtree: true }));
       void act(idlePage).catch(() => {});
       await endedSignInPage(idlePage);
       assert.equal(downloads, 0, label + " downloaded a file after the session ended");

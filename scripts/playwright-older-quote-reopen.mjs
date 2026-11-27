@@ -327,8 +327,8 @@ try {
     await page.waitForFunction(() => !appIsBusy(), null, { timeout: 30000 });
     downloaded = (await clickDownload()) || downloaded;
   }
-  result.olderRecoveryCopy.download = await page.evaluate(() => [...document.querySelectorAll("#messageList, #excelGeneratingModal.is-open")]
-    .filter((node) => node.offsetParent || node.classList.contains("is-open")).map((node) => node.innerText.replace(/\s+/g, " ").trim()).filter(Boolean));
+  result.olderRecoveryCopy.download = await page.evaluate(() => [...document.querySelectorAll("#stepMessagePopup:not([hidden]), #excelGeneratingModal.is-open")]
+    .map((node) => node.innerText.replace(/\s+/g, " ").trim()).filter(Boolean));
   assert(!downloaded && result.olderRecoveryCopy.download.some((text) => /changed in another tab or session\. Reopen it/.test(text)),
     "Download on the held recovery copy did not say why it cannot save", result.olderRecoveryCopy.download);
   await page.waitForLoadState("networkidle");

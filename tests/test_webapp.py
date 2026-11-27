@@ -32679,7 +32679,9 @@ assert.strictEqual(state.basisChat.completionNotice, null);
         self.assertNotIn(".output-page-header {", css)
         self.assertIn(".output-status-pill.is-ok", css)
         self.assertIn(".quote-basis-title-row .output-status-pill", css)
-        self.assertIn(".side-workspace .assistant-output .message-list:empty", css)
+        # Step messages left Output's body for the shared bottom-right popup (owner, #250).
+        self.assertNotIn('id="messageList"', html)
+        self.assertIn('id="stepMessagePopup"', html)
         self.assertIn("width: min(100%, var(--workspace-content-width));", css)
         self.assertIn("width: auto;", css)
         self.assertIn(".output-col-description { width: 20%; }", css)

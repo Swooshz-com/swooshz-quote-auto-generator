@@ -426,6 +426,8 @@ QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS = (
 )
 QUOTE_COMMERCIAL_REVIEW_MESSAGE = "Pricing review required: saved quote commercial state requires review before generation."
 QUOTE_EXCHANGE_RATE_INVALID_MESSAGE = "Enter an exchange rate above 0 on the Customer step."
+QUOTE_EXCHANGE_RATE_INVALID_REASON = "exchange_rate_invalid"
+NO_USABLE_QUOTE_BASIS_RULE = "no_usable_quote_basis"
 QUOTE_COMMERCIAL_REVIEW_SCHEMA = "swooshz.quote-commercial-review.v1"
 QUOTE_COMMERCIAL_REVIEW_VERSION = 1
 QUOTE_COMMERCIAL_REVIEW_STATUS = "REVIEW_REQUIRED"
@@ -18854,7 +18856,7 @@ def quote_commercial_review_preflight(
         rate_refusal = quote_exchange_rate_refusal(payload)
         if not rate_refusal:
             return None
-        result = {"status": "blocked", "errors": [rate_refusal]}
+        result = {"status": "blocked", "errors": [rate_refusal], "reason_code": QUOTE_EXCHANGE_RATE_INVALID_REASON}
     if job_id:
         result["job_id"] = job_id
     return result
@@ -22299,6 +22301,8 @@ DRAFT_REQUEST_VALIDATION_REASONS = frozenset({
 })
 
 SAFE_AI_FAILURE_DIAGNOSTIC_KEYS = {
+    # The rule (or error class) that refused an answer in normalisation: a plain name, never model text.
+    "normalization_rule",
     "response_contract_name",
     "request_validation_stage",
     "request_validation_reason",
@@ -28094,7 +28098,8 @@ def normalize_draft_response(data, shape_fingerprint, payload, auth_session, *, 
     except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exc:
         raise OpenAIAnalysisError(
             "OpenAI analysis response could not be normalized.",
-            diagnostics={**response_diagnostics, "failure_boundary": "application_normalization"},
+            diagnostics={**response_diagnostics, "failure_boundary": "application_normalization",
+                         "normalization_rule": type(exc).__name__.lower()},
         ) from exc
 
 
@@ -28211,7 +28216,9 @@ def require_usable_ai_basis(provider: str, basis: dict[str, str], sections: list
     has_section_lines = any(section.get("lines") for section in sections)
     if basis or has_section_lines:
         return
-    raise OpenAIAnalysisError(f"{provider} returned no usable quote basis.")
+    # Nothing quotable was found, as when the upload is not a booth render (owner, #250).
+    raise OpenAIAnalysisError(f"{provider} returned no usable quote basis.",
+                              diagnostics={"normalization_rule": NO_USABLE_QUOTE_BASIS_RULE})
 
 
 def ai_draft_diagnostic_details(
@@ -28259,7 +28266,8 @@ def finalized_remote_draft_result(
     )
     blockers = normalize_blocking_clarification_questions(ai_basis.get("blocking_clarification_questions"))
     if blockers:
-        raise OpenAIAnalysisError(f"{provider_label} returned clarification questions instead of a usable quote basis.")
+        raise OpenAIAnalysisError(f"{provider_label} returned clarification questions instead of a usable quote basis.",
+                                  diagnostics={"normalization_rule": "clarification_questions_only"})
     require_usable_ai_basis(provider_label, basis, sections)
     if isinstance(ai_basis.get("_staff_booth_size"), dict):
         fallback_project = ai_basis["_staff_booth_size"]
@@ -28419,12 +28427,16 @@ def protected_ai_draft_mode_enabled(auth_session: dict[str, Any] | None = None) 
     return protected_job_routes_enabled(auth_session)
 
 
-def protected_ai_draft_blocked_result(error_reference: str) -> dict[str, Any]:
-    return {
+def protected_ai_draft_blocked_result(error_reference: str, exc: BaseException | None = None) -> dict[str, Any]:
+    result = {
         "status": "blocked",
         "errors": generic_referenced_errors(error_reference),
         "error_reference": clean_text(error_reference),
     }
+    # An answer with nothing quotable (no booth found) lets the page ask for booth renders instead of "Failed".
+    if getattr(exc, "diagnostics", {}).get("normalization_rule") == NO_USABLE_QUOTE_BASIS_RULE:
+        result["reason_code"] = "no_quote_basis"
+    return result
 
 
 def log_protected_ai_draft_block(
@@ -28615,7 +28627,8 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
             except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exc:
                 raise OpenAIAnalysisError(
                     "OpenAI analysis response could not be normalized.",
-                    diagnostics={"failure_boundary": "application_normalization"},
+                    diagnostics={"failure_boundary": "application_normalization",
+                                 "normalization_rule": type(exc).__name__.lower()},
                 ) from exc
             result = completed_draft_with_pricing_reference_snapshot(
                 payload, result, auth_session=auth_session
@@ -28699,7 +28712,7 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
                     model=draft_model,
                     exc=exc,
                 )
-                return protected_ai_draft_blocked_result(error_reference)
+                return protected_ai_draft_blocked_result(error_reference, exc)
 
     if remote_errors:
         try:
@@ -36103,7 +36116,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 return
             rate_refusal = quote_exchange_rate_refusal(payload)
             if rate_refusal:
-                self.send_json({"status": "blocked", "errors": [rate_refusal]}, status=400)
+                self.send_json({"status": "blocked", "errors": [rate_refusal], "reason_code": QUOTE_EXCHANGE_RATE_INVALID_REASON}, status=400)
                 return
             try:
                 storage = self.current_quote_session_storage()
