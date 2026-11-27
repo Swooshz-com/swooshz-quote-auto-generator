@@ -17106,6 +17106,60 @@ async function modifyDashboardQuote(sessionId, options = {}) {
   }
 }
 
+// The copied Customer checkpoint still names its source quote, which sends every later step of the copy back to
+// Customer. It names the copy when the same staff member, on the same service (the recovery scope), acknowledged
+// exactly the copied Customer details. Otherwise the copy stops at Customer until Next, as the source itself would
+// for that person (a quote of another staff member, a copy service, changed details or pricing reference).
+function restampCopiedCustomerStepCheckpoint() {
+  const copied = customerStepCheckpointWithAddedFieldDefaults(state.customerStepCheckpoint);
+  if (!isPlainObject(copied)) return false;
+  const current = customerStepCheckpointForCurrent();
+  const acknowledged = { ...copied, sessionId: current?.sessionId };
+  // A checkpoint the copy cannot take is dropped, so the copy never names its source quote; the gate treats a missing
+  // checkpoint as one to make at Customer.
+  state.customerStepCheckpoint = current && quoteCommercialStrictDataEqual(acknowledged, current) ? current : null;
+  return Boolean(state.customerStepCheckpoint);
+}
+
+// A copy of a confirmed quote is priced for itself through the request Confirm sends: the server grants each ticked
+// catalogue line still in the copy's Output its price for the copy (source prices are never carried over). The copy
+// keeps its saved Output (its source's: rows deleted there stay deleted, typed prices and wording stay), each row
+// replaced by its priced version in place, and is saved at Output, ready for Generate. A row the server does not price
+// stays without a price for Output to ask for. If the copy cannot be confirmed or priced, it stays as saved: at Output
+// with its source's rows, the catalogue ones asking for a price; nothing is rebuilt from the basis.
+async function priceDuplicatedOutput(savedSession, operationIsCurrent, targetSessionId) {
+  const isCurrent = () => operationIsCurrent() && safeQuoteSessionId(state.quoteSessionId) === targetSessionId;
+  if (!customerStepCheckpointIsCurrent() || basisConfirmBlockReason() || missingDetailFields().length) return savedSession;
+  const copiedOutputRows = state.outputRows;
+  const refreshed = await refreshLineItemsFromServer();
+  if (!isCurrent()) return null;
+  if (!refreshed.ok) return savedSession;
+  const priced = new Map();
+  state.lineItems.forEach((row) => {
+    const id = String(row?.source_basis_line_id || "");
+    if (id) priced.set(id, priced.has(id) ? null : row);
+  });
+  state.outputRows = copiedOutputRows.map((row) => {
+    const pricedRow = priced.get(String(row.source_basis_line_id || ""));
+    return pricedRow ? outputRowFromLineItem(pricedRow) : row;
+  });
+  // Reset Output on the copy still goes back to its source's first Output, without the source's prices.
+  state.lineItems = retainExcludedBasisPricingRows(outputRowsToLineItems());
+  state.basisConfirmed = true;
+  setWorkflowStage("completed");
+  state.activeSidePanel = "output";
+  const saved = await saveCurrentQuoteSession({ sessionId: targetSessionId, includeDraftState: true });
+  if (!isCurrent()) return null;
+  if (!saved) {
+    if (!state.isPageUnloading) {
+      clearDashboardOperation();
+      dashboardRestoreError(state.quoteSessionLoadError || "The duplicated quote could not be saved.");
+    }
+    return null;
+  }
+  return saved;
+}
+
 function copiedQuotePricingRow(sourceRow, normalizer = normalizeLineItem) {
   // The copy has no saved price to restore, so a line still waiting for Confirm stays excluded in it.
   const row = withoutReincludedSelection(sourceRow);
@@ -17163,8 +17217,12 @@ async function duplicateDashboardQuote(sessionId, options = {}) {
     draftState = mergeDashboardDraftSummaryDetails(draftState, detailedSession || {});
     draftState = hydrateDashboardDraftImagePayloads(draftState, sourceSessionId);
     if (!operationIsCurrent()) return false;
+    const sourceHasOutput = Array.isArray(draftState.outputRows) && draftState.outputRows.length > 0;
+    const sourceConfirmed = draftState.basisConfirmed === true && sourceHasOutput;
     draftState = {
       ...draftState,
+      // The source's Excel and PDF stay the source's (publication proofs bind them to it); the copy generates its own.
+      downloadFile: null, pdfFile: null, downloadFileRevision: -1, pdfFileRevision: -1,
       lineItems: Array.isArray(draftState.lineItems) ? draftState.lineItems.map((row) => copiedQuotePricingRow(row)) : draftState.lineItems,
       outputRows: Array.isArray(draftState.outputRows) ? draftState.outputRows.map((row) => copiedQuotePricingRow(row, normalizeOutputRow)) : draftState.outputRows,
       originalOutputRows: Array.isArray(draftState.originalOutputRows) ? draftState.originalOutputRows.map((row) => copiedQuotePricingRow(row, normalizeOutputRow)) : draftState.originalOutputRows,
@@ -17181,9 +17239,10 @@ async function duplicateDashboardQuote(sessionId, options = {}) {
       dashboardRestoreError("This quote session was saved with an incompatible draft format.");
       return false;
     }
-    // Target normalisation demotes copied claims. Explicit Confirm/selection
-    // remains the only operation that can request new target pricing grants.
+    // Target normalisation demotes copied claims. A new target grant comes only from Confirm's selection request:
+    // sent by Confirm, or below for a copy of a confirmed quote (priceDuplicatedOutput).
     if (!operationIsCurrent() || safeQuoteSessionId(state.quoteSessionId) !== operation.targetSessionId) return false;
+    restampCopiedCustomerStepCheckpoint();
     if (state.outputRows.length) state.lineItems = outputRowsToLineItems();
     const normalizePayload = buildLineItemNormalizePayload();
     const normalized = await postJson("/api/line-items/normalize", normalizePayload);
@@ -17194,17 +17253,24 @@ async function duplicateDashboardQuote(sessionId, options = {}) {
       return false;
     }
     state.lineItems = normalized.data.line_items.map(normalizeLineItem);
-    state.outputRows = state.lineItems.map(outputRowFromLineItem);
+    // A source that never reached Output gives a copy without Output rows, so the copy stops where its source did.
+    // Otherwise the copy is saved with its source's Output and Reset rows, catalogue rows without the source's prices
+    // (rows deleted in Output stay deleted); a copy of a confirmed quote is then priced in place for itself.
+    state.outputRows = sourceHasOutput ? state.lineItems.map(outputRowFromLineItem) : [];
     state.quoteSessionDraftSaveStarted = true;
     state.quoteSessionRestoredSessionId = "";
     state.quoteSessionRestoredDraftKey = "";
-    const duplicatedSession = await saveCurrentQuoteSession({ sessionId: operation.targetSessionId, includeDraftState: true });
+    let duplicatedSession = await saveCurrentQuoteSession({ sessionId: operation.targetSessionId, includeDraftState: true });
     if (!duplicatedSession) {
       if (!state.isPageUnloading) {
         clearDashboardOperation();
         dashboardRestoreError(state.quoteSessionLoadError || "The duplicated quote could not be saved.");
       }
       return false;
+    }
+    if (sourceConfirmed) {
+      duplicatedSession = await priceDuplicatedOutput(duplicatedSession, operationIsCurrent, operation.targetSessionId);
+      if (!duplicatedSession) return false;
     }
     state.dashboardSelectionMode = false;
     state.dashboardSelectedSessionIds = [];

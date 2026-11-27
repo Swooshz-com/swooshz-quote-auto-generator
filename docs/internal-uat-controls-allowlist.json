@@ -1,0 +1,26 @@
+{
+  "unlisted": {},
+  "stale": {},
+  "unnamed": {
+    "<input> with no name in webapp/static/app.js": {
+      "count": 2,
+      "reason": "The Output table's quantity and price editors: their attributes are joined from a string variable, so the scan cannot read them. They open from the cells named [data-output-edit-field]; OUT-03, OUT-07 and OUT-08 use them."
+    },
+    "<textarea> with no name in webapp/static/app.js": {
+      "count": 1,
+      "reason": "The Output table's description editor, built the same way as the quantity and price editors; OUT-03 uses it."
+    },
+    "document.createElement(\"a\") in webapp/static/app.js": {
+      "count": 6,
+      "reason": "Hidden links the page makes, clicks and removes to save or open a file (Excel, PDF, the Dashboard's file links, profile export, quote template previews, pricing reference export and template); nobody sees or clicks them. The buttons that start them have their own lines (XP-01, XP-02, DB-09, QC-03, QT-06, PR-07)."
+    },
+    "qtNode(\"button\") with no name in webapp/static/app.js": {
+      "count": 8,
+      "reason": "Quote Templates editor buttons with only shared style classes: the more menu's items, Make a copy, Edit, Done, Add column and Remove column (page and item table). QT-02, QT-04 and QT-08 use them by their labels."
+    },
+    "qtNode(\"select\") with no name in webapp/static/app.js": {
+      "count": 1,
+      "reason": "The Quote Templates editor's shared drop-down (font and similar choices); QT-04 uses it."
+    }
+  }
+}
