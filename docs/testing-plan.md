@@ -610,6 +610,7 @@ the owner-approved CI lane.
   claims. Exercise missing, malformed, duplicate and inconsistent items under
   an unchanged reference basis across saved rows and Reset. Keep legitimate
   changed-basis commercial review and supported nested snapshot restoration.
+- Any change that adds, removes or renames a control in `webapp/static/index.html` or an HTML template in `webapp/static/app.js`: update its line in the [release UAT checklist](internal-uat.md) and run `python scripts/check_uat_checklist_controls.py`; changes to the check itself also run `python -m unittest tests.test_uat_checklist_controls`.
 - Upload intake, PDF/image handling, sample loading, browser refresh persistence, or local file state: run server tests for request validation and a rendered Playwright flow for the affected upload/persistence path. Reference image limits and the AI image copy: `tests/test_reference_image_limits.py` and `tests/test_pdf_reference_limits.py`.
 - Frontend layout, controls, settings, privacy page, or responsive behavior: run syntax checks and a browser/Playwright visual interaction loop on the changed screen.
 - Auth, permissions, retired OIDC refusal, cookies, CSRF, file download boundaries, or secret
