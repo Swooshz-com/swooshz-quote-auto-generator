@@ -98,7 +98,7 @@ Colour never carries meaning alone: a warning or error also has a word or icon.
 
 - **Blocking problem**: banner like `.ai-failure-banner`: `--red-soft` fill, 5 px red left border, a bold lead-in ("AI analysis blocked.") then what to do.
 - **Running or warning**: the same banner in amber.
-- **Step messages**: one popup at the bottom right, above the step footer (`.step-message-popup`, owner-approved): an error is red with an X at its top right and stays until the X is pressed; a warning is amber and fades by itself after about 6 seconds; a warning never hides an open error. At 640 px and below it spans the width and its X is 44 px.
+- **Step messages**: one popup at the bottom right, above the step footer (`.step-message-popup`, owner-approved): an error is red with an X at its top right and stays until the X or Escape is pressed, its cause goes (a new analysis, a review cleared) or the Dashboard opens; a closed error does not come back for the same cause and an open one is not announced again. A warning is amber and fades by itself after about 6 seconds and never hides an open error. At 880 px and below it sits higher, clear of the stacked footer; at 640 px and below it spans the width and its X is 44 px.
 - **Badges**: 24 px pills, 11-12 px / 800-850 today (e.g. "Profile template" is 12 px / 800); new badges use 12 px.
 - **Empty state**: like `.side-empty-state` (dashed border, pale blue fill), one line saying what goes here and the action that fills it. Where that class does not fit, use a dashed `--line-strong` border on `--blue-soft`.
 - **Loading**: the existing spinner or typing dots; anything over a second shows progress or elapsed time.

@@ -26282,7 +26282,8 @@ def require_basis_confidence(sections: list[dict[str, Any]], provider: str = "AI
         preview = "; ".join(missing[:3])
         extra = f" ({len(missing) - 3} more)" if len(missing) > 3 else ""
         raise OpenAIAnalysisError(
-            f"{provider} returned quote_basis_sections lines without mandatory confidence_pct: {preview}{extra}."
+            f"{provider} returned quote_basis_sections lines without mandatory confidence_pct: {preview}{extra}.",
+            diagnostics={"normalization_rule": "missing_basis_confidence"},
         )
 
 

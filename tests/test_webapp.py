@@ -29221,7 +29221,8 @@ async function act() {
     await settle(listeners.get("click")()); await tick();
     assert.strictEqual(state.activeAppView, "quote", "Failed save navigated to dashboard");
     assert.strictEqual(calls.filter(c => c.method === "GET" && c.url === "/api/quote-sessions").length, 0, "Failed save started list chain");
-    assert(messages.join(" ").includes("Quote could not be saved"), "Persistence failure hidden");
+    // Said once, in the "Quote not saved" dialog (the popup no longer repeats it).
+    assert(notSavedDialogs.join(" ").includes("Quote could not be saved"), "Persistence failure hidden");
     assert(state.quoteSessionLoadError.includes("ERR-")); assert.strictEqual(state.quoteSessionDashboardBusy, false);
     assert.deepStrictEqual(currentQuoteSessionDraftState(), before); assert.deepStrictEqual(sessionFileRecordsFromDraft(), files);
     assert(!quoteSessionDraftIsConfirmed(state.quoteSessionId, quoteSessionDraftComparisonKey(), quoteSessionDraftFileComparisonKey()));

@@ -1733,6 +1733,8 @@ function setAiStatusBanner(tone, title, message, options = {}) {
 }
 
 function showAiRunningBanner(message = ANALYSIS_WAIT_ESTIMATE, startedAt = activeJobStartedAt()) {
+  // A new analysis replaces the last one's error.
+  renderMessages([], "", { source: "analysis" });
   setAiStatusBanner("running", "AI analysis running.", message, { elapsed: true });
   startAnalysisElapsedTimer(startedAt);
 }
@@ -1741,7 +1743,8 @@ function showAiRunningBanner(message = ANALYSIS_WAIT_ESTIMATE, startedAt = activ
 function showAiFailureBanner(message = GENERIC_FAILURE_MESSAGE) {
   const detail = String(message || "").replace(/^AI analysis failed\.?\s*/i, "").trim() || GENERIC_FAILURE_MESSAGE;
   clearAiFailureBanner();
-  renderMessages([detail.startsWith(NO_QUOTE_BASIS_MESSAGE) ? detail : `AI analysis failed. ${detail}`], "error");
+  const text = detail.startsWith(NO_QUOTE_BASIS_MESSAGE) ? detail : `AI analysis failed. ${detail.replace(/^Failed\.\s*/, "")}`;
+  renderMessages([text], "error", { source: "analysis" });
 }
 
 function showAiBlockedBanner(message = "Complete the required details, then retry analysis.", title = "AI analysis blocked.") {
@@ -3131,8 +3134,14 @@ function setQuoteCommercialReview(reason = "invalid_snapshot", id = state.pricin
 }
 
 function renderQuoteCommercialReviewState() {
-  if (!quoteCommercialReviewRequired()) return false;
-  renderMessages([QUOTE_COMMERCIAL_REVIEW_MESSAGE], "error");
+  if (!quoteCommercialReviewRequired()) {
+    renderMessages([], "", { source: "commercial_review" });
+    return false;
+  }
+  const review = state.quoteCommercialReview || {};
+  renderMessages([QUOTE_COMMERCIAL_REVIEW_MESSAGE], "error", {
+    source: "commercial_review", key: JSON.stringify([review.reason_code, review.blocked_identity]),
+  });
   setResultStatus("Pricing review required", "is-warn");
   return true;
 }
@@ -9891,13 +9900,14 @@ function setResultStatus(label, tone = "") {
 }
 
 // Step messages show in the shared bottom-right popup (owner, #250): an error stays until its X is pressed, anything
-// else fades by itself. An empty list clears a message that is not an error.
-function renderMessages(messages = [], tone = "") {
+// else fades by itself. A message may name its source (a cause such as "analysis" or "commercial_review") and a key
+// for that cause's current state: an empty list for a source clears that source's message (its cause is gone).
+function renderMessages(messages = [], tone = "", options = {}) {
   // The page is already leaving for sign-in; a failure here would only flash.
   if (tone === "error" && authenticationRecoveryNavigating()) return;
   // Step messages belong to the quote's steps; the Dashboard shows its own errors.
-  if (state.activeAppView !== "quote") return;
-  stepMessagePopup.show(messages, tone);
+  if (state.activeAppView !== "quote" && (messages.length || !options.source)) return;
+  stepMessagePopup.show(messages, tone, options);
 }
 
 class StepMessagePopup {
@@ -9909,26 +9919,44 @@ class StepMessagePopup {
     this.list = list;
     this.closeButton = closeButton;
     this.tone = "";
+    this.text = "";
+    this.source = "";
+    this.key = "";
+    // Errors staff closed, by source and key: the same cause stays closed until it changes or goes.
+    this.dismissed = new Set();
     this.timers = [];
   }
 
   bind() {
-    this.closeButton?.addEventListener("click", () => this.close());
+    this.closeButton?.addEventListener("click", () => this.dismiss());
   }
 
-  show(messages = [], tone = "") {
+  isOpen() {
+    return Boolean(this.popup && !this.popup.hidden);
+  }
+
+  show(messages = [], tone = "", { source = "", key = "" } = {}) {
     const texts = (Array.isArray(messages) ? messages : [messages]).map((message) => String(message || "").trim()).filter(Boolean);
     const error = tone === "error";
     if (!texts.length) {
-      if (this.tone !== "error") this.close();
+      if (source) this.clear(source);
+      else if (this.tone !== "error") this.close();
       return;
     }
+    const text = texts.join("\n");
+    const identity = `${source}\u0000${key || text}`;
+    // A closed error does not come back for the same cause, and an open one is not written (or announced) again.
+    if (error && this.dismissed.has(identity)) return;
+    if (this.isOpen() && this.tone === (error ? "error" : "warn") && this.text === text && this.source === source) return;
     // A newer warning never hides an error staff have not closed.
     if (this.tone === "error" && !error) return;
     if (!this.popup || !this.list) return;
     this.clearTimers();
     this.tone = error ? "error" : "warn";
-    this.list.innerHTML = texts.map((text) => `<p>${escapeHtml(text)}</p>`).join("");
+    this.text = text;
+    this.source = source;
+    this.key = identity;
+    this.list.innerHTML = texts.map((message) => `<p>${escapeHtml(message)}</p>`).join("");
     this.popup.classList.toggle("is-error", error);
     this.popup.classList.remove("is-fading");
     this.popup.setAttribute("role", error ? "alert" : "status");
@@ -9942,9 +9970,26 @@ class StepMessagePopup {
     }
   }
 
+  // Staff closed it (the X or Escape): an error stays closed until its cause changes.
+  dismiss() {
+    if (this.tone === "error" && this.key) this.dismissed.add(this.key);
+    this.close();
+  }
+
+  // The cause is gone: its message closes, and a later message from the same source shows again.
+  clear(source) {
+    for (const identity of [...this.dismissed]) {
+      if (identity.startsWith(`${source}\u0000`)) this.dismissed.delete(identity);
+    }
+    if (this.source === source) this.close();
+  }
+
   close() {
     this.clearTimers();
     this.tone = "";
+    this.text = "";
+    this.source = "";
+    this.key = "";
     if (!this.popup) return;
     this.popup.hidden = true;
     this.popup.classList.remove("is-error", "is-fading");
@@ -16490,9 +16535,8 @@ async function returnToDashboard() {
     });
     if (!saved) {
       const message = quoteSessionDraftSynchronizationFailureMessage(saveFailure.failure);
-      renderMessages([message], "error");
       syncControlStates();
-      // The message list belongs to Output; staff leave from any step.
+      // Said once, in the "Quote not saved" dialog, from whichever step staff leave.
       if (!saveFailure.failure?.page_unloading && !authenticationRecoveryNavigating()) showQuoteNotSavedModal(message);
       return;
     }
@@ -18268,7 +18312,8 @@ function syncControlStates() {
   }
   updatePresetButtons();
   updateSidePanelNav();
-  if (quoteCommercialReviewRequired()) renderQuoteCommercialReviewState();
+  // Shows the review error once while a review is required, and clears it when the review goes.
+  renderQuoteCommercialReviewState();
   saveSessionState();
 }
 
@@ -18410,8 +18455,10 @@ async function handleDraftBasis(options = {}) {
     const wasBlocked = polled.data.status === "blocked";
     // An analysis that found nothing quotable asks for booth renders, as an error in the popup (#250).
     const noQuoteBasis = (polled.data.result || polled.data).reason_code === "no_quote_basis";
-    setWorkflowStage(wasBlocked && !noQuoteBasis ? "details_review" : "ready_to_analyze");
-    if (wasBlocked && !noQuoteBasis) {
+    // A refusal with a support reference is an analysis error (popup); one without (missing details) keeps the banner.
+    const analysisError = noQuoteBasis || Boolean(errorReferenceFrom(polled.data.result || polled.data));
+    setWorkflowStage(wasBlocked && !analysisError ? "details_review" : "ready_to_analyze");
+    if (wasBlocked && !analysisError) {
       showAiBlockedBanner(errors.join(" "));
     } else {
       showAiFailureBanner(analysisJobFailureMessage(polled.data.result || polled.data));
@@ -20009,6 +20056,9 @@ function wireEvents() {
         }
       } else if (!elements.analysisConfirmModal.hidden) {
         closeAnalysisConfirmModal();
+      } else if (stepMessagePopup.isOpen() && !event.target?.closest?.("input, textarea, select, [contenteditable='true']")) {
+        // Escape closes a step message as its X does, unless it is leaving a field being edited.
+        stepMessagePopup.dismiss();
       }
     }
   });

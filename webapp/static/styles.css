@@ -3543,7 +3543,7 @@ h3 {
     width: auto;
   }
 
-  .step-message-popup-close {
+  .step-message-popup .step-message-popup-close {
     width: 44px;
     height: 44px;
   }
@@ -5872,9 +5872,15 @@ select:focus {
   overflow: hidden;
 }
 
+.side-workspace .assistant-output .message-list,
 .side-workspace .assistant-output .match-summary {
   margin-right: 0;
   margin-left: 0;
+}
+
+.side-workspace .assistant-output .message-list:empty {
+  display: none;
+  margin: 0;
 }
 
 .side-workspace #outputSidePanel .pricing-review-messages,
@@ -8108,6 +8114,12 @@ body.privacy-page {
 /* ============================================================
    MESSAGE LIST & DOWNLOADS
    ============================================================ */
+.message-list {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
 .message {
   padding: 10px 12px;
   border: 1px solid var(--line);
@@ -8277,6 +8289,11 @@ body.privacy-page {
    RESPONSIVE — 880px (mobile)
    ============================================================ */
 @media (max-width: 880px) {
+  /* Where the step footer stacks Back over Next, the step message popup sits above both. */
+  .step-message-popup {
+    bottom: 136px;
+  }
+
   :root {
     --rail-width: 100%;
     --workspace-width: 100%;
