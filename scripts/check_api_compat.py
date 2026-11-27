@@ -1,10 +1,10 @@
-"""Check a generated API spec against its released baseline; exit 1 on a change that breaks callers.
+"""Check a generated API spec against the v1 baseline; exit 1 on a change that breaks callers.
 
     python scripts/check_api_compat.py
     python scripts/check_api_compat.py --spec <spec.json> --baseline <baseline.json>
 
-The baseline is the contract callers were promised. Replace it only with the owner's
-OK naming the release (`--write-baseline`), never to make this check pass.
+The v1 baseline is a snapshot of the contract proposal, not a released API. Replace it
+only with the owner's OK (`--write-baseline`), never to make this check pass.
 Standard library only.
 """
 import argparse
@@ -27,7 +27,7 @@ def main(argv=None):
     parser.add_argument("--spec", type=Path, default=DEFAULT_SPEC)
     parser.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE)
     parser.add_argument("--write-baseline", action="store_true",
-                        help="copy the spec to the baseline (only with the owner's OK naming the release)")
+                        help="copy the spec to the v1 baseline (only with the owner's OK)")
     args = parser.parse_args(argv)
     text = args.spec.read_text(encoding="utf-8")
     if args.write_baseline:

@@ -1,8 +1,8 @@
 """Offline contract examples and reference-model tests, never runtime qualification.
 
 Only standard-library dependencies and the contract's code owners (the feature catalogue,
-states and schema checker); no sockets, credentials or files other than the generated
-spec and the contract document are used.
+states, schema checker and the app's upload limits); no sockets, credentials or files
+other than the generated spec and the contract document are used.
 """
 
 import base64
@@ -15,7 +15,7 @@ from pathlib import Path
 import re
 import unittest
 
-from webapp import api_schema
+from webapp import api_schema, server
 from webapp.api_catalogue import CATALOGUE, FORBIDDEN_FIELDS
 from webapp.quote_states import JOB_TRANSITIONS, REQUEST_TRANSITIONS
 
@@ -449,6 +449,9 @@ class QuoteApiContractTest(unittest.TestCase):
         # 'price' is a permitted customer line object, not a caller override.
         forbidden = FORBIDDEN - {"price"}
         self.assertLessEqual(set(SPEC["x-forbidden-fields"]), forbidden)
+        # AGENTS.md: customer output never shows internal cost, GST, markup or supplier notes.
+        self.assertLessEqual({"internal_cost", "gst", "markup", "supplier", "supplier_notes"},
+                             set(SPEC["x-forbidden-fields"]))
         for name in ("CustomerEstimateView", "BasisView", "JobView", "Error"):
             for nested in walk_schema(SCHEMAS[name]):
                 self.assertFalse(forbidden & {key.lower() for key in nested.get("properties", {})})
@@ -670,6 +673,11 @@ class QuoteApiContractTest(unittest.TestCase):
                                        DOC.split("| Job state |")[0], re.M))
         self.assertEqual({s: set(v.strip().split(", ")) if v.strip() != "none" else set()
                           for s, v in request_table.items()}, REQUEST_EDGES)
+        # The document's hand-written job table is the independent source for the job states.
+        job_table = dict(re.findall(r"^\| (queued|running|completed|failed) \| ([^|]+) \|$",
+                                    DOC.split("| Job state |")[1].split("\n\n")[0], re.M))
+        self.assertEqual({s: set(v.strip().split(", ")) if v.strip() != "none" else set()
+                          for s, v in job_table.items()}, JOB_EDGES)
 
     def test_confirmation_then_price_then_export_and_stale_revision(self):
         self.assertEqual(SPEC["x-confirmation-policy"], {
@@ -750,14 +758,18 @@ class QuoteApiContractTest(unittest.TestCase):
     def test_limits_represent_owner_sandbox_policy_and_schema_boundaries(self):
         self.assertEqual(SPEC["x-retention-seconds"], {"uploads": 7 * 86400, "results": 30 * 86400, "replay_receipts": 86400})
         limits = SPEC["x-limits"]
-        self.assertEqual(limits, {"files": 8, "image_bytes": 12 * 1024**2, "pdf_bytes": 48 * 1024**2,
-            "pdf_pages_total": 96, "decoded_bytes_total": 128 * 1024**2, "notes_utf8_bytes": 16384,
+        # The app owns its upload limits, so a change there reaches the API with no edit here;
+        # the API's own limits and the owner's sandbox quotas stay pinned.
+        self.assertEqual(limits, {"files": server.MAX_REFERENCE_IMAGES, "image_bytes": 12 * 1024**2,
+            "pdf_bytes": server.MAX_PDF_BYTES, "pdf_pages_total": server.MAX_DRAFT_PDF_PAGES,
+            "decoded_bytes_total": server.MAX_DRAFT_SOURCE_BYTES, "notes_utf8_bytes": 16384,
             "basis_lines": 500, "creates_per_minute_per_tenant": 15, "active_jobs_per_tenant": 2,
             "accepted_requests_per_utc_day_per_tenant": 100, "polls_per_minute_per_caller": 120})
-        for count in (0, 1, 8, 9):
+        files = limits["files"]
+        for count in (0, 1, files, files + 1):
             body = example("CreateQuoteRequest")
             body["design_files"] *= count
-            if 1 <= count <= 8:
+            if 1 <= count <= files:
                 check(SCHEMAS["CreateQuoteRequest"], body)
 
             else:

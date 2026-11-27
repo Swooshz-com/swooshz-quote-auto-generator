@@ -26,6 +26,15 @@ def changed(mutate):
     return compatibility_breaks(BASELINE, spec)
 
 
+def jobs_get(spec):
+    return spec["paths"]["/api/v1/jobs/{job_id}"]["get"]
+
+
+def parameter(location, required):
+    return {"name": "X-Request-Id" if location == "header" else "view", "in": location, "required": required,
+            "schema": {"type": "string"}}
+
+
 def add_operation(spec):
     spec["paths"]["/api/v1/quote-requests/{id}/history"] = {
         "get": copy.deepcopy(spec["paths"]["/api/v1/quote-requests/{id}"]["get"]) | {"operationId": "history"}}
@@ -75,6 +84,28 @@ BLOCKED = {
                          "response 200 removed"),
     "removed parameter": (lambda s: s["paths"]["/api/v1/quote-requests"]["post"]["parameters"].clear(),
                           "parameter Idempotency-Key removed"),
+    "new required header parameter": (lambda s: jobs_get(s)["parameters"].append(parameter("header", True)),
+                                      "parameter X-Request-Id added as required"),
+    "new required query parameter": (lambda s: jobs_get(s)["parameters"].append(parameter("query", True)),
+                                     "parameter view added as required"),
+    "enum added to a free request field": (lambda s: schemas(s)["CreateQuoteRequest"]["properties"]
+                                           ["client_reference"].update(enum=["design.test-001"]),
+                                           "client_reference: enum added"),
+    "enum added to a free optional field": (lambda s: schemas(s)["QueueDraftRequest"]["properties"]["notes"]
+                                            .update(enum=["x"]), "notes: enum added"),
+    "pattern added to a request field": (lambda s: schemas(s)["QueueDraftRequest"]["properties"]["notes"]
+                                         .update(pattern="^[a-z]*$"), "notes: pattern changed"),
+    "range tightened": (lambda s: schemas(s)["Revision"].update(minimum=2), "minimum tightened"),
+    "length tightened from below": (lambda s: schemas(s)["CreateQuoteRequest"]["properties"]["notes"]
+                                    .update(minLength=1), "minLength tightened"),
+    "closed type widened to null in a response": (lambda s: schemas(s)["AcceptedJob"]["properties"]["status"]
+                                                  .update(type=["string", "null"]), "type changed"),
+    "removed error response header": (lambda s: s["components"]["responses"]["Error429"]["headers"]
+                                      .pop("Retry-After"), "response 429 header Retry-After removed"),
+    "removed success response header": (lambda s: s["paths"]["/api/v1/quote-requests"]["post"]["responses"]
+                                        ["202"]["headers"].pop("Location"), "response 202 header Location removed"),
+    "forbidden name removed": (lambda s: s["x-forbidden-fields"].remove("markup"),
+                               "x-forbidden-fields: markup no longer forbidden"),
 }
 
 ALLOWED = {
@@ -91,6 +122,10 @@ ALLOWED = {
     "new error code": lambda s: s["x-error-status-codes"]["429"].append("SLOW_DOWN"),
     "new scope operation": lambda s: s["x-scopes"]["quote.read"].append("history"),
     "description change": lambda s: s["paths"]["/api/v1/jobs/{job_id}"]["get"].update(summary="Poll a job"),
+    "new optional parameter": lambda s: jobs_get(s)["parameters"].append(parameter("header", False)),
+    "new response header": lambda s: jobs_get(s)["responses"]["200"]["headers"].update(
+        {"X-Trace": {"schema": {"type": "string"}}}),
+    "new forbidden name": lambda s: s["x-forbidden-fields"].append("cost_basis"),
 }
 
 
@@ -105,6 +140,21 @@ class CompatibilityTest(unittest.TestCase):
         for name, mutate in ALLOWED.items():
             with self.subTest(change=name):
                 self.assertEqual(changed(mutate), [])
+
+    def test_an_optional_parameter_that_becomes_required_fails(self):
+        baseline, current = copy.deepcopy(BASELINE), copy.deepcopy(BASELINE)
+        jobs_get(baseline)["parameters"].append(parameter("query", False))
+        jobs_get(current)["parameters"].append(parameter("query", True))
+        self.assertIn("GET /api/v1/jobs/{job_id}: parameter view became required",
+                      compatibility_breaks(baseline, current))
+        self.assertEqual(compatibility_breaks(current, baseline), [])
+
+    def test_a_closed_request_object_cannot_start_refusing_extra_fields_it_accepted(self):
+        baseline, current = copy.deepcopy(BASELINE), copy.deepcopy(BASELINE)
+        schemas(baseline)["QueueDraftRequest"]["additionalProperties"] = True
+        self.assertTrue(any("additionalProperties closed" in line
+                            for line in compatibility_breaks(baseline, current)))
+        self.assertEqual(compatibility_breaks(current, baseline), [])
 
     def test_a_preview_operation_is_outside_the_promise(self):
         baseline = copy.deepcopy(BASELINE)

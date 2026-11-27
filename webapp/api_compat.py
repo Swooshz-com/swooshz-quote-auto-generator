@@ -1,11 +1,14 @@
-"""Compare a generated API spec with its released baseline and list the changes that break callers.
+"""Compare a generated API spec with the v1 baseline and list the changes that break callers.
 
-Allowed: a new operation, a new optional request field, a new response field, a new enum
-value, a higher limit, a looser request bound. Blocked: a removed or renamed operation,
-path, parameter, response or field; a request field becoming required (or a response
-field optional); a changed type, format, constant or pattern; a removed enum value or
-schema variant (a new variant in a response); a tighter request bound or lower limit;
-a changed or removed error code status; a changed money rule; a scope losing operations.
+Allowed: a new operation, a new optional request field or parameter, a new response field
+or header, a new enum value, a higher limit, a looser request bound, a new forbidden name.
+Blocked: a removed or renamed operation, path, parameter, response, response header or
+field; a new required parameter or request field, or one becoming required (or a response
+field optional); a changed type, format, constant or pattern; an enum added to a free
+request value, a removed enum value or schema variant (a new variant in a response); a
+tighter request bound, a request object closed to extra fields, or a lower limit; a
+changed or removed error code status; a changed money rule; a scope losing operations; a
+name no longer forbidden.
 Operations marked preview in the baseline are outside the promise. Works for any spec
 pair (the v1 API now, the Platform contract later). Standard library only.
 """
@@ -42,6 +45,10 @@ class _Walk:
             if removed or "enum" not in new:
                 self.add(where, "enum values removed: " + ", ".join(map(str, removed or old["enum"])))
         if side == "request":
+            if "enum" in new and "enum" not in old:
+                self.add(where, "enum added")
+            if old.get("additionalProperties", True) is not False and new.get("additionalProperties") is False:
+                self.add(where, "additionalProperties closed")
             for bound in _LOWER_BOUNDS:
                 if bound in new and new[bound] > old.get(bound, float("-inf")):
                     self.add(where, f"{bound} tightened")
@@ -90,13 +97,18 @@ class _Walk:
         if old.get("operationId") != new.get("operationId"):
             self.add(where, "operationId changed")
         new_params = {(p.get("name"), p.get("in")): p for p in map(self._param_current, new.get("parameters", []))}
-        for param in map(self._param_baseline, old.get("parameters", [])):
-            key = (param.get("name"), param.get("in"))
+        old_params = {(p.get("name"), p.get("in")): p for p in map(self._param_baseline, old.get("parameters", []))}
+        for key, param in old_params.items():
             if key not in new_params:
                 self.add(where, f"parameter {key[0]} removed")
-            else:
-                self.schema(param.get("schema", {}), new_params[key].get("schema", {}), "request",
-                            f"{where} parameter {key[0]}")
+                continue
+            if new_params[key].get("required") and not param.get("required"):
+                self.add(where, f"parameter {key[0]} became required")
+            self.schema(param.get("schema", {}), new_params[key].get("schema", {}), "request",
+                        f"{where} parameter {key[0]}")
+        for key, param in new_params.items():
+            if key not in old_params and param.get("required"):
+                self.add(where, f"parameter {key[0]} added as required")
         old_body = old.get("requestBody", {}).get("content", {})
         new_body = new.get("requestBody", {}).get("content", {})
         if new.get("requestBody", {}).get("required") and not old.get("requestBody", {}).get("required"):
@@ -111,8 +123,16 @@ class _Walk:
             if status not in new_responses:
                 self.add(where, f"response {status} removed")
                 continue
-            old_content = self._resolve(response, self.baseline).get("content", {})
-            new_content = self._resolve(new_responses[status], self.current).get("content", {})
+            old_response = self._resolve(response, self.baseline)
+            new_response = self._resolve(new_responses[status], self.current)
+            new_headers = new_response.get("headers", {})
+            for header, spec in old_response.get("headers", {}).items():
+                if header not in new_headers:
+                    self.add(where, f"response {status} header {header} removed")
+                else:
+                    self.schema(spec.get("schema", {}), new_headers[header].get("schema", {}), "response",
+                                f"{where} {status} header {header}")
+            old_content, new_content = old_response.get("content", {}), new_response.get("content", {})
             for media, content in old_content.items():
                 if media not in new_content:
                     self.add(where, f"response {status} media type {media} removed")
@@ -151,6 +171,10 @@ def compatibility_breaks(baseline: dict, current: dict) -> list[str]:
     for name, value in baseline.get("x-limits", {}).items():
         if name not in new_limits or new_limits[name] < value:
             walk.add(f"limit {name}", "lowered or removed")
+    still_forbidden = set(current.get("x-forbidden-fields", []))
+    for name in baseline.get("x-forbidden-fields", []):
+        if name not in still_forbidden:
+            walk.add("x-forbidden-fields", f"{name} no longer forbidden")
     new_scopes = current.get("x-scopes", {})
     for scope, operations in baseline.get("x-scopes", {}).items():
         lost = sorted(set(operations) - set(new_scopes.get(scope, [])))

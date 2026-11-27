@@ -115,7 +115,7 @@ jobs:
       - name: Check the generated API spec is current
         run: python scripts/build_api_spec.py --check
 
-      - name: Check API compatibility with the released baseline
+      - name: Check API compatibility with the v1 baseline
         run: python scripts/check_api_compat.py
 
       - name: Run API spec tests

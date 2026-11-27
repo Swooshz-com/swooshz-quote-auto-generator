@@ -240,7 +240,7 @@ def _structure(node):
 
 
 class SpecAgreementTest(unittest.TestCase):
-    """The hand-maintained spec stays the published contract until it is generated (slice B)."""
+    """Catalogue body shapes agree with the component schemas the spec builder writes."""
 
     def spec_operation(self, op):
         return SPEC["paths"][op.path][op.method.lower()]
