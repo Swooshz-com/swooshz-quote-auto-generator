@@ -249,7 +249,6 @@ function newStandardServiceDecisions() {
 }
 
 const state = {
-  quoteAiSpendRequest: 0,
   profileId: "",
   pricingReferenceId: "",
   pricingReferenceSource: "",
@@ -818,8 +817,6 @@ function transitionGenerationContext(sessionId = "", runId = "") {
   state.quoteSessionId = safeSessionId;
   if (previousContext.session_id !== safeSessionId) {
     state.pricingDraftVersion = safeSessionId ? false : "";
-    state.quoteAiSpendRequest += 1;
-    renderQuoteAiSpend();
   }
   state.lastGenerationRunId = safeRunId;
   state.lastGenerationRunSessionId = safeRunId ? safeSessionId : "";
@@ -14354,7 +14351,6 @@ async function buildAiBasisChatResponse(text, options = {}) {
       return { errorDisplayed: true };
     }
     const job = polled.job;
-    void refreshQuoteAiSpend(state.quoteSessionId);
     const result = job.result && !Array.isArray(job.result) ? job.result : Object.create(null);
     if (["blocked", "failed"].includes(job.status)) {
       const message = basisChatFriendlyError(result);
@@ -15833,7 +15829,6 @@ function mergeDashboardQuoteSession(session = {}) {
   state.quoteSessions = index >= 0
     ? existing.map((item, itemIndex) => (itemIndex === index ? { ...item, ...nextSession } : item))
     : [nextSession, ...existing];
-  if (safeSessionId === state.quoteSessionId) renderQuoteAiSpend();
 }
 
 function currentQuoteSessionPayload(options = {}) {
@@ -17168,45 +17163,6 @@ function dashboardExportAvailabilityItem(session = {}, kind = "xlsx", label = "X
   return { kind, label, exportInfo, available: false, statusText, className: "is-unavailable" };
 }
 
-function quoteAiSpendText(amount) {
-  if (amount?.status === "partial") {
-    return amount.display ? amount.display + " (partial)" : "Unknown (partial)";
-  }
-  if (amount?.status === "reported" && amount.display) return amount.display;
-  if (amount?.status === "none") return "No sends";
-  return "Unavailable";
-}
-
-function renderQuoteAiSpend() {
-  const sessionId = safeQuoteSessionId(state.quoteSessionId || "");
-  const spend = state.quoteSessions?.find((session) => session.session_id === sessionId)?.ai_spend;
-  const text = [
-    "Analysis / Re-Analyse " + quoteAiSpendText(spend?.draft),
-    "Basis chat " + quoteAiSpendText(spend?.basis_chat),
-    "AI spend total " + quoteAiSpendText(spend?.total),
-  ].join(" · ");
-  for (const id of ["basisAiSpend", "outputAiSpend"]) {
-    const target = document.getElementById(id);
-    if (!target) continue;
-    target.hidden = !sessionId;
-    if (target.textContent !== text) target.textContent = text;
-  }
-}
-
-async function refreshQuoteAiSpend(sessionId) {
-  if (!sessionId || sessionId !== state.quoteSessionId) return;
-  const request = ++state.quoteAiSpendRequest;
-  const { ok, data } = await getJson("/api/quote-sessions", { logFetchFailure: false });
-  if (request !== state.quoteAiSpendRequest || sessionId !== state.quoteSessionId) return;
-  const current = ok && Array.isArray(data.quote_sessions)
-    ? data.quote_sessions.find((session) => session.session_id === sessionId)
-    : null;
-  if (state.quoteSessions.some((session) => session.session_id === sessionId)) {
-    mergeDashboardQuoteSession({ session_id: sessionId, ai_spend: current?.ai_spend });
-  }
-  renderQuoteDashboard();
-}
-
 function dashboardSessionCard(session = {}) {
   const status = quoteSessionStatus(session);
   const customer = dashboardSessionCustomerText(session);
@@ -17271,10 +17227,6 @@ function dashboardSessionCard(session = {}) {
           <div class="dashboard-session-subtotal-cell">
             <dt>Subtotal</dt>
             <dd class="dashboard-session-subtotal">${subtotalHtml}</dd>
-          </div>
-          <div>
-            <dt>AI spend</dt>
-            <dd>${escapeHtml(quoteAiSpendText(session.ai_spend?.total))}</dd>
           </div>
         </dl>
         <div class="dashboard-session-record-zone dashboard-session-result-zone">
@@ -17921,7 +17873,6 @@ function dashboardDateFilterSummaryText(filteredCount = 0, totalCount = 0) {
 }
 
 function renderQuoteDashboard() {
-  renderQuoteAiSpend();
   if (elements.dashboardSearchInput) elements.dashboardSearchInput.value = state.dashboardSearch || "";
   updateDashboardSummary();
   if (elements.dashboardDateFilter) elements.dashboardDateFilter.value = state.dashboardDateFilter || "all";
@@ -18202,7 +18153,6 @@ async function handleDraftBasis(options = {}) {
   saveSessionState();
 
   const polled = await pollJob(state.activeJob.id);
-  if (!polled.aborted) void refreshQuoteAiSpend(synchronizedSessionId);
   if (polled.aborted) {
     restoreQuoteCommercialOverrideSnapshot(quoteCommercialSnapshot, { reason: "draft_poll_aborted" });
     return;
@@ -18783,7 +18733,6 @@ async function resumeSavedJob() {
       return;
     }
     const resumedJob = state.activeJob || activeJob;
-    const spendSessionId = state.quoteSessionId;
 
     const polled = await pollJob(resumedJob.id, (job) => {
       if (job.created_at && !state.activeJob?.startedAt) {
@@ -18792,7 +18741,6 @@ async function resumeSavedJob() {
         saveSessionState();
       }
     });
-    if (!polled.aborted) void refreshQuoteAiSpend(spendSessionId);
     if (polled.aborted) {
       restoreQuoteCommercialOverrideSnapshot(quoteCommercialSnapshot, { reason: "resume_draft_poll_aborted" });
       return;
