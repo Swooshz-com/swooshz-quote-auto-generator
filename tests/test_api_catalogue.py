@@ -44,7 +44,7 @@ def old_match(method, path):
 
 def entry(**changes):
     base = Operation("probe", "quote.read", "GET", "/api/v1/probes/{id}", "webapp.server:QuoteRunnerHandler",
-                     "sync", path_params=(("id", Field("string")),))
+                     "sync", "Read a probe", path_params=(("id", Field("string")),))
     return replace(base, **changes)
 
 
@@ -111,6 +111,19 @@ class SingleSourceTest(unittest.TestCase):
         self.assertEqual(matched - {None}, set(STORED_BITS))
 
 
+class FastSpecJobTest(unittest.TestCase):
+    def test_the_fast_ci_job_runs_every_api_spec_module_and_both_checks(self):
+        # tests/api_spec has no __init__.py, so Validate app's discovery skips it; this job is its only run.
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        modules = sorted(path.stem for path in (ROOT / "tests/api_spec").glob("test_*.py"))
+        self.assertTrue(modules)
+        self.assertFalse((ROOT / "tests/api_spec/__init__.py").exists())
+        for needed in ["python scripts/build_api_spec.py --check", "python scripts/check_api_compat.py",
+                       *(f"tests.api_spec.{name}" for name in modules)]:
+            with self.subTest(needed=needed):
+                self.assertIn(needed, workflow)
+
+
 class DeclaredPolicyTest(unittest.TestCase):
     def test_owner_revision_3_audiences_and_caller_policies(self):
         for op in CATALOGUE.operations:
@@ -151,10 +164,40 @@ class DeclaredPolicyTest(unittest.TestCase):
                {"path": "/api/v1/probes/{id}/"}, {"path": "/api/v1/probes/{other}"},
                {"path_params": ()}, {"path_params": (("id", Field("integer")),)},
                {"path_params": (("id", Field("string", nullable=True)),)},
-               {"request": obj(note=Field("string"))}, {"response": Field("array", item=Field("string"))})
+               {"request": obj(note=Field("string"))}, {"response": Field("array", item=Field("string"))},
+               {"method": "POST", "request_schema": "Probe"}, {"summary": ""}, {"summary": " Read"},
+               {"description": "x" * 1025}, {"from_states": ("bogus",)}, {"from_states": ("drafting", "drafting")},
+               {"request_schema": "Probe"}, {"response_schema": "probe"},
+               {"scope": "quote.write", "method": "GET"}, {"scope": "quote.write", "method": "POST"},
+               {"scope": "quote.write", "method": "POST", "request_schema": "Probe", "staff_request_schema": "Probe"})
         for changes in bad:
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 entry(**changes)
+
+    def test_write_scope_and_post_go_together_so_every_write_gets_the_staff_csrf_check(self):
+        write = entry(scope="quote.write", method="POST", request_schema="Probe")
+        self.assertEqual(write.scope, "quote.write")
+        for changes in ({"method": "POST", "request_schema": "Probe"}, {"scope": "quote.write"}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                entry(**changes)
+        self.assertEqual(quote_api_auth._STAFF_MUTATIONS,
+                         frozenset(op.name for op in CATALOGUE.operations if op.method == "POST"))
+
+    def test_overlapping_path_templates_are_refused_whatever_the_entry_order(self):
+        basis, artifact = CATALOGUE.get("basis"), CATALOGUE.get("artifact")
+        overlapping = (replace(entry(), name="latest", path="/api/v1/quote-requests/latest", path_params=()),
+                       replace(entry(), name="pdf_copy", path="/api/v1/quote-requests/{id}/artifacts/pdf"),
+                       replace(entry(), name="any_kind", path="/api/v1/quote-requests/{id}/artifacts/{other}",
+                               path_params=(("id", Field("string")), ("other", Field("string")))))
+        for extra, existing in zip(overlapping, (basis, artifact, artifact)):
+            for order in ((existing, extra), (extra, existing)):
+                with self.subTest(extra=extra.name, first=order[0].name), self.assertRaises(ValueError):
+                    ApiCatalogue(order)
+        apart = (replace(entry(), name="zip_copy", path="/api/v1/quote-requests/{id}/artifacts/zip"),
+                 replace(entry(), name="latest_write", scope="quote.write", method="POST",
+                         path="/api/v1/quote-requests/latest", path_params=(), request_schema="Probe"),
+                 replace(entry(), name="jobs_list", path="/api/v1/jobs", path_params=()))
+        self.assertEqual(len(ApiCatalogue((*CATALOGUE.operations, *apart)).operations), len(CATALOGUE.operations) + 3)
 
     def test_duplicate_names_endpoints_or_bits_are_refused(self):
         create = CATALOGUE.get("create")

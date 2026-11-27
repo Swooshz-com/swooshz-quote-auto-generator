@@ -353,8 +353,9 @@ the owner-approved CI lane.
 
 - Quotation API contract proposal: Run
   `python -m unittest tests.test_quote_api_contract`. The standard-library-only
-  module reads the contract document/spec and uses in-file fake gateway, clock
-  and storage objects. It checks example schemas, recursive closed fields,
+  module reads the contract document and the generated spec, takes operations,
+  states, the forbidden field list and the schema checker (`webapp/api_schema.py`)
+  from their code owners, and uses in-file fake gateway, clock and storage objects. It checks example schemas, recursive closed fields,
   forged authority/query rejection, estimate wording, decimal money, unresolved
   nulls and labelled subtotals, optional admin-set tax, safe error shapes,
   idempotency replay/conflict/expiry, owner isolation, confirmation, closed state
@@ -366,11 +367,23 @@ the owner-approved CI lane.
   arithmetic. Migration wording, priced revision visibility and response evolution
   are checked too. Run `python -m unittest tests.test_sensitive_fixture_scan` for
   the path/category-specific documentation exceptions and secret-marker controls.
-  It imports no app runtime and proves no real HTTP admission, authentication,
+  It proves no real HTTP admission, authentication,
   durable queue/recovery, media limits, artifact privacy/fidelity or retention
   execution. Those require later implementation tests and independent review.
-  No CI command or required-check setting changes; existing discovery includes
-  this module. Browser and owner UAT are not required for this docs/test slice.
+  Existing discovery includes this module. Browser and owner UAT are not required.
+
+- Generated Quotation API spec: Run `python scripts/build_api_spec.py --check`,
+  `python scripts/check_api_compat.py` and
+  `python -m unittest tests.api_spec.test_api_spec_generation tests.api_spec.test_api_compat`.
+  These run only in the fast `Quotation API spec` CI job: `tests/api_spec/` has no
+  `__init__.py`, so Validate app's discovery skips it, and
+  `tests.test_api_catalogue` checks the job still runs every module there. They
+  check the committed spec is exactly the generated one, a stale file fails the
+  check, a server limit change reaches `x-limits` and its schema bounds with no
+  other edit, error codes, states and new entries come from their owners, every
+  example matches its schema, and one fixture per blocked change kind fails the
+  compatibility check while each allowed kind passes. After changing the catalogue
+  or an owning constant, run `python scripts/build_api_spec.py` and commit the spec.
 
 - Pricing-reference startup and first Customer entry: Run
   `python -m unittest tests.test_webapp.WebappServerTest.test_static_next_to_customer_initializes_untouched_commercial_defaults tests.test_webapp.WebappServerTest.test_static_authority_profile_race_discards_late_request_completely`

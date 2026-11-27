@@ -1,6 +1,6 @@
 # Current CI/CD Status
 
-Last updated: 2026-11-25
+Last updated: 2026-11-27
 
 Sources of truth: `.github/workflows/ci.yml`, `.github/workflows/plain-text.yml`,
 and the two Toolkit Programme Sweep workflows
@@ -154,6 +154,16 @@ or deployment behaviour changes accompany this test.
   not the original RED chronology or original development sequence.
 - `Secret scan`: checks the repository with Gitleaks before validation work proceeds.
 - `Dependency audit`: installs Node dependencies with `npm ci` and runs `npm audit --audit-level=high`.
+- `Quotation API spec` (added 27 Nov 2026 for the Quotation API): Python only, no
+  packages installed, after the retrospective fixture job. Runs
+  `python scripts/build_api_spec.py --check` (fails when the committed
+  `docs/quotation-api-v1.openapi.json` differs from the one generated from the
+  feature catalogue and its code owners), `python scripts/check_api_compat.py`
+  (fails on a change that breaks callers of `docs/api/quotation-api-v1-baseline.json`)
+  and the `tests/api_spec/` tests. Validate app does not discover `tests/api_spec/`
+  (no `__init__.py`); `tests.test_api_catalogue`, which it does run, fails if this
+  job stops running any of them. Not a required check; it is checked green on the
+  exact head before every merge like the other jobs.
 - `Nixpacks Python-only contract`: runs `python scripts/validate_nixpacks_python_contract.py`
   and `python -m unittest tests.test_nixpacks_python_contract`. It requires
   the locked Python-only provider/archive/start contract and exact

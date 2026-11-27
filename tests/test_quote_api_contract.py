@@ -1,137 +1,39 @@
 """Offline contract examples and reference-model tests, never runtime qualification.
 
-Only standard-library dependencies; no app imports, sockets, credentials or files
-other than the two directly maintained contract sources are used.
+Only standard-library dependencies and the contract's code owners (the feature catalogue,
+states and schema checker); no sockets, credentials or files other than the generated
+spec and the contract document are used.
 """
 
 import base64
 import copy
-from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 import hashlib
 import itertools
 import json
-import math
 from pathlib import Path
 import re
 import unittest
+
+from webapp import api_schema
+from webapp.api_catalogue import CATALOGUE, FORBIDDEN_FIELDS
+from webapp.quote_states import JOB_TRANSITIONS, REQUEST_TRANSITIONS
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = json.loads((ROOT / "docs/quotation-api-v1.openapi.json").read_text(encoding="utf-8"))
 DOC = (ROOT / "docs/quotation-api-v1.md").read_text(encoding="utf-8")
 SCHEMAS = SPEC["components"]["schemas"]
-OPERATIONS = {
-    ("POST", "/api/v1/quote-requests"),
-    ("POST", "/api/v1/quote-requests/{id}/drafts"),
-    ("POST", "/api/v1/quote-steps/price"),
-    ("POST", "/api/v1/quote-requests/{id}/exports"),
-    ("GET", "/api/v1/jobs/{job_id}"),
-    ("GET", "/api/v1/quote-requests/{id}"),
-    ("GET", "/api/v1/quote-requests/{id}/result"),
-    ("GET", "/api/v1/quote-requests/{id}/artifacts/{kind}"),
-}
-REQUEST_EDGES = {
-    "drafting": {"awaiting_confirmation", "needs_input", "failed", "expired"},
-    "awaiting_confirmation": {"drafting", "pricing", "generating", "expired"},
-    "pricing": {"awaiting_confirmation", "needs_input", "failed", "expired"},
-    "generating": {"completed", "needs_input", "failed", "expired"},
-    "completed": {"drafting", "expired"},
-    "needs_input": {"drafting", "expired"},
-    "failed": {"drafting", "expired"},
-    "expired": set(),
-}
-JOB_EDGES = {"queued": {"running", "failed"}, "running": {"completed", "failed"},
-             "completed": set(), "failed": set()}
-FORBIDDEN = {
-    "internal_override", "role", "tenant", "tenant_id", "workspace_id", "company_id", "account_id",
-    "price", "grant", "view", "confidence", "scores", "prompt", "proposal", "suggestions",
-    "review_choices", "internal_cost", "gst", "markup", "supplier", "supplier_notes", "ai_spend",
-    "profile", "admin", "audit", "ledger", "seal", "matches", "raw_source", "private_path", "provider_response",
-}
-
-
-class ContractViolation(ValueError):
-    """A failed test contract assertion, not a production error mapper."""
+OPERATIONS = {(op.method, op.path) for op in CATALOGUE.operations}
+REQUEST_EDGES = {state: set(moves) for state, moves in REQUEST_TRANSITIONS.items()}
+JOB_EDGES = {state: set(moves) for state, moves in JOB_TRANSITIONS.items()}
+# Request bodies also refuse a client-sent price; the estimate response has its own price object.
+FORBIDDEN = set(FORBIDDEN_FIELDS) | {"price"}
+ContractViolation = api_schema.SchemaViolation
 
 
 def check(schema, value):
-    """Small fail-closed checker for precisely the JSON Schema subset in this spec.
-
-    It deliberately refuses unknown keywords instead of pretending to implement
-    full OpenAPI/JSON Schema validation. Semantic money/media/auth checks are
-    separate: a string pattern cannot establish those invariants.
-    """
-    supported = {"$ref", "type", "properties", "required", "additionalProperties", "items",
-                 "minItems", "maxItems", "uniqueItems", "minLength", "maxLength", "pattern",
-                 "minimum", "maximum", "exclusiveMinimum", "enum", "const", "anyOf", "oneOf",
-                 "format", "examples", "description"}
-    if set(schema) - supported:
-        raise ContractViolation("Unsupported schema keyword")
-    if "$ref" in schema:
-        target = SPEC
-        for part in schema["$ref"].removeprefix("#/").split("/"):
-            target = target[part]
-        check(target, value)
-    for keyword in ("anyOf", "oneOf"):
-        if keyword in schema:
-            matches = 0
-            for variant in schema[keyword]:
-                try:
-                    check(variant, value)
-                    matches += 1
-                except ContractViolation:
-                    pass
-            if matches == 0 or (keyword == "oneOf" and matches != 1):
-                raise ContractViolation("No unique valid variant")
-    kind = schema.get("type")
-    valid_type = {
-        "object": lambda: type(value) is dict,
-        "array": lambda: type(value) is list,
-        "string": lambda: type(value) is str,
-        "integer": lambda: type(value) is int,
-        "number": lambda: type(value) in (int, float) and math.isfinite(value),
-        "boolean": lambda: type(value) is bool,
-        "null": lambda: value is None,
-    }
-    if kind and (kind not in valid_type or not valid_type[kind]()):
-        raise ContractViolation("Wrong type")
-    if "const" in schema and (type(value) is not type(schema["const"]) or value != schema["const"]):
-        raise ContractViolation("Wrong constant")
-    if "enum" in schema and not any(type(value) is type(v) and value == v for v in schema["enum"]):
-        raise ContractViolation("Unknown enum value")
-    if kind == "object":
-        props = schema["properties"]
-        if set(schema["required"]) - value.keys():
-            raise ContractViolation("Missing field")
-        if schema.get("additionalProperties") is not False or value.keys() - props.keys():
-            raise ContractViolation("Unknown field or open schema")
-        for key, child in value.items():
-            check(props[key], child)
-    if kind == "array":
-        if len(value) < schema.get("minItems", 0) or len(value) > schema.get("maxItems", math.inf):
-            raise ContractViolation("Array bound")
-        if schema.get("uniqueItems") and len({json.dumps(v, sort_keys=True) for v in value}) != len(value):
-            raise ContractViolation("Duplicate item")
-        for child in value:
-            check(schema["items"], child)
-    if kind == "string":
-        if len(value) < schema.get("minLength", 0) or len(value) > schema.get("maxLength", math.inf):
-            raise ContractViolation("String bound")
-        if "pattern" in schema and re.search(schema["pattern"], value) is None:
-            raise ContractViolation("String pattern")
-        if schema.get("format") == "date-time":
-            try:
-                datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
-            except ValueError as exc:
-                raise ContractViolation("Invalid timestamp") from exc
-        elif "format" in schema and schema["format"] != "binary":
-            raise ContractViolation("Unsupported format")
-    if kind in ("number", "integer"):
-        if value < schema.get("minimum", -math.inf) or value > schema.get("maximum", math.inf):
-            raise ContractViolation("Numeric bound")
-        if "exclusiveMinimum" in schema and value <= schema["exclusiveMinimum"]:
-            raise ContractViolation("Exclusive bound")
+    api_schema.check(schema, value, root=SPEC)
 
 
 def example(name):

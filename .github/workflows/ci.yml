@@ -95,6 +95,32 @@ jobs:
       - name: Run Nixpacks Python contract tests
         run: python -m unittest tests.test_nixpacks_python_contract
 
+  quotation-api-spec:
+    name: Quotation API spec
+    runs-on: ubuntu-latest
+    needs:
+      - retrospective_exact_starting_head_red
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12.13"
+
+      - name: Check the generated API spec is current
+        run: python scripts/build_api_spec.py --check
+
+      - name: Check API compatibility with the released baseline
+        run: python scripts/check_api_compat.py
+
+      - name: Run API spec tests
+        run: python -m unittest tests.api_spec.test_api_spec_generation tests.api_spec.test_api_compat
+
   quote-basis-click-budget:
     name: Quote Basis click budget
     runs-on: ubuntu-24.04

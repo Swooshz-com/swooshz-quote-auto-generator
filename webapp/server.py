@@ -125,7 +125,7 @@ from webapp.internal_password_auth import (
     InternalAuthStateError, canonical_email,
 )
 from webapp.quote_api_auth import (
-    AdmissionError, QuoteApiAdmission, SERVICE_HEADER, SERVICE_FLAG, STAFF_FLAG,
+    AdmissionError, QuoteApiAdmission, RETRY_AFTER_STATUSES, SERVICE_HEADER, SERVICE_FLAG, STAFF_FLAG,
     flag_enabled, quote_operation,
 )
 from webapp.quote_context import QuoteContext, QUOTE_OPERATIONS, QUOTE_READ_OPERATIONS
@@ -36454,7 +36454,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 "status": exc.status, "error_reference": reference,
             })
             headers = []
-            if exc.status in {429, 503}:
+            if exc.status in RETRY_AFTER_STATUSES:
                 headers.append(("Retry-After", "60"))
             self.send_json(exc.payload(reference), status=exc.status, extra_headers=headers)
         return True
