@@ -1672,6 +1672,12 @@ async function verifyPricingReferenceSelectionCommitsOnCustomerNext(page) {
   if (cancelled.panel !== "customer" || cancelled.pricingReferenceId !== applied.pricingReferenceId || !cancelled.basisCount || !cancelled.outputCount) {
     throw new Error("Cancelling the dependency warning changed quote state: " + JSON.stringify(cancelled));
   }
+  // #443 CU-02: cancelling puts the saved reference back in the select, so pick the new one again.
+  const shownAfterCancel = await page.locator("#profileSelect").inputValue();
+  if (shownAfterCancel === pendingValue) {
+    throw new Error("Cancelling the dependency warning left the new pricing reference selected.");
+  }
+  await page.locator("#profileSelect").selectOption(pendingValue);
 
   await page.locator("#sideNextButton", { hasText: "Next: Quote Company" }).click();
   await page.locator("#quoteDependencyConfirmModal").waitFor({ state: "visible", timeout: 15000 });

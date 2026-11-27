@@ -38,9 +38,9 @@ only and writes all text as inline strings.
 - **Text:** trimmed and NFC-normalised. Any control, format (including bidi
   overrides and zero-width characters), surrogate, private-use, unassigned,
   line-separator or paragraph-separator character is refused. Text that starts
-  with `=`, `+`, `-` or `@` is kept as plain text with a leading apostrophe
-  (the same rule as profile text). Any renderer must also write template text
-  as inline strings, so template text never becomes a live Excel or CSV formula.
+  with `=`, `+`, `-` or `@` is kept exactly as typed, with no added apostrophe:
+  every renderer must write template text as inline strings, so template text
+  never becomes a live Excel formula and shows as typed.
 - **Normalised output:** `read_quote_template` returns the definition with every
   optional key filled in. `quote_template_fingerprint` is the SHA-256 of its
   canonical JSON (sorted keys, no spaces), so key order and spelled-out defaults

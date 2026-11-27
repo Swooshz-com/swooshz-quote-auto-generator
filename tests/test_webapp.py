@@ -19522,7 +19522,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertIn("canManagePricingReferences", js)
         self.assertIn("You do not have access to manage pricing references.", js)
         self.assertIn("elements.settingsButton.hidden = false;", js)
-        self.assertIn('elements.settingsButton.title = canManage ? "Settings" : pricingReferenceNoAccessReason();', js)
+        self.assertIn('elements.settingsButton.title = canManage ? "Settings" : "Only admins can open Settings.";', js)
         self.assertIn("overflow-wrap: anywhere", css)
         self.assertIn("AI analysis failed.", html)
         self.assertIn("showAiFailureBanner", js)
@@ -23404,7 +23404,12 @@ function renderPresetOptions() { renderedOptions += 1; }
 function persistLastProfilePresetSelection(value) { persistedSelection = value; }
 function appIsBusy() { return false; }
 function genericFailureMessages(value) { return value?.errors || ["Failed."]; }
-function applyQuoteDetails() { throw new Error("Import defaults should not apply for a normal save."); }
+let importDefaultsApplied = null;
+function applyQuoteDetails(defaults) {
+  if (!state.importing) throw new Error("Import defaults should not apply for a normal save.");
+  importDefaultsApplied = defaults;
+}
+function invalidateGeneratedExportsForPresentationChange() {}
 function clearGeneratedQuoteState() {}
 function setWorkflowStage() {}
 async function quoteDetailsWithStrongLogoFingerprint(details) { return details; }
@@ -23477,6 +23482,41 @@ eval([
   assert.ok(buttonUpdates >= 1);
   assert.ok(syncedControls >= 1);
   assert.ok(statuses.some((message) => message.includes('Saved "Existing Profile".')));
+
+  // #443 QC-03: importing a profile JSON whose name exists asks first; Cancel keeps the old profile.
+  state.importing = true;
+  const imported = { id: "imported-profile", label: "Existing Profile", description: "Imported", defaults: { company: { name: "Imported Co" } } };
+  await saveNamedCompanyProfile("Existing Profile", { mode: "import", profile: imported });
+  assert.strictEqual(posted.length, 1, "An import over an existing name must not save before the question");
+  assert.strictEqual(elements.profileOverwriteModal.hidden, false);
+  assert.match(overwriteDetail.textContent, /imported quote company defaults/i);
+  hideProfileOverwriteModal({ focusInput: true });
+  assert.strictEqual(posted.length, 1);
+  assert.strictEqual(state.companyProfiles[0].defaults.company.name, "Current Defaults");
+  assert.strictEqual(importDefaultsApplied, null);
+
+  await saveNamedCompanyProfile("Existing Profile", { mode: "import", profile: imported });
+  await confirmProfileOverwriteSave({ preventDefault() {} });
+  assert.strictEqual(posted.length, 2);
+  assert.strictEqual(posted[1].payload.operation, "update");
+  assert.strictEqual(posted[1].payload.id, "legacy-profile-id");
+  assert.deepStrictEqual(posted[1].payload.defaults.company, { name: "Imported Co" });
+  assert.strictEqual(state.companyProfiles.length, 1);
+  assert.strictEqual(state.companyProfiles[0].defaults.company.name, "Imported Co");
+  assert.deepStrictEqual(importDefaultsApplied.company, { name: "Imported Co" });
+
+  // G2 Low 449-3: a name with no ASCII letters must not match by the imported file's id.
+  // The exported file still carries the original's id; the typed name is new, so this is a new copy.
+  await saveNamedCompanyProfile("展台公司", { mode: "import", profile: { ...imported, id: "legacy-profile-id" } });
+  assert.strictEqual(elements.profileOverwriteModal.hidden, true, "A new non-ASCII name matched a profile by the file's id");
+  assert.strictEqual(posted.length, 3);
+  assert.strictEqual(posted[2].payload.operation, "create");
+  assert.strictEqual(posted[2].payload.revision, 0);
+  // The same non-ASCII name typed again matches by name and asks first.
+  await saveNamedCompanyProfile("展台公司", { mode: "import", profile: imported });
+  assert.strictEqual(elements.profileOverwriteModal.hidden, false);
+  assert.strictEqual(posted.length, 3);
+  assert.strictEqual(overwriteStrong.textContent, 'A profile named "展台公司" already exists.');
 })().catch((error) => {
   console.error(error);
   process.exit(1);
@@ -24774,6 +24814,18 @@ assert.strictEqual(
   restoredQuoteSessionSidePanel(completedQuoteViewedFromCustomer, { restoreFurthestPanel: true }),
   "output",
 );
+// #443 RO-02: Quote Basis edited after Output was built, not confirmed again: reopen on Quote Basis.
+const confirmedQuote = {
+  activeSidePanel: "output", workflowStage: "completed", basisConfirmed: true,
+  lineItems: [{ description: "Synthetic row" }], outputRows: [{ description: "Synthetic row" }],
+};
+assert.strictEqual(restoredQuoteSessionSidePanel({ ...confirmedQuote, activeSidePanel: "basis" }, { restoreFurthestPanel: true }), "output");
+for (const activeSidePanel of ["basis", "output"]) {
+  assert.strictEqual(
+    restoredQuoteSessionSidePanel({ ...confirmedQuote, activeSidePanel, basisConfirmed: false }, { restoreFurthestPanel: true }),
+    "basis",
+  );
+}
 assert.strictEqual(restoredQuoteSessionSidePanel({ activeSidePanel: "quote_company" }), "quote_company");
 checkpointValid = false;
 assert.strictEqual(restoredQuoteSessionSidePanel({ activeSidePanel: "quote_company" }), "customer");
@@ -26607,6 +26659,7 @@ eval([
   "markOutputRowsDirty",
   "downloadFileIsFresh",
   "pdfFileIsFresh",
+  "downloadButtonBlockReason",
   "updateDownloadButton",
   "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "outputPriceAuthority", "outputPriceDenomination", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor", "currentReinclusionRows", "withoutReincludedSelection", "retainExcludedBasisPricingRows", "releaseDeletedReinclusionPrice",
   "hideOutputDeleteModal",
@@ -30697,7 +30750,11 @@ const attention = pricingReferencePreviewAttention(result, {
   currencyNeedsReview: !isValidCurrencyCode("GAY"),
 });
 
-assert.ok(attention.some((item) => item.label === "Missing required columns" && item.text === "Markup (markup_multiplier)"));
+// #443 PR-10: staff see the column names only, never the internal field names.
+assert.ok(attention.some((item) => item.label === "Missing required columns" && item.text === "Markup"));
+const allMissing = pricingReferencePreviewAttention({ ...result, missing: ["unit_hint", "internal_cost", "markup_multiplier"] }, {});
+assert.ok(allMissing.some((item) => item.label === "Missing required columns" && item.text === "Unit, Cost, Markup"));
+assert.ok(!JSON.stringify(allMissing).match(/unit_hint|internal_cost|markup_multiplier/));
 assert.ok(attention.some((item) => item.label === "2 rows need edit" && item.text.includes("row 2: unit required")));
 assert.ok(!attention.some((item) => item.label === "Currency review"));
 assert.ok(attention.some((item) => item.label === "Skipped rows" && item.text.includes("2 rows were skipped")));

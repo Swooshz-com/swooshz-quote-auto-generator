@@ -3,6 +3,8 @@ import base64
 import contextlib
 import io
 import json
+import shutil
+import subprocess
 from pathlib import Path
 import socket
 import sqlite3
@@ -208,7 +210,31 @@ class PdfReferenceLimitsTest(unittest.TestCase):
               mock.patch.object(server, "write_local_log") as log,
               mock.patch.object(server, "set_job_state") as state):
             server.finish_draft_job("synthetic-job", {})
-        self.assertIn("96", state.call_args.kwargs["result"]["errors"][0])
+        result = state.call_args.kwargs["result"]
+        self.assertIn("96", result["errors"][0])
+        self.assertEqual(result["limit_message"], "PDF references can have up to 96 pages in total across PDFs.")
+        # The page shows that limit instead of the generic failure, with the reference (#443).
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node is required for the browser message check")
+        script = (
+            "const source = require('fs').readFileSync('webapp/static/app.js', 'utf8');"
+            "const take = (name) => { const start = source.indexOf(`function ${name}(`); let depth = 0;"
+            " for (let i = source.indexOf(') {', start) + 2; i < source.length; i++) {"
+            "  if (source[i] === '{') depth++; if (source[i] === '}' && --depth === 0) return source.slice(start, i + 1); } };"
+            "const GENERIC_FAILURE_MESSAGE = eval(source.match(/^const GENERIC_FAILURE_MESSAGE = (.+);$/m)[1]);"
+            "eval(['errorReferenceFrom', 'genericFailureMessage', 'analysisJobFailureMessage'].map(take).join('\\n'));"
+            "const result = JSON.parse(process.argv[1]);"
+            "console.log(JSON.stringify([analysisJobFailureMessage(result),"
+            " analysisJobFailureMessage({ status: 'failed', error_reference: result.error_reference })]));"
+        )
+        completed = subprocess.run([node, "-e", script, json.dumps(result)], cwd=ROOT, capture_output=True, text=True, timeout=60)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        reference = result["error_reference"]
+        self.assertEqual(json.loads(completed.stdout), [
+            f"PDF references can have up to 96 pages in total across PDFs. Reference: {reference}.",
+            f"Failed. Please try again. Contact support if this keeps happening. Reference: {reference}.",
+        ])
         failure = next(call.args[1] for call in log.call_args_list if call.args[0] == "draft_failed")
         self.assertEqual(failure["pdf_total_pages"], 120)
         self.assertEqual(failure["pdf_total_bytes"], 12345)

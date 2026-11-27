@@ -178,17 +178,20 @@ class HostileDefinitionTest(unittest.TestCase):
                 )
                 self.assert_refused(mutated(lambda d: d.update({"name": "Std" + character})), "name")
 
-    def test_formula_like_text_is_kept_as_plain_text(self):
+    def test_formula_like_text_is_kept_as_typed(self):
+        # The generator writes template text as inline strings, so no apostrophe is added (#443 QT-07).
         for text in ("=SUM(A1:A9)", "+1", "-1+cmd|' /C calc'!A0", "@SUM(1)"):
             with self.subTest(text=text):
                 definition = qt.read_quote_template(mutated(lambda d: block(d, "free_text")["lines"].__setitem__(0, text)))
-                self.assertEqual(block(definition, "free_text")["lines"][0], "'" + text)
+                self.assertEqual(block(definition, "free_text")["lines"][0], text)
                 self.assertEqual(qt.read_quote_template(definition), definition)
         definition = qt.read_quote_template(mutated(lambda d: d["labels"].update({"total": "=1+1"})))
-        self.assertEqual(definition["labels"]["total"], "'=1+1")
+        self.assertEqual(definition["labels"]["total"], "=1+1")
         plain = qt.read_quote_template(mutated(lambda d: d["labels"].update({"total": "  Total (SGD)  "})))
         self.assertEqual(plain["labels"]["total"], "Total (SGD)")
-        self.assert_refused(mutated(lambda d: d["labels"].update({"total": "=" + "x" * 39})), "labels.total")
+        full = qt.read_quote_template(mutated(lambda d: d["labels"].update({"total": "=" + "x" * 39})))
+        self.assertEqual(full["labels"]["total"], "=" + "x" * 39)
+        self.assert_refused(mutated(lambda d: d["labels"].update({"total": "=" + "x" * 40})), "labels.total")
 
     def test_required_blocks_and_layout_rules_are_enforced(self):
         def drop(block_type):
