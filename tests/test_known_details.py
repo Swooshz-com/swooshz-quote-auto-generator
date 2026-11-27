@@ -592,7 +592,7 @@ class StaffBoothSizeContractTest(unittest.TestCase):
                       contracts.DRAFT_SYNTHESIS.field_instructions())
 
     def test_strict_schema_carries_the_staff_size(self):
-        schema = contracts.DRAFT_SYNTHESIS.root.schema()["properties"]["project"]
+        schema = contracts.DRAFT_SYNTHESIS.text_format()["format"]["schema"]["properties"]["project"]
         self.assertEqual(schema["required"], ["booth_width", "booth_depth", "booth_area_sqm", "staff_booth_size"])
         staff = schema["properties"]["staff_booth_size"]
         self.assertEqual(staff["type"], ["object", "null"])
