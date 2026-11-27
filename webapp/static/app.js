@@ -1621,6 +1621,14 @@ function startAnalysisElapsedTimer(startedAt = activeJobStartedAt()) {
 }
 
 const GENERIC_FAILURE_MESSAGE = "Failed. Please try again. Contact support if this keeps happening.";
+// Fixed Re texts the server may send; any other server text is never shown (#430 R2).
+const BASIS_CHAT_REPLY_UNUSABLE_CODE = "basis_chat_reply_unusable";
+const BASIS_CHAT_REPLY_UNUSABLE_MESSAGE = "The AI reply could not be used, so the line was not changed. Please say the change another way.";
+const BASIS_CHAT_ADMISSION_MESSAGES = new Set([
+  "Please type a message about the selected line.",
+  "Please keep the message to 1,000 characters or fewer.",
+  "This line has changed since it was selected. Close Re, open it again on the line and resend.",
+]);
 
 function errorReferenceFrom(data = {}) {
   if (!data || typeof data !== "object") return "";
@@ -13633,24 +13641,22 @@ function canonicalBasisChatLineage(lineage) {
   if (supplied._lineageVersion !== BASIS_CHAT_LINEAGE_VERSION
     || typeof supplied.lineageId !== "string" || !/^lineage-[A-Za-z0-9_-]{8,80}$/.test(supplied.lineageId)
     || typeof supplied.clientOperationId !== "string" || !/^operation-[A-Za-z0-9_-]{8,80}$/.test(supplied.clientOperationId)
-    || !["server", "local_literal", "local_fragment"].includes(supplied.source)
-    || (supplied.source === "server" ? supplied.jobType !== "basis_chat" : supplied.jobType !== null)
-    || (supplied.source === "server" ? typeof supplied.requestedJobId !== "string" || !/^job-[A-Za-z0-9_-]{8,80}$/.test(supplied.requestedJobId) : supplied.requestedJobId !== null)
-    || (supplied.serverJobId !== null && (supplied.source !== "server" || supplied.serverJobId !== supplied.requestedJobId))) {
+    || supplied.source !== "server" || supplied.jobType !== "basis_chat"
+    || typeof supplied.requestedJobId !== "string" || !/^job-[A-Za-z0-9_-]{8,80}$/.test(supplied.requestedJobId)
+    || (supplied.serverJobId !== null && supplied.serverJobId !== supplied.requestedJobId)) {
     throw new TypeError("Basis lineage is invalid.");
   }
   return recursivelyFreezeBasisChatAuthority(supplied);
 }
 
-function newBasisChatLineage(source) {
-  const server = source === "server";
+function newBasisChatLineage() {
   return canonicalBasisChatLineage({
     _lineageVersion: BASIS_CHAT_LINEAGE_VERSION,
     lineageId: newBasisChatLineageId(),
     clientOperationId: newClientOperationId(),
-    source,
-    jobType: server ? "basis_chat" : null,
-    requestedJobId: server ? newClientJobId() : null,
+    source: "server",
+    jobType: "basis_chat",
+    requestedJobId: newClientJobId(),
     serverJobId: null,
   });
 }
@@ -13782,14 +13788,6 @@ function installBasisChatOwner(status, origin, lineage, token) {
   return owner;
 }
 
-function beginLocalBasisChatAuthority(source, origin) {
-  invalidateBasisChatAuthority();
-  const lineage = newBasisChatLineage(source);
-  const token = mintBasisChatRuntimeAuthority("running", origin, lineage);
-  installBasisChatOwner("running", origin, lineage, token);
-  return { lineage, token };
-}
-
 function completeBasisChatOwner(origin, lineage, token, options = {}) {
   if (!basisChatRuntimeAuthorityMatches(token, origin, lineage)) return false;
   let owner;
@@ -13859,7 +13857,7 @@ function canonicalTargetOnlyBasisChatProposal(proposal, authoritativeOrigin, aut
       || !basisChatOriginIsCurrent(origin)
       || !basisChatLineageIsCurrent(lineage, token))) throw new TypeError("Basis proposal authority is stale.");
   const supplied = detachedBasisChatAuthorityValue(proposal);
-  const allowedKeys = ["message", "quoteBasis", "quote_basis", "quoteBasisSections", "quote_basis_sections", "lineItems", "line_items", "literalReplacement", "changedLineCount", "affectedSectionCount", "snippets", "_origin", "_lineage"];
+  const allowedKeys = ["message", "quoteBasis", "quote_basis", "quoteBasisSections", "quote_basis_sections", "lineItems", "line_items", "_origin", "_lineage"];
   if (Reflect.ownKeys(supplied).some((key) => typeof key !== "string" || !allowedKeys.includes(key))) throw new TypeError("Basis proposal envelope contains unsupported keys.");
   if (Object.prototype.hasOwnProperty.call(supplied, "_origin")
     && !basisChatAuthorityStrictEqual(canonicalBasisChatProposalOrigin(supplied._origin), origin)) throw new TypeError("Basis proposal origin conflicts with its owner.");
@@ -14008,7 +14006,7 @@ function renderBasisChatProposalCard(proposal, changedFields = []) {
       <span class="basis-chat-proposal-status">Review</span>
     </div>
     <p class="basis-chat-proposal-summary">${escapeHtml(message)}</p>
-    ${proposal.literalReplacement ? renderLiteralReplacementPreview(proposal) : delta ? `
+    ${delta ? `
       <div class="basis-chat-compare">
         <div class="basis-chat-compare-card">
           <span>Current</span>
@@ -14071,6 +14069,12 @@ function setBasisChatProposal(proposal, authoritativeLineage, token) {
 
 function basisChatFriendlyError(messages = []) {
   if (messages && typeof messages === "object" && !Array.isArray(messages)) {
+    if (messages.failure_code === BASIS_CHAT_REPLY_UNUSABLE_CODE) {
+      const reference = errorReferenceFrom(messages);
+      return reference ? `${BASIS_CHAT_REPLY_UNUSABLE_MESSAGE} Reference: ${reference}.` : BASIS_CHAT_REPLY_UNUSABLE_MESSAGE;
+    }
+    if (messages.status === "blocked" && typeof messages.errors?.[0] === "string"
+      && BASIS_CHAT_ADMISSION_MESSAGES.has(messages.errors[0])) return messages.errors[0];
     return genericFailureMessage(messages);
   }
   return genericFailureMessage();
@@ -14246,219 +14250,6 @@ function normalizeServerBasisChatProposal(proposal, operation, jobResponse, toke
   return canonicalTargetOnlyBasisChatProposal(proposal, normalizedOperation.proposalOrigin, normalizedOperation.lineage, token);
 }
 
-function parseLiteralReplacementCommand(text = "") {
-  const match = String(text || "").trim().match(/^(?:change|replace|switch)(?:\s+all)?\s+(.+?)\s+(?:to|with)\s+(.+?)\s*$/i);
-  if (!match) return null;
-  const from = match[1].trim().replace(/^['"]|['"]$/g, "");
-  const to = match[2].trim().replace(/^['"]|['"]$/g, "");
-  if (!from || !to || from.length > 80 || to.length > 80) return null;
-  return { from, to };
-}
-
-function replaceLiteralText(value = "", from = "", to = "") {
-  if (!from) return { text: String(value || ""), changed: false };
-  const pattern = new RegExp(from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
-  const original = String(value || "");
-  const next = original.replace(pattern, to);
-  return { text: next, changed: next !== original };
-}
-
-function unbracketedCatalogReferenceText(reference = "", detail = "") {
-  const cleanedReference = cleanCustomerQuoteLineText(reference);
-  const cleanedDetail = cleanCustomerQuoteLineText(detail);
-  if (!cleanedReference) return cleanedDetail;
-  return cleanedDetail ? `${cleanedReference} - ${cleanedDetail}` : cleanedReference;
-}
-
-function markBasisLineAsManualPricing(line = {}) {
-  const next = { ...line, custom_pricing: true };
-  const tag = normalizeBasisTag(next.tag);
-  if (tag === "Include" || tag === "Custom") next.custom_confirmed = true;
-  delete next.pricing_keyword;
-  delete next.catalog_description;
-  delete next.pricing_reference_description;
-  delete next.catalog_unit_price;
-  delete next.possible_pricing_matches;
-  delete next.possible_catalog_matches;
-  delete next.pricing_tag;
-  delete next.pricing_status;
-  return next;
-}
-
-function replaceBasisLineReferenceText(line = {}, from = "", to = "") {
-  const bracketed = bracketedCatalogReferenceParts(line.text || "");
-  const targetText = bracketed ? bracketed.reference : line.text || "";
-  const replaced = replaceLiteralText(targetText, from, to);
-  if (!replaced.changed) return { line, changed: false };
-  const nextLine = {
-    ...line,
-    text: bracketed
-      ? unbracketedCatalogReferenceText(replaced.text, bracketed.detail)
-      : replaced.text,
-  };
-  return {
-    line: bracketed ? markBasisLineAsManualPricing(nextLine) : nextLine,
-    changed: true,
-  };
-}
-
-function buildLiteralReplacementProposal(command) {
-  let origin;
-  try {
-    origin = basisChatProposalOrigin();
-  } catch (_error) {
-    return null;
-  }
-  const sections = cloneQuoteBasisSections(origin.quoteBasisSections);
-  const target = rawBasisChatTarget(sections, origin.selector);
-  const currentLine = target.line;
-  const replaced = replaceBasisLineReferenceText(currentLine, command.from, command.to);
-  if (!replaced.changed) return null;
-  const nextLine = {
-    ...replaced.line,
-    tag: bracketedCatalogReferenceParts(currentLine.text || "") ? normalizeBasisTag(currentLine.tag) : "Confirm",
-  };
-  if (isCustomPricingBasisLine(nextLine)) nextLine.custom_pricing = true;
-  sections[target.sectionIndex].lines[target.lineIndex] = nextLine;
-  return {
-    message: "Literal replacement: changed the selected basis line.",
-    literalReplacement: true,
-    changedLineCount: 1,
-    affectedSectionCount: 1,
-    snippets: [{ section: sections[target.sectionIndex].title, before: currentLine.text, after: nextLine.text }],
-    quoteBasis: quoteBasisFromSections(sections),
-    quoteBasisSections: sections,
-    lineItems: state.lineItems,
-    _origin: origin,
-  };
-}
-
-function simpleBasisEditFragment(text = "") {
-  const fragment = cleanCustomerQuoteLineText(text).replace(/^['"]|['"]$/g, "");
-  if (!fragment || fragment.length > 60 || /[?]/.test(fragment)) return "";
-  if (/^(?:change|replace|switch|make|set|update|revise|edit|remove|delete|include|exclude)\b/i.test(fragment)) return "";
-  const words = fragment.match(/[A-Za-z0-9.]+/g) || [];
-  if (!words.length || words.length > 6) return "";
-  const hasEditSignal = /\d/.test(fragment)
-    || /\b(?:mm|cm|sqm|sqft|ft|m|black|white|red|blue|green|yellow|grey|gray|teal|wood|glass|metal|laminate|fabric|vinyl|paint)\b/i.test(fragment);
-  return hasEditSignal ? fragment : "";
-}
-
-function replaceReferenceDimensionToken(value = "", fragment = "") {
-  const replacement = cleanCustomerQuoteLineText(fragment).replace(/\s+/g, "");
-  const replacementMatch = replacement.match(/^(\d+(?:\.\d+)?)(mm|cm|sqm|sqft|ft|m)$/i);
-  if (!replacementMatch) return null;
-  const replacementUnit = replacementMatch[2].toLowerCase();
-  const text = cleanCustomerQuoteLineText(value);
-  const dimensionPattern = /\b\d+(?:\.\d+)?\s*(mm|cm|sqm|sqft|ft|m)\b/gi;
-  const matches = Array.from(text.matchAll(dimensionPattern));
-  if (!matches.length) return null;
-  const sameUnitMatches = matches.filter((match) => String(match[1] || "").toLowerCase() === replacementUnit);
-  const candidates = sameUnitMatches.length ? sameUnitMatches : matches;
-  if (candidates.length !== 1) return null;
-  const match = candidates[0];
-  const start = match.index;
-  const end = start + match[0].length;
-  return `${text.slice(0, start)}${replacement}${text.slice(end)}`;
-}
-
-function basisChatRequestedQuantityValue(text = "") {
-  const cleaned = cleanCustomerQuoteLineText(text).toLowerCase().replace(/,/g, "");
-  const patterns = [
-    /\b(?:qty|quantity|count)\s*(?:to|=|:|is|as)?\s*(\d+(?:\.\d+)?)\b/i,
-    /\b(\d+(?:\.\d+)?)\s*(?:qty|quantity|count)\b/i,
-    /\bfrom\s+\d+(?:\.\d+)?\s+to\s+(\d+(?:\.\d+)?)\b/i,
-    /\b(?:make|set|change|update|revise)\s+(?:it|this|that|qty|quantity|count)?\s*(?:to\s+)?(\d+(?:\.\d+)?)\s*(?:nos?\.?|pcs?|pieces?|units?|lots?|sets?|each|ea|sqm)\b/i,
-  ];
-  for (const pattern of patterns) {
-    const match = cleaned.match(pattern);
-    if (!match) continue;
-    const quantity = leadingNumber(match[1]);
-    if (quantity !== null && quantity > 0) return formatQuantityNumber(quantity);
-  }
-  return null;
-}
-
-function basisLineTextHasLiteralQuantityWord(line = {}) {
-  const bracketed = bracketedCatalogReferenceParts(line.text || "");
-  if (!bracketed) return false;
-  return /\b(?:qty|quantity)\b/i.test(cleanCustomerQuoteLineText(bracketed.reference || ""));
-}
-
-function buildSelectedLineFragmentReplacementProposal(text = "") {
-  if (state.basisChat.scope !== "line") return null;
-  let origin;
-  try {
-    origin = basisChatProposalOrigin();
-  } catch (_error) {
-    return null;
-  }
-  const sections = cloneQuoteBasisSections(origin.quoteBasisSections);
-  const target = rawBasisChatTarget(sections, origin.selector);
-  const section = sections[target.sectionIndex];
-  const lineIndex = target.lineIndex;
-  const currentLine = target.line;
-  const requestedQuantity = basisChatRequestedQuantityValue(text);
-  if (requestedQuantity !== null && !basisLineTextHasLiteralQuantityWord(currentLine)) {
-    const currentQuantity = leadingNumber(currentLine.quantity);
-    if (currentQuantity === requestedQuantity) return null;
-    const nextLine = { ...currentLine, quantity: requestedQuantity };
-    if (!normalizeUnit(nextLine.unit || "") && normalizeUnit(state.basisChat.unit || "")) {
-      nextLine.unit = state.basisChat.unit;
-    }
-    section.lines[lineIndex] = nextLine;
-    const quoteBasis = quoteBasisFromSections(sections);
-    const unit = normalizeUnit(nextLine.unit || "");
-    return {
-      message: `Change the selected line quantity to ${requestedQuantity}${unit ? ` ${unit}` : ""}?`,
-      quoteBasis,
-      quoteBasisSections: sections,
-      lineItems: Array.isArray(state.lineItems) ? state.lineItems : [],
-      _origin: origin,
-    };
-  }
-  const fragment = simpleBasisEditFragment(text);
-  if (!fragment) return null;
-  const bracketed = bracketedCatalogReferenceParts(currentLine.text || "");
-  const targetText = bracketed ? bracketed.reference : currentLine.text || "";
-  const replacedReference = replaceReferenceDimensionToken(targetText, fragment);
-  if (!replacedReference || cleanCustomerQuoteLineText(replacedReference) === cleanCustomerQuoteLineText(targetText)) return null;
-  let nextLine = {
-    ...currentLine,
-    text: bracketed
-      ? unbracketedCatalogReferenceText(replacedReference, bracketed.detail)
-      : replacedReference,
-  };
-  if (bracketed) nextLine = markBasisLineAsManualPricing(nextLine);
-  section.lines[lineIndex] = nextLine;
-  const quoteBasis = quoteBasisFromSections(sections);
-  return {
-    message: `Change the selected line to '${nextLine.text}'?`,
-    quoteBasis,
-    quoteBasisSections: sections,
-    lineItems: Array.isArray(state.lineItems) ? state.lineItems : [],
-    _origin: origin,
-  };
-}
-
-function renderLiteralReplacementPreview(proposal) {
-  return `
-    <div class="basis-chat-literal-stats">
-      <span>Changed lines: <strong>${proposal.changedLineCount}</strong></span>
-      <span>Affected sections: <strong>${proposal.affectedSectionCount}</strong></span>
-    </div>
-    <div class="basis-chat-compare">
-      ${proposal.snippets.map((snippet) => `
-        <div class="basis-chat-compare-card">
-          <span>${escapeHtml(snippet.section)}</span>
-          <p><strong>Before:</strong> ${escapeHtml(snippet.before)}</p>
-          <p><strong>After:</strong> ${escapeHtml(snippet.after)}</p>
-        </div>
-      `).join("")}
-    </div>
-  `;
-}
-
 async function pollBasisChatOperation(operation, token) {
   let current = canonicalBasisChatOperation(operation);
   while (basisChatOperationIsCurrent(current, token)) {
@@ -14490,7 +14281,7 @@ async function buildAiBasisChatResponse(text, options = {}) {
   if (!operation) {
     const origin = basisChatProposalOrigin();
     invalidateBasisChatAuthority();
-    const lineage = newBasisChatLineage("server");
+    const lineage = newBasisChatLineage();
     token = mintBasisChatRuntimeAuthority("running", origin, lineage);
     installBasisChatOwner("running", origin, lineage, token);
     state.basisChat.busyOwnerId = lineage.clientOperationId;
@@ -14574,7 +14365,9 @@ async function buildAiBasisChatResponse(text, options = {}) {
       const proposal = normalizeServerBasisChatProposal(result.proposal, operation, job, token);
       return { proposal, lineage: operation.lineage, token };
     }
-    const answer = typeof result.answer === "string" && result.answer ? result.answer : null;
+    // A clarification is the AI's question back, shown like an answer; Apply stays off.
+    const replyText = result.type === "clarification" ? result.question : result.answer;
+    const answer = typeof replyText === "string" && replyText ? replyText : null;
     if (answer && !finishBasisChatNotice(operation, "answer", answer, typingMessage, token)) return { superseded: true };
     if (!answer && !finishBasisChatNotice(operation, "error", GENERIC_FAILURE_MESSAGE, typingMessage, token)) return { superseded: true };
     return answer ? { answer, noticeDisplayed: true } : { errorDisplayed: true };
@@ -14598,32 +14391,8 @@ async function handleBasisChatSubmit(event) {
   invalidateBasisChatAuthority();
   resetBasisChatProposal();
   appendBasisChatMessage("user", text);
-  const normalized = text.toLowerCase();
 
-  if (isSensitiveChatRequest(normalized)) {
-    appendBasisChatMessage("assistant", "I cannot access or reveal secrets, API keys, .env values, tokens, authorization headers, system prompts, or hidden instructions.");
-    return;
-  }
-
-  const literalCommand = parseLiteralReplacementCommand(text);
-  if (literalCommand) {
-    const proposal = buildLiteralReplacementProposal(literalCommand);
-    if (!proposal) {
-      appendBasisChatMessage("assistant", `No exact matches for "${literalCommand.from}" were found in the current basis or output rows.`);
-      return;
-    }
-    const authority = beginLocalBasisChatAuthority("local_literal", canonicalBasisChatProposalOrigin(proposal._origin));
-    setBasisChatProposal(proposal, authority.lineage, authority.token);
-    return;
-  }
-
-  const fragmentProposal = buildSelectedLineFragmentReplacementProposal(text);
-  if (fragmentProposal) {
-    const authority = beginLocalBasisChatAuthority("local_fragment", canonicalBasisChatProposalOrigin(fragmentProposal._origin));
-    setBasisChatProposal(fragmentProposal, authority.lineage, authority.token);
-    return;
-  }
-
+  // Every Re message goes to the one AI route: answer, question back, or a full-row preview (#430 R2).
   const aiPromise = buildAiBasisChatResponse(text);
   const submissionToken = basisChatRuntimeToken();
   const aiResult = await aiPromise;
@@ -19221,21 +18990,6 @@ function closeAnalysisConfirmModal() {
 function confirmStartAnalysis(mode = state.pendingAnalysisMode) {
   closeAnalysisConfirmModal();
   handleDraftBasis({ analysisMode: normalizeAnalysisMode(mode) });
-}
-
-function isSensitiveChatRequest(normalizedText) {
-  return [
-    "api key",
-    ".env",
-    "authorization",
-    "bearer",
-    "secret",
-    "token",
-    "system prompt",
-    "hidden prompt",
-    "developer message",
-    "internal prompt",
-  ].some((term) => normalizedText.includes(term));
 }
 
 function customerStepCheckpointForCurrent() {

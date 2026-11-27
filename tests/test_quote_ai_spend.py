@@ -12,7 +12,7 @@ import unittest
 import urllib.error
 from unittest.mock import Mock, patch
 
-from tests.gateway_test_support import synthetic_configuration
+from tests.gateway_test_support import REVISE_LINE_ANSWER_TEXT, synthetic_configuration
 from tests.test_openrouter_gateway import RecordingTransport, completed, envelope
 from tests.test_webapp import local_pricing_fixture_root, valid_payload, wait_for_job
 from webapp import ai_gateway, server
@@ -97,7 +97,7 @@ class QuoteAiSpendTest(unittest.TestCase):
         self.assertEqual(result["draft"], {"status": "reported", "display": "USD 0.01"})
 
         chat = self.bind(store, payload, "basis_chat").claim("job-basis-chat-test")
-        route = self.configuration.route("basis_answer")
+        route = self.configuration.route("basis_line")
         body = json.dumps({"model": route.model, "usage": {"cost": 0.025}})
         failed_http = urllib.error.HTTPError(
             ai_gateway.OPENROUTER_RESPONSES_URL, 503, "synthetic", {}, io.BytesIO(body.encode()),
@@ -109,8 +109,8 @@ class QuoteAiSpendTest(unittest.TestCase):
         retry = error.exception
         self.assertTrue(retry.retryable)
         timeout = ai_gateway.GatewayError("connection_failed", retryable=True)
-        transport = RecordingTransport([retry, timeout, completed(route, usage={"cost": 0})])
-        self.gateway(chat, transport).request("basis_answer", envelope(route))
+        transport = RecordingTransport([retry, timeout, completed(route, text=REVISE_LINE_ANSWER_TEXT, usage={"cost": 0})])
+        self.gateway(chat, transport).request("basis_line", envelope(route))
         self.assertEqual(len(transport.calls), 3)
         result = store.get_quote_session(chat.binding.session_id)["ai_spend"]
         self.assertEqual(result["basis_chat"], {"status": "partial", "display": "USD 0.03"})

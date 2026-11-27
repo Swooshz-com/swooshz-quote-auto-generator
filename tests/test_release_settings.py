@@ -34,6 +34,15 @@ class ReleaseSettingsFileTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertEqual(json.loads(out)["status"], "ok")
 
+    def test_re_uses_one_route_and_no_model_is_below_gpt_6_luna(self) -> None:
+        # Owner (INT-SQAG-202611260011): no AI route below gpt-6-luna, and Re has one route (BASIS_LINE).
+        shared = json.loads(SETTINGS.read_text(encoding="utf-8"))["shared"]
+        models = {name: value for name, value in shared.items() if name.startswith("OPENROUTER_") and name.endswith("_MODEL")}
+        self.assertEqual(set(models.values()) - {"openai/gpt-6-luna", "openai/gpt-6.1-sol"}, set(), models)
+        self.assertEqual(models["OPENROUTER_BASIS_LINE_MODEL"], "openai/gpt-6-luna")
+        self.assertFalse([name for name in shared if name.startswith("OPENROUTER_BASIS_ANSWER_")])
+        self.assertEqual(shared["OPENROUTER_BASIS_LINE_REASONING_EFFORT"], "high")
+
     def test_names_cover_the_env_template_exactly(self) -> None:
         data = json.loads(SETTINGS.read_text(encoding="utf-8"))
         self.assertEqual(checker.settings_names(data), set(checker.parse_template(TEMPLATE)))
@@ -125,6 +134,15 @@ class EnvNamesComparisonTests(unittest.TestCase):
         report = json.loads(out)
         self.assertEqual(report["unexpected"], ["SOMETHING_NEW"])
         self.assertEqual(report["must_be_unset_present"], ["OIDC_CLIENT_ID", "OPENROUTER_DRAFT_SCHEMA_ENABLED"])
+
+    def test_retired_re_answer_route_names_must_be_removed_from_an_app(self) -> None:
+        # The live app still holds them until the deploy that ships the one-route Re removes them.
+        retired = ["OPENROUTER_BASIS_ANSWER_MODEL", "OPENROUTER_BASIS_ANSWER_PROVIDER_ONLY", "OPENROUTER_BASIS_ANSWER_REASONING_EFFORT"]
+        code, out = run_checker("--env-names", str(self.names_file(self.all_names + retired)))
+        self.assertEqual(code, 1)
+        report = json.loads(out)
+        self.assertEqual(report["must_be_unset_present"], retired)
+        self.assertEqual(report["unexpected"], [])
 
     def test_platform_and_image_names_are_ignored(self) -> None:
         names = self.all_names + ["HOSTNAME", "COOLIFY_FQDN", "PATH", "NIXPACKS_PATH"]

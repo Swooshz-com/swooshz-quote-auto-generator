@@ -3703,9 +3703,11 @@ async function startSyntheticGatewayProvider() {
         requests.push({ editRequest, model: String(payload.model || "") });
         const content = JSON.stringify({
           intent: "proposal",
+          answer: null,
+          question: null,
           proposal: {
             message: `Synthetic server-backed proposal for: ${editRequest}`,
-            replacement_line: { text: replacements.get(editRequest), confidence: 93 },
+            replacement_line: { text: replacements.get(editRequest), tag: null, quantity: null, unit: null },
           },
         });
         const body = JSON.stringify({
@@ -3748,7 +3750,7 @@ function isolatedLoadedAppEnvironment(runRoot, overrides = {}) {
     SQAG_DISABLE_DOTENV: "true",
     SQAG_STORAGE_MODE: "local",
     SQAG_ARTIFACT_STORAGE_MODE: "local",
-    ...Object.fromEntries(["DRAFT", "DRAFT_HIGH_QUALITY", "BASIS_LINE", "BASIS_ANSWER", "PRICING_IMPORT", "PRICING_METADATA"].flatMap((suffix) => [
+    ...Object.fromEntries(["DRAFT", "DRAFT_HIGH_QUALITY", "BASIS_LINE", "PRICING_IMPORT", "PRICING_METADATA"].flatMap((suffix) => [
       [`OPENROUTER_${suffix}_MODEL`, `synthetic/${suffix.toLowerCase()}`],
       [`OPENROUTER_${suffix}_REASONING_EFFORT`, "high"],
       [`OPENROUTER_${suffix}_PROVIDER_ONLY`, '["synthetic-fixture"]'],
@@ -3962,16 +3964,28 @@ async function run573LoadedAppOnce(runIndex) {
         unit: "nos",
         proposal: null,
       };
-      const run586Proposal = buildSelectedLineFragmentReplacementProposal("quantity to 2");
-      if (!run586Proposal) throw new Error("Run-586 loaded-app quantity proposal was not built.");
+      // Re has no local shortcut (#430 R2): build the quantity proposal a server reply would give.
+      const run586Origin = basisChatProposalOrigin();
+      const run586Sections = cloneQuoteBasisSections(run586Origin.quoteBasisSections);
+      run586Sections[0].lines[0] = { ...run586Sections[0].lines[0], quantity: 2 };
+      const run586Proposal = {
+        message: "Change the selected line quantity to 2 nos?",
+        quoteBasis: quoteBasisFromSections(run586Sections),
+        quoteBasisSections: run586Sections,
+        lineItems: [],
+        _origin: run586Origin,
+      };
       if (
         run586Proposal._origin?._originVersion !== BASIS_CHAT_PROPOSAL_ORIGIN_VERSION
         || !Object.isFrozen(run586Proposal._origin)
         || !Object.isFrozen(run586Proposal._origin.quoteBasisSections)
         || !Object.isFrozen(run586Proposal._origin.quoteBasisSections[0].lines[0])
-      ) throw new Error("Run-599 local proposal origin was not recursively frozen.");
-      const run586Authority = beginLocalBasisChatAuthority("local_fragment", run586Proposal._origin);
-      setBasisChatProposal(run586Proposal, run586Authority.lineage, run586Authority.token);
+      ) throw new Error("Run-599 proposal origin was not recursively frozen.");
+      invalidateBasisChatAuthority();
+      const run586Lineage = newBasisChatLineage();
+      const run586Token = mintBasisChatRuntimeAuthority("running", run586Proposal._origin, run586Lineage);
+      installBasisChatOwner("running", run586Proposal._origin, run586Lineage, run586Token);
+      setBasisChatProposal(run586Proposal, run586Lineage, run586Token);
       applyBasisChatProposal();
       const assertRun586CanonicalState = (label, sections, basis) => {
         const target = sections.find((section) => section.id === "run586-target");
@@ -4173,12 +4187,12 @@ async function run573LoadedAppOnce(runIndex) {
           quantityLabel: "1 nos",
           proposal: null,
         };
-        if (parseLiteralReplacementCommand(editRequest) || buildSelectedLineFragmentReplacementProposal(editRequest)) {
-          throw new Error(`Run-589 request did not bypass local proposal shortcuts: ${editRequest}`);
+        if (typeof parseLiteralReplacementCommand !== "undefined" || typeof buildSelectedLineFragmentReplacementProposal !== "undefined") {
+          throw new Error(`Run-589 found a local Re shortcut: ${editRequest}`);
         }
         const proposalOrigin = basisChatProposalOrigin();
         invalidateBasisChatAuthority(basisChatRuntimeToken());
-        const lineage = newBasisChatLineage("server");
+        const lineage = newBasisChatLineage();
         const runtimeToken = mintBasisChatRuntimeAuthority("running", proposalOrigin, lineage);
         installBasisChatOwner("running", proposalOrigin, lineage, runtimeToken);
         state.basisChat.busyOwnerId = lineage.clientOperationId;
@@ -4275,9 +4289,12 @@ async function run573LoadedAppOnce(runIndex) {
         }
         state.outputRevision = originalRevision;
         const validOrigin = basisChatProposalOrigin();
-        const validAuthority = beginLocalBasisChatAuthority("local_fragment", validOrigin);
-        const validProposal = canonicalTargetOnlyBasisChatProposal(rawProposal, validOrigin, validAuthority.lineage, validAuthority.token);
-        setBasisChatProposal(validProposal, validAuthority.lineage, validAuthority.token);
+        invalidateBasisChatAuthority();
+        const validLineage = newBasisChatLineage();
+        const validToken = mintBasisChatRuntimeAuthority("running", validOrigin, validLineage);
+        installBasisChatOwner("running", validOrigin, validLineage, validToken);
+        const validProposal = canonicalTargetOnlyBasisChatProposal(rawProposal, validOrigin, validLineage, validToken);
+        setBasisChatProposal(validProposal, validLineage, validToken);
         applyBasisChatProposal();
         assertRun589State("authoritative state", state.quoteBasisSections, state.quoteBasis, expectedTargetText, state.lineItems);
         const snapshot = buildSessionSnapshot();

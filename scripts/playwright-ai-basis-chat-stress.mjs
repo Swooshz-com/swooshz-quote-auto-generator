@@ -316,6 +316,18 @@ function basisChatResult(payload) {
       },
     });
   }
+  // #430 R2: the AI's question back, and a reply the app could not use.
+  if (chat.scope === "line" && question.includes("size not correct")) {
+    return { status: "answered", type: "clarification", source: "playwright-mock", question: "What size should this line be?" };
+  }
+  if (chat.scope === "line" && question.includes("unusable reply")) {
+    return {
+      status: "failed",
+      errors: ["The AI reply could not be used, so the line was not changed. Please say the change another way. Reference: ERR-0A1B2C3D."],
+      error_reference: "ERR-0A1B2C3D",
+      failure_code: "basis_chat_reply_unusable",
+    };
+  }
   if (question.includes("what does")) {
     return {
       status: "answered",
@@ -570,10 +582,22 @@ async function main() {
     await page.locator("#basisChatMessages", { hasText: "Kept the current quote basis unchanged." }).waitFor({ timeout: 15000 });
     await submitBasisChat(page, "banana everything but also delete it");
     await page.locator("#basisChatMessages", { hasText: "Failed. Please try again." }).waitFor({ timeout: 15000 });
+    await submitBasisChat(page, "size not correct");
+    await page.locator("#basisChatMessages", { hasText: "What size should this line be?" }).waitFor({ timeout: 15000 });
+    if (!(await page.locator("#basisChatProposal").isHidden()) || !(await page.locator("#basisChatApplyButton").isDisabled())) {
+      throw new Error("A clarification question must not show a proposal or enable Apply.");
+    }
+    await submitBasisChat(page, "unusable reply");
+    await page.locator("#basisChatMessages", {
+      hasText: "The AI reply could not be used, so the line was not changed. Please say the change another way. Reference: ERR-0A1B2C3D.",
+    }).waitFor({ timeout: 15000 });
+    if ((await page.locator("#basisChatPrompt").getAttribute("maxlength")) !== "1000") {
+      throw new Error("The Re message box must stop at 1,000 characters.");
+    }
     await page.evaluate(() => {
       const origin = currentBasisChatAuthority();
       const makeOperation = () => {
-        const lineage = newBasisChatLineage("server");
+        const lineage = newBasisChatLineage();
         return canonicalBasisChatOperation({
           _operationVersion: BASIS_CHAT_OPERATION_VERSION,
           id: lineage.requestedJobId,

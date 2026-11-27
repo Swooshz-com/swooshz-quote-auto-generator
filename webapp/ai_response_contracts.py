@@ -282,3 +282,35 @@ DRAFT_SYNTHESIS = ResponseContract("draft_synthesis_v1", obj(
 # Owner rule (18 Nov 2026): a quote is a prediction, so physical lines always carry a predicted quantity.
 ), measurement_rule="null quantity and unit are only for purely informational lines; every physical line "
    "has a positive quantity and unit, predicted from the booth size, drawing scale and typical sizes when not stated")
+
+
+# Owner (INT-SQAG-202611260010, #430 slice R2): every Re message on a selected line gets one of three outcomes.
+# The reply never carries a price, catalogue field, id or confidence; the server keeps those from the row.
+REVISE_LINE = ResponseContract("revise_line_v1", obj(
+    intent=Field("string", enum=("answer", "clarification", "proposal")),
+    answer=Field("string", nullable=True, nonblank=True,
+                 instruction="the reply to a question about the line; null unless intent is answer"),
+    question=Field("string", nullable=True, nonblank=True,
+                   instruction="one short question to the operator; null unless intent is clarification"),
+    proposal=Field("object", nullable=True, fields=(
+        ("message", Field("string", nonblank=True, instruction="one short approval question")),
+        ("replacement_line", obj(
+            text=Field("string", nonblank=True, instruction="the whole line as it should read, without its quantity"),
+            tag=Field("string", nullable=True, enum=("Include", "Exclude"),
+                      instruction="null keeps the line's current tag"),
+            quantity=Field("number", nullable=True, positive=True, instruction="null keeps the current quantity"),
+            unit=Field("string", nullable=True, nonblank=True, instruction="null keeps the current unit"),
+        )),
+    ), instruction="null unless intent is proposal"),
+), measurement_rule="never invent a number the operator, the line or the staff facts did not state")
+
+REVISE_LINE_PAYLOAD_KEYS = {"answer": "answer", "clarification": "question", "proposal": "proposal"}
+
+
+def admit_revise_line_reply(value):
+    """Contract shape, then exactly the one payload its intent names."""
+    admitted = REVISE_LINE.admit(value)
+    present = {key for key in REVISE_LINE_PAYLOAD_KEYS.values() if key in admitted}
+    if present != {REVISE_LINE_PAYLOAD_KEYS[admitted["intent"]]}:
+        raise ContractViolation("intent_payload")
+    return admitted

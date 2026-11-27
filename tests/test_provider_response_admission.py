@@ -12,7 +12,7 @@ from unittest import mock
 
 from tests import test_webapp as existing
 from tests.gateway_test_support import (install_mock_responses_transport, json_response,
-    FixtureHttpResponse, responses_envelope, synthetic_configuration)
+    FixtureHttpResponse, responses_envelope, revise_line_reply, synthetic_configuration)
 from tests.test_basis_source_provenance import CATALOG
 from tests.test_openai_draft_request_contract import synthetic_image
 
@@ -410,7 +410,7 @@ class ProviderAdapterContractTest(unittest.TestCase):
     def test_all_gateway_callers_share_completion_admission_after_one_send(self):
         configs=existing.SYNTHETIC_DRAFT_CONFIG
         cases=(("draft","DRAFT"),("high_quality","DRAFT_HIGH_QUALITY"),("line","BASIS_LINE"),
-               ("answer","BASIS_ANSWER"),("import","PRICING_IMPORT"),("metadata","PRICING_METADATA"))
+               ("import","PRICING_IMPORT"),("metadata","PRICING_METADATA"))
         for route,suffix in cases:
             for mode in ("completed","incomplete","refusal"):
                 parsed={"items":[]} if route in {"import","metadata"} else draft()
@@ -426,7 +426,7 @@ class ProviderAdapterContractTest(unittest.TestCase):
                     payload["basis_chat"]={"question":"change 100mm to 150mm" if route=="line" else "What is this?",
                         "scope":"line" if route=="line" else "quote","field":"platform","line_index":0,
                         "line":"Confirm: 100mm raised platform with needle punch carpet." if route=="line" else ""}
-                    parsed={"intent":"proposal","proposal":{"message":"Change the platform height?","replacement_line":{"tag":"Confirm","text":"150mm raised platform with needle punch carpet.","confidence_pct":90}}} if route=="line" else {"intent":"answer","answer":"Synthetic answer"}
+                    parsed=revise_line_reply(text="150mm raised platform with needle punch carpet.",message="Change the platform height?") if route=="line" else {"intent":"answer","answer":"Synthetic answer"}
                 envelope=responses_envelope(configs["OPENROUTER_"+suffix+"_MODEL"],json.dumps(parsed),status="incomplete" if mode=="incomplete" else "completed")
                 if mode=="refusal": envelope["refusal"]="Synthetic refusal"
                 response=FixtureHttpResponse(envelope)
@@ -462,10 +462,11 @@ class ProviderAdapterContractTest(unittest.TestCase):
     def test_gateway_support_callers_reach_transport_and_refuse_truncation(self):
         # Retains each former support-adapter success/truncation control on its maintained protocol.
         configs=existing.SYNTHETIC_DRAFT_CONFIG
-        for operation,suffix in (("basis_line","BASIS_LINE"),("basis_answer","BASIS_ANSWER"),("pricing_import","PRICING_IMPORT"),("pricing_metadata","PRICING_METADATA")):
+        for operation,suffix in (("basis_line","BASIS_LINE"),("pricing_import","PRICING_IMPORT"),("pricing_metadata","PRICING_METADATA")):
             for status in ("completed","incomplete"):
                 model=configs["OPENROUTER_"+suffix+"_MODEL"]
-                fixture = {"currency": None, "items": []} if operation == "pricing_import" else {"items": []}
+                fixture = ({"currency": None, "items": []} if operation == "pricing_import"
+                           else revise_line_reply("answer") if operation == "basis_line" else {"items": []})
                 envelope=responses_envelope(model,json.dumps(fixture),status=status)
                 response=FixtureHttpResponse(envelope)
                 with (self.subTest(operation=operation,status=status), s.ai_log_tracking_scope({}),

@@ -148,7 +148,7 @@ const lineAt = (page, id) => page.evaluate((lineId) => {
 // the scenario's tag (sections 1-5) or, once the scenario asks for it, `replacement` (section 6).
 const revise = async (page, id, message, replacement = null) => {
   await run.openPanel(page, "basis");
-  if (replacement) await fs.writeFile(path.join(run.runRoot, "basis-chat-reply.json"), JSON.stringify({ confidence_pct: 95, ...replacement }));
+  if (replacement) await fs.writeFile(path.join(run.runRoot, "basis-chat-reply.json"), JSON.stringify({ tag: null, quantity: null, unit: null, ...replacement }));
   const { at } = await lineAt(page, id);
   await page.locator(`#basisReviewSurface [data-revise-section="${at[0]}"][data-revise-line-index="${at[1]}"]`).click();
   await page.locator("#basisChatPrompt").fill(message);

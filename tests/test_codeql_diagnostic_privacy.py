@@ -16,13 +16,13 @@ class DiagnosticPrivacyTest(unittest.TestCase):
     def test_live_smoke_missing_provider_reports_key_names_only(self):
         output = io.StringIO()
         with mock.patch.object(smoke, 'configured_provider', return_value=''), \
-             mock.patch.object(smoke.webapp, 'answer_basis_chat') as provider, \
+             mock.patch.object(smoke.webapp, 'request_configured_basis_chat') as provider, \
              mock.patch.object(sys, 'argv', ['live_ai_basis_chat_smoke.py']), \
              contextlib.redirect_stdout(output):
             self.assertEqual(smoke.main(), 2)
         result = json.loads(output.getvalue())
         self.assertEqual(result['status'], 'blocked')
-        self.assertEqual(result['error'], 'Configure all six OpenRouter operation routes and OPENROUTER_API_KEY in the local environment.')
+        self.assertEqual(result['error'], 'Configure all OpenRouter operation routes and OPENROUTER_API_KEY in the local environment.')
         provider.assert_not_called()
 
     def test_readiness_prints_configuration_names_without_values(self):
@@ -45,7 +45,7 @@ class DiagnosticPrivacyTest(unittest.TestCase):
         marker = 'Synthetic confidential quotation commentary'
         case = {'name': 'synthetic-case', 'basis_chat': {}, 'expect_type': 'answer'}
         with mock.patch.object(smoke, 'base_payload', return_value={}), \
-             mock.patch.object(smoke.webapp, 'answer_basis_chat', return_value={
+             mock.patch.object(smoke.webapp, 'request_configured_basis_chat', return_value={
                  'type': 'answer', 'answer': marker, 'source': 'openai'}):
             result = smoke.run_case(case)
         self.assertEqual(result['status'], 'ok')
@@ -56,7 +56,7 @@ class DiagnosticPrivacyTest(unittest.TestCase):
         marker = 'Synthetic confidential provider request detail'
         case = {'name': 'synthetic-case', 'basis_chat': {}, 'expect_type': 'answer'}
         with mock.patch.object(smoke, 'base_payload', return_value={}), \
-             mock.patch.object(smoke.webapp, 'answer_basis_chat', side_effect=support.webapp.OpenAIAnalysisError(marker)):
+             mock.patch.object(smoke.webapp, 'request_configured_basis_chat', side_effect=support.webapp.OpenAIAnalysisError(marker)):
             result = smoke.run_case(case)
         self.assertEqual(result['status'], 'failed')
         self.assertNotIn(marker, json.dumps(result))
@@ -65,7 +65,7 @@ class DiagnosticPrivacyTest(unittest.TestCase):
     def test_live_smoke_still_rejects_forbidden_model_output(self):
         case = {'name': 'synthetic-case', 'basis_chat': {}, 'expect_type': 'answer'}
         with mock.patch.object(smoke, 'base_payload', return_value={}), \
-             mock.patch.object(smoke.webapp, 'answer_basis_chat', return_value={
+             mock.patch.object(smoke.webapp, 'request_configured_basis_chat', return_value={
                  'type': 'answer', 'answer': 'Traceback: synthetic provider internals', 'source': 'openai'}):
             result = smoke.run_case(case)
         self.assertEqual(result['status'], 'failed')
@@ -77,7 +77,7 @@ class DiagnosticPrivacyTest(unittest.TestCase):
         for source, actual in [(marker, marker), ({'value': marker}, 'answer')]:
             with self.subTest(source_type=type(source).__name__), \
                  mock.patch.object(smoke, 'base_payload', return_value={}), \
-                 mock.patch.object(smoke.webapp, 'answer_basis_chat', return_value={
+                 mock.patch.object(smoke.webapp, 'request_configured_basis_chat', return_value={
                      'type': actual, 'answer': marker, 'source': source}):
                 result = smoke.run_case(case)
             self.assertNotIn(marker, json.dumps(result))

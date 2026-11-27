@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from tests import test_synthesis_contract_repair as synthesis
-from tests.gateway_test_support import responses_envelope, synthetic_configuration
+from tests.gateway_test_support import REVISE_LINE_ANSWER_TEXT, responses_envelope, synthetic_configuration
 from tests.test_ai_response_contracts import canonical_draft
 from tests.test_basis_quantity_retention import MEASURED_NOTE, draft
 from tests.test_openai_draft_request_contract import synthetic_image
@@ -28,6 +28,16 @@ SYNTHESIS_OPTION = "OPENROUTER_DRAFT_SCHEMA_ENABLED"
 CANARY = "synthetic-observation-must-stay-out-of-diagnostics"
 USAGE = {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3, "cost": 0.125}
 
+
+
+def completed_text(operation):
+    # The Re route always holds its reply to the strict revise_line_v1 contract (#430 R2).
+    return REVISE_LINE_ANSWER_TEXT if operation == "basis_line" else '{"observations":["Synthetic"]}'
+
+
+def provider_error_reason(operation, draft_batch):
+    # Gateway-owned contracts (draft batches, the Re route) read an explicit schema code as a schema rejection.
+    return "response_schema_rejected" if draft_batch or operation == "basis_line" else "http_error"
 
 def batch_body(route, count=1):
     prompt = {"type": "input_text", "text": "Synthetic image inspection"}
@@ -377,14 +387,14 @@ class ImageObservationGatewayTest(unittest.TestCase):
             ("unread chunked tail", limit + 1, True, 0, "response_size"),
         )
         for operation, status, case in product(
-            ("draft", "draft_high_quality", "basis_line", "basis_answer"), (200, 400, 503), cases,
+            ("draft", "draft_high_quality", "basis_line"), (200, 400, 503), cases,
         ):
             label, size, chunked, missing, body_failure = case
             with self.subTest(operation=operation, status=status, case=label):
                 gateway, _, _, telemetry, spend = self.gateway(images="true")
                 route = gateway.configuration.route(operation)
                 if status == 200:
-                    reply = responses_envelope(route.model, '{"observations":["Synthetic"]}', usage=USAGE)
+                    reply = responses_envelope(route.model, completed_text(operation), usage=USAGE)
                 else:
                     reply = {"model": route.model, "usage": USAGE,
                              "error": {"code": "unsupported_schema", "message": CANARY}}
@@ -403,7 +413,7 @@ class ImageObservationGatewayTest(unittest.TestCase):
                 draft_batch = operation.startswith("draft")
                 expected = body_failure
                 if not expected and status != 200:
-                    expected = "response_schema_rejected" if draft_batch else "http_error"
+                    expected = provider_error_reason(operation, draft_batch)
                 with mock.patch.object(ai_gateway, "MAX_RESPONSE_BYTES", limit):
                     if expected:
                         with self.assertRaises(ai_gateway.GatewayError) as caught:
@@ -451,13 +461,13 @@ class ImageObservationGatewayTest(unittest.TestCase):
             ("complete trailer", b'0;fixture="done"\r\nX-Test: sample\r\n\r\n', b"", None),
         )
         for operation, status, case in product(
-            ("draft", "draft_high_quality", "basis_line", "basis_answer"), (200, 400, 503), cases,
+            ("draft", "draft_high_quality", "basis_line"), (200, 400, 503), cases,
         ):
             label, tail, headers, failure = case
             with self.subTest(operation=operation, status=status, case=label):
                 gateway, _, _, telemetry, spend = self.gateway(images="true")
                 route = gateway.configuration.route(operation)
-                payload = responses_envelope(route.model, '{"observations":["Synthetic"]}', usage=USAGE)
+                payload = responses_envelope(route.model, completed_text(operation), usage=USAGE)
                 if status != 200:
                     payload = {"model": route.model, "usage": USAGE,
                                "error": {"code": "unsupported_schema", "message": CANARY}}
@@ -467,7 +477,7 @@ class ImageObservationGatewayTest(unittest.TestCase):
                 draft_batch = operation.startswith("draft")
                 expected = failure
                 if not failure and status != 200:
-                    expected = "response_schema_rejected" if draft_batch else "http_error"
+                    expected = provider_error_reason(operation, draft_batch)
                 if expected:
                     with self.assertRaises(ai_gateway.GatewayError) as caught:
                         gateway.request(operation, batch_body(route), draft_batch=draft_batch)
@@ -494,7 +504,7 @@ class ImageObservationGatewayTest(unittest.TestCase):
             b"Transfer-Encoding: gzip, chunked\r\n",
             b"Transfer-Encoding: identity\r\n",
         )
-        for operation, status, extra in product(("draft", "basis_answer"), (200, 503), headers):
+        for operation, status, extra in product(("draft", "basis_line"), (200, 503), headers):
             with self.subTest(operation=operation, status=status, extra=extra):
                 gateway, _, _, telemetry, spend = self.gateway(images="true")
                 route = gateway.configuration.route(operation)
@@ -529,7 +539,7 @@ class ImageObservationGatewayTest(unittest.TestCase):
         cases = (
             ("draft", True), ("draft_high_quality", True),
             ("draft", False), ("draft_high_quality", False),
-            ("basis_line", False), ("basis_answer", False),
+            ("basis_line", False),
         )
         for (operation, draft_batch), status in product(cases, (101, 103, 199, 204, 205, 304)):
             with self.subTest(operation=operation, draft_batch=draft_batch, status=status):
@@ -697,7 +707,7 @@ class ImageObservationGatewayTest(unittest.TestCase):
 
     def test_partial_bodies_never_retry_even_on_retry_eligible_routes(self):
         for operation, status, interruption in product(
-            ("basis_line", "basis_answer"), (200, 503),
+            ("basis_line",), (200, 503),
             ("fixed_length", None, ConnectionResetError, TimeoutError),
         ):
             with self.subTest(operation=operation, status=status, interruption=interruption):
@@ -717,7 +727,12 @@ class ImageObservationGatewayTest(unittest.TestCase):
                 self.assertEqual(error.diagnostics["failure_boundary"], "provider_response_shape")
                 self.assertEqual(error.diagnostics.get("http_status"), 503 if status == 503 else None)
                 self.assertFalse(error.retryable)
-                self.assertNotIn("response_contract_name", error.diagnostics)
+                if operation == "basis_line":
+                    # The contract is named, but a cut-off body is never read as a schema rejection.
+                    self.assertEqual(error.diagnostics["response_contract_name"], "revise_line_v1")
+                    self.assertEqual(error.diagnostics["response_contract_reason"], "response_partial")
+                else:
+                    self.assertNotIn("response_contract_name", error.diagnostics)
                 self.assertNotIn(CANARY, json.dumps(error.diagnostics))
                 self.assertTrue(response.closed)
                 opener.open.assert_called_once()
@@ -727,7 +742,7 @@ class ImageObservationGatewayTest(unittest.TestCase):
 
     def test_basis_retries_pre_response_failures_and_complete_transient_http_errors(self):
         for operation, failure in product(
-            ("basis_line", "basis_answer"), (ConnectionResetError, TimeoutError, urllib.error.HTTPError),
+            ("basis_line",), (ConnectionResetError, TimeoutError, urllib.error.HTTPError),
         ):
             with self.subTest(operation=operation, failure=failure):
                 gateway, _, _, telemetry, spend = self.gateway()
@@ -739,7 +754,7 @@ class ImageObservationGatewayTest(unittest.TestCase):
                 else:
                     opener, failed_response = mock.Mock(), None
                     first_error = failure(CANARY)
-                reply = responses_envelope(route.model, '{"message":"complete"}', usage=USAGE)
+                reply = responses_envelope(route.model, completed_text(operation) if operation == "basis_line" else '{"message":"complete"}', usage=USAGE)
                 success = wire_http_response(200, json.dumps(reply).encode(), truncated=False)
                 opener.open.side_effect = [first_error, success]
                 sleep = mock.Mock()

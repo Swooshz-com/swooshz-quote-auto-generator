@@ -13,7 +13,7 @@ import urllib.error
 import urllib.request
 from types import MappingProxyType
 from typing import Any
-from webapp.ai_response_contracts import ContractViolation, DRAFT_SYNTHESIS
+from webapp.ai_response_contracts import ContractViolation, DRAFT_SYNTHESIS, REVISE_LINE, admit_revise_line_reply
 from webapp.image_observation_contract import (
     IMAGE_OBSERVATIONS,
     admit_image_observations,
@@ -24,7 +24,7 @@ from webapp.pricing_response_contracts import PRICING_RESPONSE_CONTRACTS
 OPENROUTER_RESPONSES_URL = "https://openrouter.ai/api/v1/responses"
 ROUTE_KEYS = MappingProxyType({
     "draft": "DRAFT", "draft_high_quality": "DRAFT_HIGH_QUALITY",
-    "basis_line": "BASIS_LINE", "basis_answer": "BASIS_ANSWER",
+    "basis_line": "BASIS_LINE",
     "pricing_import": "PRICING_IMPORT", "pricing_metadata": "PRICING_METADATA",
 })
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -656,6 +656,13 @@ def admit_response(data,route, *, strict_image_observations=False):
             error = GatewayError("response_pricing_contract", boundary="provider_response_contract")
             error.diagnostics["response_contract_reason"] = exc.reason
             raise error from None
+    if route.operation == "basis_line":
+        try:
+            admit_revise_line_reply(REVISE_LINE.parse_json(texts[0]))
+        except ContractViolation as exc:
+            error = GatewayError("response_revise_contract", boundary="provider_response_contract")
+            error.diagnostics["response_contract_reason"] = exc.reason
+            raise error from None
     # The caller still performs business admission.
     result={"status":"completed","output":copy.deepcopy(output),"model":route.model}
     usage=admitted_usage(data.get("usage"))
@@ -701,8 +708,11 @@ class AiGateway:
         pricing_contract = PRICING_RESPONSE_CONTRACTS.get(operation)
         if pricing_contract is not None:
             contract = pricing_contract
+        # A selected-line Re reply is always held to its strict contract (#430 slice R2).
+        if operation == "basis_line":
+            contract = REVISE_LINE
         body=copy.deepcopy(envelope)
-        gateway_owns_contract = strict_image_observations or pricing_contract is not None
+        gateway_owns_contract = strict_image_observations or pricing_contract is not None or operation == "basis_line"
         if gateway_owns_contract:
             body["text"] = contract.text_format()
         body["provider"]=self.configuration.provider_policy(operation)
@@ -715,7 +725,7 @@ class AiGateway:
         credential=self._credential_reader()
         if not isinstance(credential,str) or not credential or len(credential)>4096 or any(c.isspace() or ord(c)<32 or ord(c)>126 for c in credential):
             raise GatewayError("credential_missing")
-        delays=(2.0,5.0) if operation in {"basis_line","basis_answer"} else ()
+        delays=(2.0,5.0) if operation == "basis_line" else ()
         spend = self._quote_spend
         if spend is not None and not spend.tracks(operation):
             spend = None

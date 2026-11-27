@@ -414,7 +414,8 @@ the owner-approved CI lane.
   usage or cost. Keep this check separate
   from customer documents and the live AI provider.
 
-- Quote basis, `Re`, `Ask For Changes`, AI parsing, or basis UI state: follow `docs/ai-basis-chat-test-playbook.md`, run the mocked tests, and run `npm run playwright:ai-stress` when practical.
+- Quote basis, `Re`, AI parsing, or basis UI state: follow `docs/ai-basis-chat-test-playbook.md`, run the mocked tests, and run `npm run playwright:ai-stress` when practical.
+- `Re` message route (one AI route, three outcomes): run `python -m unittest tests.test_ai_basis_chat_stress tests.test_ai_response_contracts tests.test_openrouter_gateway` and `npm run playwright:ai-stress`. `ReviseLineRouteTest` sends each case through `create_job` with a mocked provider: the owner and agent UAT phrasings ("change to 30", "quantity should be 30", "Change the wording to: ...", Re to another catalogue item, the AI logo line), the G0 walk rows, the answer and clarification outcomes, and every reply rule that refuses (with one log entry naming the rule and one reference). Requests refused before spend (empty, over 1,000 characters, a stale or forged selector) make no AI call and no spend claim. Requests without a selected line are refused the same way (Re has one route and one model). A new reply rule or outcome gets a row in its table.
 - `Re` Apply reaching the quote: run `python -m unittest tests.test_revise_apply_browser` and the Apply test in `tests.test_webapp` (`-k line_revise_preserves`). Apply changes the selected line and its one quote row together (`applyRevisedRow`): with two rows it refuses as stale and writes nothing; with none, Output builds the row from the line as before. The row keeps only a price it already held, checked against the row before the change (`revisedQuoteRowForApply`): a typed price and Included stay through a wording change, also when a catalogue line becomes another item; a catalogue price stays for the same item; a new unit, another item and a price to be discussed ask again; a unit alias (m2, pcs) is no change. A changed size drops Est. Include and Exclude go through the line's own tick (`commitBasisTagPlan`). A line ticked back in keeps its tick through Re, as through a typed size: saved as excluded until Confirm, which restores the price only while the tick still matches. The preview shows each size before the wording, and says when a catalogue price will not be kept. The browser test walks Apply, Confirm, save, reopen, a second Confirm and Excel on own, hand-priced, catalogue, renamed, Included, price to be discussed, excluded and standard rows with siblings compared, then runs the price rule's table on the page's functions and the server's own check. A new price kind or change gets a row in that table.
 - PDF batch measurement retention: run `python -m unittest tests.test_basis_quantity_retention`.
   The offline transport probe covers single-call and observation/synthesis paths with
@@ -625,7 +626,7 @@ the owner-approved CI lane.
 - Browser harness startup and cleanup: run `python -m unittest tests.test_smoke_harness_lifecycle tests.test_owner_harness_lifecycle`. Preserve non-zero startup failures, handle already-exited children, and register exit listeners before signalling. Synthetic browser login must use its actual loopback origin; generated carriers must resolve shared helper imports from the maintained source.
 - Missing AI pricing import configuration: run the Markdown missing-configuration test in `tests.test_webapp` and `tests.test_pricing_import_telemetry`. Assert zero sends, unsaved/non-saveable state, a configuration-required review layout, and matching support references. Keep transport, refusal and invalid-output negative controls distinct.
 
-- AI operation lifetime: run `tests.test_gateway_operation_lifecycle` with the gateway, telemetry and import suites. Cover all six routes, missing/malformed configuration and credentials, success, refusal, response shape and JSON failures, logger exceptions, nested same-feature parents, concurrent threads, and immutable metadata batches. Keep exactly one terminal record per actual send and canonical zero-send validation. The G3 metadata fixture must admit source-backed synthetic metadata through real gateway admission while rejecting other operations and external network access.
+- AI operation lifetime: run `tests.test_gateway_operation_lifecycle` with the gateway, telemetry and import suites. Cover all five routes, missing/malformed configuration and credentials, success, refusal, response shape and JSON failures, logger exceptions, nested same-feature parents, concurrent threads, and immutable metadata batches. Keep exactly one terminal record per actual send and canonical zero-send validation. The G3 metadata fixture must admit source-backed synthetic metadata through real gateway admission while rejecting other operations and external network access.
 
 - AI telemetry attempt numbering, pre-transport validation, provider fallback,
   or model privacy: run `tests.test_telemetry_producer`,
@@ -877,7 +878,7 @@ Supplied arrays, objects and rows must have supported shapes, with no silent
 material row removal. JSON admission accepts one bounded object and rejects
 duplicate keys, array wrappers, extra objects and nested nonfinite numbers. Keep
 the demonstrated fenced/trailing-prose chat consumer until its response contract
-is explicitly changed. All six maintained gateway callers share shape/completion/refusal checks.
+is explicitly changed. All five maintained gateway callers share shape/completion/refusal checks.
 The retained legacy envelope parser tests cover historical consumers only.
 Single-send analysis and pricing calls send once; text retries stay on the captured
 route and never switch model, provider or response parser.
@@ -963,7 +964,7 @@ whole-envelope bounds. Retain the five-PDF control and below/exact/above aggrega
 boundaries. Original PDFs, rendered pages and catalogue visuals keep their order,
 detail levels and independent budgets; draft rendering keeps no debug images.
 
-All six operation routes require explicit namespaced model, reasoning effort and
+All five operation routes require explicit namespaced model, reasoning effort and
 single downstream endpoint settings described in [the gateway contract](ai-gateway.md).
 There are no model defaults or cross-route substitutions. Reasoning must match
 one of the seven supported values exactly, without trimming or case changes.
@@ -975,7 +976,7 @@ sends. Missing-key tests remove their own setting; fixtures must not refill it.
 Deploy configuration comes from process settings only. Poison the dotenv reader
 to prove that missing Coolify settings cannot fall through to a local file.
 Local development keeps its explicit dotenv source. Complete synthetic fixtures
-provide all six routes, even when a test exercises just one. Every operation
+provide all five routes, even when a test exercises just one. Every operation
 captures an immutable configuration for request, retries, metadata batches and
 telemetry. Change settings mid-prompt and between operations to prove snapshot
 stability and later refresh. Client model/effort overrides have no effect.
