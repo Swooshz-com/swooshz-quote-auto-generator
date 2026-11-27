@@ -44,6 +44,9 @@ try {
   assert(JSON.stringify(result.kept) === JSON.stringify(names), "the kept rows are not the file's rows", result.kept);
   // No price is made up from the unit price.
   assert((await rows.locator('[data-preview-field="internal_cost"], [data-preview-field="markup_multiplier"]').evaluateAll((inputs) => inputs.map((input) => input.value))).every((value) => value === ""), "a price was made up");
+  // Cost is what the company pays; the markup cell says what to enter for a list already in selling prices.
+  assert(await row(0).locator('[data-preview-field="markup_multiplier"]').getAttribute("title") === "1 if these are already selling prices",
+    "the markup cell has no hint for selling prices");
   for (let index = 0; index < 3; index++) {
     await fill(index, "internal_cost", "80");
     await fill(index, "markup_multiplier", "0");
@@ -51,6 +54,12 @@ try {
     await fill(index, "markup_multiplier", "1.25");
     assert(await status(index) === "OK", "a completed row is still flagged", await status(index));
   }
+  // The summary follows the rows as they are fixed, before any name is typed, and the cell keeps its focus.
+  result.attentionAfterRows = await attention();
+  assert(!result.attentionAfterRows.includes("markup required") && !result.attentionAfterRows.includes("rows need edit"),
+    "the Needs attention summary still lists fixed rows", result.attentionAfterRows);
+  assert(await page.evaluate(() => document.activeElement?.dataset?.previewField === "markup_multiplier" && document.activeElement.dataset.previewRow === "2"),
+    "the edited cell lost its focus");
   // A duplicate flag leaves both rows as soon as either one is changed.
   await fill(1, "description", names[0]);
   assert((await status(0)).includes("duplicate pricing row") && (await status(1)).includes("duplicate pricing row"), "the duplicate rows are not flagged", [await status(0), await status(1)]);

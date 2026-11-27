@@ -175,7 +175,7 @@ const functions = ["canonicalPricingAuthorityText", "withQuoteStepLoading", "sho
   "applyPendingPricingReferenceSelection", "resetPendingPricingReferenceSelection", "handleProfileSelectionChange",
   "quoteCommercialReviewRequired", "clearQuoteCommercialReview", "clearGeneratedQuoteState", "setDownloadFiles",
   "quoteDraftHasAiAnalysis", "quoteDraftHasOutputState", "quoteHasDerivedResults", "quoteDependencyChangesForNext",
-  "quoteDependencyChangeCopy", "hideQuoteDependencyConfirmModal", "requestQuoteDependencyChangeConfirmation",
+  "quoteDependencyChangeCopy", "hideQuoteDependencyConfirmModal", "cancelQuoteDependencyChange", "requestQuoteDependencyChangeConfirmation",
   "confirmQuoteDependencyChange", "missingCustomerFields", "customerDetailsBlockReason",
   "missingQuoteCompanyFields", "missingDetailFields", "startAnalysisBlockReason", "quoteCompanyDetailsBlockReason",
   "standardServiceDecisionsForSave", "currentStandardServiceDecisions", "normalizeStandardServiceDecisions", "currentReinclusionRows", "withoutReincludedSelection", "buildSessionSnapshot", "pendingReinclusionTagged", "pendingReinclusionDraftBasis", "recordSavedExclusions", "currentQuoteSessionDraftState", "currentQuoteSessionPayload", "buildPayload",
@@ -375,10 +375,23 @@ function control(name, action) {action(); controls.push(name);}
     assert.deepStrictEqual(state.pendingQuoteDependencyChanges, ["pricing_reference"]);
     assert.strictEqual(state.pricingReferenceId, "reference-a"); assert.strictEqual(state.outputRows.length, 1);
   });
-  hideQuoteDependencyConfirmModal();
-  control("cancel preserves committed checkpoint and results", () => {
+  cancelQuoteDependencyChange();
+  control("cancel puts the saved reference back and keeps results", () => {
     assert.deepStrictEqual(state.customerStepCheckpoint, previous);
     assert.strictEqual(state.pricingReferenceId, "reference-a"); assert.strictEqual(state.outputRows.length, 1);
+    assert.strictEqual(elements.quoteDependencyConfirmModal.hidden, true);
+    assert.strictEqual(state.pricingReferenceSelectionIntent, null);
+    assert.strictEqual(elements.profileSelect.value, "company::reference-a");
+  });
+  await goToNextSidePanel();
+  control("next after cancel does not ask again", () => {
+    assert.deepStrictEqual(state.pendingQuoteDependencyChanges, []);
+    assert.strictEqual(elements.quoteDependencyConfirmModal.hidden, true);
+    assert.strictEqual(state.activeSidePanel, "quote_company");
+    assert.strictEqual(state.pricingReferenceId, "reference-a"); assert.strictEqual(state.outputRows.length, 1);
+  });
+  setSidePanel("customer"); selectB();
+  control("pending uncommitted intent is not the checkpoint", () => {
     assert.strictEqual(setSidePanel("quote_company"), false, "pending uncommitted intent is not the checkpoint");
   });
   goToPreviousSidePanel();

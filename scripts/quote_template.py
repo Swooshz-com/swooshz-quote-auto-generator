@@ -85,7 +85,6 @@ TABLE_COLUMN_KEYS = ("position", "quantity", "unit", "description", "unit_price"
 COMPANY_FIELDS = ("header_lines", "project_number", "blank")
 CLIENT_FIELDS = ("client_name", "client_address", "attention", "client_title", "blank")
 QUOTE_FIELDS = ("quote_date", "project_title", "project_number", "blank")
-FORMULA_PREFIXES = ("=", "+", "-", "@")
 HEX_COLOR = re.compile(r"#[0-9A-Fa-f]{6}")
 # Characters that hide, reorder or break text: every control, format, surrogate,
 # private-use and unassigned code point, plus line and paragraph separators.
@@ -155,7 +154,11 @@ def _choice(value: Any, path: str, choices: tuple[str, ...]) -> str:
 
 
 def _text(value: Any, path: str, max_length: int, *, allow_empty: bool = True) -> str:
-    """Return checked display text; formula-like text is kept as plain text with a leading apostrophe."""
+    """Return checked display text as entered (trimmed, NFC).
+
+    Text starting with = + - or @ stays as typed: the generator writes every template text as an
+    inline string, which Excel never runs as a formula, so no apostrophe is needed (and it would show).
+    """
     if not isinstance(value, str):
         _refuse(path, "must be text")
     for character in value:
@@ -164,8 +167,6 @@ def _text(value: Any, path: str, max_length: int, *, allow_empty: bool = True) -
     text = unicodedata.normalize("NFC", value).strip()
     if not text and not allow_empty:
         _refuse(path, "must not be empty")
-    if text.startswith(FORMULA_PREFIXES):
-        text = "'" + text
     if len(text) > max_length:
         _refuse(path, f"must be at most {max_length} characters")
     return text

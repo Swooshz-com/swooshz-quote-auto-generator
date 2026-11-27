@@ -105,6 +105,8 @@ The preview table exposes section, description, unit hint, internal cost, markup
 
 A row with a description but no usable cost or markup, such as a file that gives only a unit price, is an invalid row: it stays in the table with the missing number empty for the admin to enter. The import never derives a cost or markup from another number. Only a row without a description, or over the row limit, is left out, and the preview names each such row and why.
 
+Internal cost is what the company pays; the selling price is cost times markup. A list that is already in selling prices takes markup 1, and the markup cell's hover text says so. A file with no rows to read (an empty file, blank cells only, a CSV with only a header line, or blank Markdown) is refused with "This file has no rows to import." before any AI call.
+
 ## User confirmation before save
 
 Preview generation is not persistence. The company pricing reference is written only after the admin clicks Save Reference.

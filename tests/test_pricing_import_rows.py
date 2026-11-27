@@ -102,6 +102,23 @@ class PricingImportRowsTest(unittest.TestCase):
                 self.assertEqual(ai.call_count, 0 if priced else 1)
                 self.assertEqual(result["layout"] == "sectioned-pricing-workbook", priced)
 
+    def test_a_file_with_no_rows_is_refused_before_the_ai_reader(self):
+        workbook = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        cases = {
+            "empty csv": ("synthetic.csv", "text/csv", b""),
+            "blank cells only csv": ("synthetic.csv", "text/csv", b",,,\n , ,\n"),
+            "header-only csv": ("synthetic.csv", "text/csv", b"Category,Item,Unit,Unit price\n"),
+            "empty xlsx": ("synthetic.xlsx", workbook, fixtures.xlsx_with_rows([[None, None], [" ", None]])),
+            "blank markdown": ("synthetic.md", "text/markdown", b"  \n\t\n"),
+        }
+        for name, (filename, mime, raw) in cases.items():
+            with self.subTest(name):
+                result, ai = preview_file(filename, mime, raw, [row("Display")])
+                ai.assert_not_called()
+                self.assertEqual(result["errors"], ["This file has no rows to import."])
+                self.assertFalse(result["canSave"])
+                self.assertEqual(result.get("items") or [], [])
+
     def test_saving_still_takes_only_priced_rows(self):
         self.assertIsNone(webapp.sanitize_pricing_reference_item(row(internal_cost=None)))
         self.assertIsNone(webapp.sanitize_pricing_reference_item(row(markup_multiplier=0)))

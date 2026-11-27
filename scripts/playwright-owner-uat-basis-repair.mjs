@@ -942,6 +942,9 @@ try {
       assert(!(await page.locator("#excelGeneratingModal").isVisible()), "dependency confirmation started a loading request");
       await page.locator("#cancelQuoteDependencyConfirmButton").click();
       assert(await page.evaluate((before) => JSON.stringify(state.outputRows) === before.rows && state.pricingReferenceId === before.reference, beforeChange), "cancelled reference change altered output");
+      // #443 CU-02: Cancel puts the saved reference back, so the change is picked again before Next.
+      assert(await page.locator("#profileSelect").inputValue() !== replacementOption, "cancelled reference change stayed selected");
+      await page.locator("#profileSelect").selectOption(replacementOption);
       await page.locator("#sideNextButton").click();
       await page.locator("#confirmQuoteDependencyChangeButton").click();
       await page.waitForFunction(() => !appIsBusy() && state.activeSidePanel === "quote_company");

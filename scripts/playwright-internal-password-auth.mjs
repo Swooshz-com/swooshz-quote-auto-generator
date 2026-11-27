@@ -73,6 +73,18 @@ try {
   assert.equal(session.authenticated,true); assert.equal(session.user,null); assert.ok(session.browser_recovery_scope);
   assert.deepEqual(session.staff_identity, { email: "alpha-admin" + "@" + "example.test", role: "admin" });
   await page.locator("#topbarAuthText").getByText("Signed in as alpha-admin" + "@" + "example.test (Admin)", { exact: true }).waitFor();
+  // #443 LF-02: keyboard focus on the top bar links shows the standard 2 px teal outline.
+  await page.keyboard.press("Shift");
+  for (const link of [page.locator("#topbarLogoutLink"), page.locator(".topbar-privacy-link", { hasText: "Terms" }),
+    page.locator(".topbar-privacy-link", { hasText: "Privacy Notice" })]) {
+    await link.focus();
+    const outline = await link.evaluate(element => {
+      const style = getComputedStyle(element);
+      return [element.matches(":focus-visible"), style.outlineStyle, style.outlineWidth, style.outlineColor, style.outlineOffset];
+    });
+    assert.deepEqual(outline, [true, "solid", "2px", "rgb(15, 118, 110)", "2px"], await link.textContent());
+  }
+  await page.locator("body").evaluate(() => document.activeElement?.blur());
   const copied=await request.newContext({storageState:await context.storageState()});
   assert.equal((await copied.get(base+"/logout")).status(),405);
   assert.equal((await copied.post(base+"/logout",{headers:{Origin:base}})).status(),403);
@@ -128,6 +140,40 @@ try {
     buffer: Buffer.alloc(imageLimit) });
   await page.waitForFunction(size => state.images.length === 1 && state.images[0].size === size, imageLimit);
   await page.evaluate(() => removeImageAt(0));
+  // #443: a GIF is refused at Upload, by the picker and by drag and drop, with what to add instead.
+  const typeMessage = "Add JPG, PNG, WebP or PDF files only.";
+  const gif = { name: "synthetic.gif", mimeType: "image/gif", buffer: Buffer.from("GIF89a synthetic") };
+  await page.evaluate(() => setImageUploadStatus(""));
+  await fileInput.setInputFiles(gif);
+  await page.locator("#imageUploadStatus").getByText(typeMessage, { exact: true }).waitFor({ state: "attached" });
+  assert.equal(await page.evaluate(() => state.images.length), 0);
+  await page.evaluate(() => setImageUploadStatus(""));
+  await page.evaluate(async () => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File(["GIF89a synthetic"], "dropped.gif", { type: "image/gif" }));
+    elements.dropzone.dispatchEvent(new DragEvent("drop", { dataTransfer: transfer, bubbles: true, cancelable: true }));
+  });
+  await page.locator("#imageUploadStatus").getByText(typeMessage, { exact: true }).waitFor({ state: "attached" });
+  assert.equal(await page.evaluate(() => state.images.length), 0);
+  await fileInput.setInputFiles([gif, { name: "synthetic.webp", mimeType: "image/webp", buffer: Buffer.from("RIFF synthetic webp") }]);
+  await page.waitForFunction(() => state.images.length === 1 && state.images[0].name === "synthetic.webp");
+  assert.ok((await page.locator("#imageUploadStatus").textContent()).endsWith(typeMessage), "a skipped GIF is not explained");
+  await page.evaluate(() => removeImageAt(0));
+  // #443: a GIF or a logo over 2 MB is refused at once with a plain message; the logo stays as it was.
+  const logoInput = page.locator("#headerLogoInput");
+  const logoMessage = "Use a PNG or JPEG logo of 2 MB or less.";
+  for (const logo of [
+    { name: "synthetic-logo.gif", mimeType: "image/gif", buffer: Buffer.from("GIF89a synthetic") },
+    { name: "synthetic-logo.png", mimeType: "image/png", buffer: Buffer.alloc(2 * 1024 * 1024 + 1) },
+  ]) {
+    await page.evaluate(() => renderPresetStatus(""));
+    await logoInput.setInputFiles(logo);
+    await page.locator("#presetStatus").getByText(logoMessage, { exact: true }).waitFor({ state: "attached" });
+    assert.equal(await page.evaluate(() => state.headerLogo), null, "a refused logo was taken");
+  }
+  await logoInput.setInputFiles({ name: "synthetic-logo.png", mimeType: "image/png", buffer: Buffer.alloc(2 * 1024 * 1024) });
+  await page.waitForFunction(() => state.headerLogo?.name === "synthetic-logo.png");
+  await page.evaluate(() => { state.headerLogo = null; renderHeaderLogoPreview(); renderPresetStatus(""); });
   const cards = page.locator(".dashboard-session-card");
   await cards.nth(1).waitFor();
   assert.equal(await cards.count(), 2);
@@ -187,6 +233,9 @@ try {
   const selected=await (await context.request.get(base+"/api/session")).json();
   assert.deepEqual(selected.staff_identity, { email: "alpha-operator" + "@" + "example.test", role: "operator" });
   await page.locator("#topbarAuthText").getByText("Signed in as alpha-operator" + "@" + "example.test (Operator)", { exact: true }).waitFor();
+  // #443: staff see why Settings is off.
+  assert.equal(await page.locator("#settingsButton").getAttribute("title"), "Only admins can open Settings.");
+  assert.equal(await page.locator("#settingsButton").isDisabled(), true);
   assert.equal(selected.authenticated,true); assert.notEqual(selected.browser_recovery_scope,session.browser_recovery_scope);
   assert.equal((await copied.get(base+"/api/session")).status(),401);
   assert.deepEqual(external,[]);

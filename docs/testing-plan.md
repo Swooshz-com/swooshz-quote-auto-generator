@@ -8,7 +8,9 @@ Every code change must test the features it can affect. A small edit can use foc
 
 Saved profile access is enforced by `webapp/profile_access.py` and the database
 storage adapter. New HTTP saves and imports create personal copies with opaque
-IDs; explicit updates and deletes carry the listed revision. Members can read
+IDs; explicit updates and deletes carry the listed revision. An import whose name
+matches a profile the user may update asks to overwrite it first, then sends an
+explicit update. Members can read
 shared profiles and export or copy them. Personal profiles are visible only to
 their owner, including when the other user is an administrator. Administrators
 manage their own personal profiles and shared profiles; they cannot list, load,
