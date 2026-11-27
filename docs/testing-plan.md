@@ -320,7 +320,13 @@ the owner-approved CI lane.
 ## Feature Coverage Guide
 
 - Disabled quote admission: Run
-  `python -m unittest tests.test_quote_api_contract tests.test_quote_api_auth tests.test_quote_api_tenancy tests.test_quote_api_hardening`.
+  `python -m unittest tests.test_api_catalogue tests.test_quote_api_contract tests.test_quote_api_auth tests.test_quote_api_tenancy tests.test_quote_api_hardening`.
+  `tests.test_api_catalogue` checks the feature catalogue, the one place the API
+  operations are listed: the permission bit each operation has held in stored keys
+  since migration 012 (a swap or removal fails), routes that match the earlier
+  hand-written table on valid and hostile paths, entry checks (staff-only and
+  confirm-first unless an entry says otherwise), handlers that resolve, and body
+  shapes that agree with the OpenAPI spec.
   These exercise exact HTTP methods/routes, separate default-off flags, raw
   singleton token grammar, fixed dummy comparisons, scope, rotation/revocation
   and inclusive expiry, shared admission throttling before registry/hash,
@@ -913,6 +919,9 @@ Use synthetic configuration, fake gateway responses, denied outbound sockets,
 `SQAG_DISABLE_DOTENV=1`, disabled bytecode and approved temporary directories.
 The schema setting defaults off; enable it only in explicit fake-gateway tests.
 Keep existing default-off and saved/history compatibility coverage unchanged.
+A field shape's plain schema lists only the fields a reader must send, and the
+tests check that against what admission accepts left out; the strict schema sent
+to the model still lists every key, with optional fields nullable.
 
 | Strict final-draft state | Required effects |
 | --- | --- |

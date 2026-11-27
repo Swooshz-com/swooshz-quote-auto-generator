@@ -2,9 +2,11 @@
 
 from dataclasses import dataclass
 
+from webapp.api_catalogue import CATALOGUE
 
-QUOTE_OPERATIONS = frozenset({"create", "draft", "price", "export", "poll", "basis", "result", "artifact"})
-QUOTE_READ_OPERATIONS = frozenset({"poll", "basis", "result", "artifact"})
+
+QUOTE_OPERATIONS = CATALOGUE.names()
+QUOTE_READ_OPERATIONS = CATALOGUE.names(scope="quote.read")
 
 
 @dataclass(frozen=True, slots=True)

@@ -12,6 +12,7 @@ from unittest import mock
 from tests.gateway_test_support import synthetic_configuration, responses_envelope
 from tests.test_basis_quantity_retention import draft
 from tests.test_openrouter_gateway import RecordingTransport, envelope
+from tests import field_shape_support
 from tests import test_synthesis_contract_repair as repair_support
 from tests import test_provider_response_admission as admission_support
 from webapp.ai_response_contracts import ContractViolation
@@ -127,6 +128,32 @@ class ContractDefinitionTest(unittest.TestCase):
         walk(root)
         self.assertIn('draft.quote_basis_sections[].lines[].confidence_pct: integer', contracts.DRAFT_SYNTHESIS.field_instructions())
         self.assertNotIn('confidence (or', contracts.DRAFT_SYNTHESIS.field_instructions())
+
+    def test_schema_required_matches_what_admission_accepts_left_out(self):
+        # #306 slice A: a derived API spec must not call a field required when the reader may omit it.
+        for contract in (contracts.DRAFT_SYNTHESIS, contracts.REVISE_LINE):
+            with self.subTest(contract=contract.name):
+                self.assertEqual(field_shape_support.omission_mismatches(contract.root), [])
+        project = contracts.DRAFT_SYNTHESIS.root.schema()['properties']['project']
+        self.assertNotIn('booth_area_sqm', project['required'])
+        self.assertNotIn('staff_booth_size', project['required'])
+        line = contracts.DRAFT_SYNTHESIS.root.schema()['properties']['quote_basis_sections']['items'][
+            'properties']['lines']['items']
+        self.assertNotIn('booth_profile', line['required'])
+        self.assertIn('quantity_estimated', line['required'])
+
+    def test_strict_wire_schema_keeps_every_key_and_refuses_an_optional_non_null_field(self):
+        # Strict structured output needs every key listed; optional fields stay nullable instead.
+        strict = contracts.DRAFT_SYNTHESIS.text_format()['format']['schema']
+        self.assertIn('booth_area_sqm', strict['properties']['project']['required'])
+        self.assertEqual(strict, contracts.DRAFT_SYNTHESIS.root.schema(strict=True))
+        probe = contracts.obj(note=contracts.Field('string', optional=True))
+        self.assertEqual(probe.schema()['required'], [])
+        missing = []
+        probe.inspect({}, '', missing)
+        self.assertEqual(missing, [])
+        with self.assertRaises(ValueError):
+            contracts.ResponseContract('optional_probe', probe).text_format()
 
     def test_contract_tree_generates_schema_admission_and_instructions_together(self):
         # An independent tiny future contract proves extensibility without freezing a matcher shape.
