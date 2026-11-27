@@ -12,6 +12,7 @@ import hmac
 import math
 import re
 import time
+from types import MappingProxyType
 from typing import Protocol
 
 from webapp.api_catalogue import CATALOGUE
@@ -26,15 +27,28 @@ DUMMY_VERIFIER = hashlib.sha256(TOKEN_DOMAIN + b"unknown-credential-dummy").dige
 # Staff writes carry the session-bound CSRF check.
 _STAFF_MUTATIONS = CATALOGUE.names(scope="quote.write")
 _TOKEN_RE = re.compile(r"sqagq1\.([A-Za-z0-9_-]{22})\.([A-Za-z0-9_-]{43})", re.ASCII)
-_ERRORS = {
-    "AUTH_REQUIRED": (401, "Authentication is required.", False),
-    "SCOPE_DENIED": (403, "This operation is not permitted.", False),
-    "CSRF_INVALID": (403, "The session request could not be verified.", False),
-    "NOT_FOUND": (404, "Not found.", False),
-    "INVALID_REQUEST": (400, "The request is invalid.", False),
-    "RATE_LIMITED": (429, "Too many requests. Try again later.", True),
-    "CAPACITY_UNAVAILABLE": (503, "Quote operations are unavailable.", True),
-}
+# Every v1 error code and its HTTP status, in display order. The API spec's error
+# responses come from this table; a code's status never changes once published.
+ERROR_STATUS = MappingProxyType({
+    "INVALID_REQUEST": 400, "AUTH_REQUIRED": 401, "SCOPE_DENIED": 403, "CSRF_INVALID": 403,
+    "NOT_FOUND": 404, "BASIS_STALE": 409, "IDEMPOTENCY_CONFLICT": 409, "RESULT_NOT_READY": 409,
+    "STATE_CONFLICT": 409, "RESULT_EXPIRED": 410, "UPLOAD_LIMIT_EXCEEDED": 413, "UNSUPPORTED_MEDIA": 415,
+    "DESIGN_REQUIRED": 422, "NEEDS_INPUT": 422, "PRICING_REFERENCE_UNAVAILABLE": 422,
+    "RATE_LIMITED": 429, "QUOTA_EXCEEDED": 429, "ANALYSIS_FAILED": 502,
+    "CAPACITY_UNAVAILABLE": 503, "RECOVERY_REQUIRED": 503,
+})
+# Statuses whose answer tells the caller when to retry (the admission boundary sends Retry-After).
+RETRY_AFTER_STATUSES = frozenset({429, 503})
+# The codes admission raises today: message and whether a retry can help.
+_ERRORS = {code: (ERROR_STATUS[code], message, retryable) for code, (message, retryable) in {
+    "AUTH_REQUIRED": ("Authentication is required.", False),
+    "SCOPE_DENIED": ("This operation is not permitted.", False),
+    "CSRF_INVALID": ("The session request could not be verified.", False),
+    "NOT_FOUND": ("Not found.", False),
+    "INVALID_REQUEST": ("The request is invalid.", False),
+    "RATE_LIMITED": ("Too many requests. Try again later.", True),
+    "CAPACITY_UNAVAILABLE": ("Quote operations are unavailable.", True),
+}.items()}
 
 
 class AdmissionError(Exception):

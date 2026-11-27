@@ -28,8 +28,10 @@ IGNORED_LOCAL_ARTIFACT_PATHS = {
 
 class SensitiveFixtureScanTest(unittest.TestCase):
     def test_quote_contract_exceptions_are_path_and_category_specific(self):
-        allowed = ("docs/quotation-api-v1.md", "docs/quotation-api-v1.openapi.json")
-        neighbours = ("docs/quotation-other.md", "fixtures/quotation-api-v1.openapi.json")
+        allowed = ("docs/quotation-api-v1.md", "docs/quotation-api-v1.openapi.json",
+                   "docs/api/quotation-api-v1-baseline.json")
+        neighbours = ("docs/quotation-other.md", "fixtures/quotation-api-v1.openapi.json",
+                      "docs/api/quotation-api-v2-baseline.json", "docs/quotation-api-v1-baseline.json")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             for rel_path in (*allowed, *neighbours):
