@@ -8946,15 +8946,6 @@ body.privacy-page {
   line-height: 1.38;
 }
 
-.basis-chat-literal-stats {
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
-  margin: 8px 0;
-  color: #17345c;
-  font-size: 12px;
-}
-
 
 .settings-section-actions {
   margin: 10px 0;

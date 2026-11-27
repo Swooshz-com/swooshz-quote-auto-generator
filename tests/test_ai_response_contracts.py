@@ -36,6 +36,67 @@ def canonical_draft():
     return value
 
 
+class ReviseLineContractTest(unittest.TestCase):
+    """#430 slice R2: three outcomes, one payload each, no price, id, confidence or Custom tag."""
+
+    def reply(self, intent="proposal", **changes):
+        value = {"intent": intent, "answer": None, "question": None, "proposal": None}
+        if intent == "answer":
+            value["answer"] = "A short answer."
+        elif intent == "clarification":
+            value["question"] = "What size should it be?"
+        else:
+            value["proposal"] = {"message": "Change it?", "replacement_line": {
+                "text": "Synthetic panel", "tag": None, "quantity": 30, "unit": None}}
+        value.update(changes)
+        return value
+
+    def test_schema_is_closed_and_every_field_required(self):
+        schema = contracts.REVISE_LINE.text_format()["format"]["schema"]
+        self.assertEqual(contracts.REVISE_LINE.text_format()["format"]["name"], "revise_line_v1")
+        self.assertIs(contracts.REVISE_LINE.text_format()["format"]["strict"], True)
+        proposal = schema["properties"]["proposal"]
+        row = proposal["properties"]["replacement_line"]
+        for shape in (schema, proposal, row):
+            self.assertFalse(shape["additionalProperties"])
+            self.assertEqual(set(shape["required"]), set(shape["properties"]))
+        self.assertEqual(schema["properties"]["intent"]["enum"], ["answer", "clarification", "proposal"])
+        self.assertEqual(set(row["properties"]), {"text", "tag", "quantity", "unit"})
+        self.assertEqual(row["properties"]["tag"]["enum"], ["Include", "Exclude", None])
+        instructions = contracts.REVISE_LINE.field_instructions()
+        self.assertIn("null unless intent is clarification", instructions)
+        self.assertIn("never invent a number", instructions)
+
+    def test_each_intent_admits_exactly_its_own_payload(self):
+        self.assertEqual(contracts.admit_revise_line_reply(self.reply("answer")), {"intent": "answer", "answer": "A short answer."})
+        self.assertEqual(contracts.admit_revise_line_reply(self.reply("clarification")),
+                         {"intent": "clarification", "question": "What size should it be?"})
+        self.assertEqual(contracts.admit_revise_line_reply(self.reply()),
+                         {"intent": "proposal", "proposal": {"message": "Change it?", "replacement_line": {"text": "Synthetic panel", "quantity": 30}}})
+        row = self.reply()["proposal"]["replacement_line"]
+        refused = {
+            "no payload": (self.reply("answer", answer=None), "intent_payload"),
+            "two payloads": (self.reply(answer="Also"), "intent_payload"),
+            "payload of another intent": (self.reply("clarification", question=None, answer="x"), "intent_payload"),
+            "missing key": ({key: value for key, value in self.reply().items() if key != "question"}, "schema_shape"),
+            "extra key": (self.reply(confidence_pct=90), "schema_shape"),
+            "unknown intent": (self.reply(intent="edit"), "schema_shape"),
+            "blank answer": (self.reply("answer", answer="  "), "schema_shape"),
+            "price": (self.reply(proposal={"message": "x", "replacement_line": {**row, "unit_price": 1}}), "schema_shape"),
+            "custom tag": (self.reply(proposal={"message": "x", "replacement_line": {**row, "tag": "Custom"}}), "schema_shape"),
+            "quantity text": (self.reply(proposal={"message": "x", "replacement_line": {**row, "quantity": "30"}}), "schema_shape"),
+            "negative quantity": (self.reply(proposal={"message": "x", "replacement_line": {**row, "quantity": -1}}), "schema_shape"),
+            "array": ([self.reply()], "schema_shape"),
+        }
+        for name, (value, reason) in refused.items():
+            with self.subTest(case=name), self.assertRaises(ContractViolation) as caught:
+                contracts.admit_revise_line_reply(value)
+            self.assertEqual(caught.exception.reason, reason)
+        with self.assertRaises(ContractViolation) as caught:
+            contracts.REVISE_LINE.parse_json('{"intent":"answer","intent":"proposal"}')
+        self.assertEqual(caught.exception.reason, "schema_json")
+
+
 class ContractDefinitionTest(unittest.TestCase):
     def test_independent_canonical_fields_and_recursive_closed_objects(self):
         schema = contracts.DRAFT_SYNTHESIS.text_format()

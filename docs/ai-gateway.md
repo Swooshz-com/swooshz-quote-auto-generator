@@ -16,8 +16,7 @@ For each suffix below, supply all three server-only configuration names:
 | --- | --- |
 | `DRAFT` | Normal full image/PDF analysis |
 | `DRAFT_HIGH_QUALITY` | High Quality full image/PDF analysis |
-| `BASIS_LINE` | Selected-line changes |
-| `BASIS_ANSWER` | Answers and other basis chat |
+| `BASIS_LINE` | Every `Re` message on a selected line |
 | `PRICING_IMPORT` | Pricing-reference import normalisation |
 | `PRICING_METADATA` | Matching metadata before and after saving |
 
@@ -27,7 +26,7 @@ It is passed literally without trimming, changing case or remapping. A
 syntactically valid pair still needs provider/account/media compatibility proof.
 `PROVIDER_ONLY` is a JSON array containing exactly one reviewed endpoint slug.
 Each operation can pin a different endpoint; no common downstream vendor is
-assumed. All six routes must be complete. There are no source model defaults.
+assumed. All five routes must be complete. There are no source model defaults.
 
 Also configure `OPENROUTER_API_KEY`, a 10-1800-second integer
 `OPENROUTER_REQUEST_TIMEOUT_SECONDS`, and these exact privacy/routing settings:
@@ -131,6 +130,39 @@ Each pricing call sends once. A provider schema rejection requires a
 recognised machine code or schema parameter. Qualify each configured pricing
 route on the installed build before rollout.
 
+## Re (selected-line) response contract
+
+Every Re message on a selected quote-basis line goes to the `BASIS_LINE` route;
+the browser has no local shortcut or word list, and the server decides nothing
+from the message's words. The gateway attaches the strict `revise_line_v1`
+schema to every `basis_line` request and admits the reply before the application
+uses it. The reply is one closed object with `intent` (`answer`, `clarification`
+or `proposal`) and exactly the one payload that intent names (`answer` text,
+`question` text, or `proposal` with `message` and one `replacement_line`); the
+other two are null. `replacement_line` holds only `text`, `tag` (`Include`,
+`Exclude` or null to keep the current tag), `quantity` and `unit` (null keeps
+the current value). It never carries a price, catalogue field, id or confidence.
+`max_output_tokens` is 4,000. Re has this one route and one model: a request
+without a selected line is refused before any spend or AI call, and the reasoning
+effort comes only from `OPENROUTER_BASIS_LINE_REASONING_EFFORT`.
+
+Before any spend claim or send, the server admits the request: a message of at
+most 1,000 characters and a selector that still names the exact current row.
+A refusal returns a fixed message, logs `basis_chat_blocked` with the rule name
+and makes no AI call. After the reply, the server checks that something changed,
+that the text is at most 2,000 characters, that the quantity agrees with any
+quantity written in the text, and that every number in the proposed row was
+stated in the current row, the operator's message, Known details or the booth
+size, or is an area in sqm that is the product of two sizes in the new text.
+When the item changes, the proposed text is the whole new line: the old item's
+detail is never carried onto it. A refused reply fails once with
+`failure_code=basis_chat_reply_unusable`, a plain message and one reference;
+the `basis_chat_failed` log carries `failure_kind=model_output_invalid` and the
+refusing rule in `response_contract_reason`. Contract violations, cut-off and
+refused replies are not replayed; schema rejection by the provider is terminal.
+Transient transport errors keep the two same-route retries. Only Apply in the
+browser changes a row.
+
 ## PDF reference limits
 
 Analysis accepts PDFs and images up to 48 MiB each, 96 pages in total across PDFs and
@@ -193,7 +225,7 @@ body reads and response admission. It refuses redirects, wrong MIME, duplicate
 JSON keys, invalid JSON, body overflow and truncated declared bodies. Requests
 carry `store=false` and no model arrays, tools, plugins or provider conversation
 state. Single-send analysis and pricing calls send once; batched synthesis has
-only the missing-field repair described above. Basis line/answer calls retain
+only the missing-field repair described above. Re (basis line) calls retain
 at most two same-route transient retries with the existing two/five-second delays.
 Auth, payment, permission, unsupported input, refusal and partial output are never
 replayed. Closed canonical Responses error types and native machine codes override
@@ -245,7 +277,7 @@ Per-operation model and effort mappings are recorded for the current candidate.
 Recorded mappings do not prove the effective installed settings or exact
 model/provider/account/media/privacy compatibility. Approved downstream
 endpoint/privacy behaviour, original-PDF-plus-image compatibility,
-identity continuity and successful qualification of all six installed operations
+identity continuity and successful qualification of all five installed operations
 remain acceptance holds.
 Synthetic tests prove source contracts only. No credentials, live inference,
 deployment or customer-record operation is authorised by these instructions.

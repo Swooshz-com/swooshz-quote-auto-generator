@@ -517,11 +517,15 @@ class KnownDetailsDraftTest(unittest.TestCase):
         first = self.payload(injection)
         again = {**first, "project": held}
         draft_prompt = webapp.build_quote_draft_prompt(first)
-        chat_prompt = webapp.build_basis_chat_prompt({**again, "basis_chat": {"question": "Why is carpet included?"}})
+        sections = [{"id": "floor", "title": "Floor", "lines": [{"tag": "Confirm", "text": "Carpet across the booth floor"}]}]
+        chat_prompt = webapp.build_basis_chat_prompt({
+            **again, "quote_basis_sections": sections, "quote_basis": webapp.quote_basis_from_sections(sections),
+            "basis_chat": {"question": "Why is carpet included?", "scope": "line", "field": "floor", "line_index": 0,
+                           "line": "Confirm: Carpet across the booth floor"}})
         for prompt, marker, first in (
             (draft_prompt, "Quote context JSON: ", True),
             (webapp.build_quote_draft_prompt(again), "Quote context JSON: ", False),
-            (chat_prompt, "Quote review context JSON: ", False),
+            (chat_prompt, "Context JSON: ", False),
         ):
             with self.subTest(marker=marker, first=first):
                 instructions, context_json = prompt.split(marker, 1)

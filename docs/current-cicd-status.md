@@ -348,7 +348,7 @@ or deployment behaviour changes accompany this test.
   mode the loopback run fails if Pass B changes any `sqag_` table's row count, telemetry included. The
   production-branch guard (`scripts/neon_branch_guard.py`) is tested offline with a fake production
   host; CI never calls Neon.
-- All six maintained inference operations require `OPENROUTER_API_KEY` and
+- All five maintained inference operations require `OPENROUTER_API_KEY` and
   explicit `OPENROUTER_<SUFFIX>_MODEL`,
   `OPENROUTER_<SUFFIX>_REASONING_EFFORT` and
   `OPENROUTER_<SUFFIX>_PROVIDER_ONLY` settings in the deployed process environment.
