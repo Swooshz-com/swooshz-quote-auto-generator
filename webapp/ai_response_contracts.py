@@ -74,16 +74,23 @@ class Field:
     decimal_wire: bool = False
     # Object only: at least one key group must be fully present and non-null.
     require_any: tuple[tuple[str, ...], ...] = ()
-    # Nullable only: a reply from before the field existed may leave it out.
+    # A reader may leave the field out. AI contracts use it only on nullable fields:
+    # a reply from before the field existed may omit it, while strict mode still
+    # makes the model send every key.
     optional: bool = False
 
-    def schema(self):
+    def schema(self, *, strict=False):
+        """JSON Schema of this shape. Strict structured output requires every key,
+        so ``strict=True`` lists optional fields as required and keeps them nullable."""
         result = {"type": [self.kind, "null"] if self.nullable else self.kind}
         if self.kind == "object":
-            result.update(properties={key: field.schema() for key, field in self.fields},
-                          required=[key for key, _ in self.fields], additionalProperties=False)
+            if strict and any(field.optional and not field.nullable for _, field in self.fields):
+                raise ValueError("Strict output cannot express an optional non-null field.")
+            result.update(properties={key: field.schema(strict=strict) for key, field in self.fields},
+                          required=[key for key, field in self.fields if strict or not field.optional],
+                          additionalProperties=False)
         elif self.kind == "array":
-            result["items"] = self.item.schema()
+            result["items"] = self.item.schema(strict=strict)
         if self.enum:
             result["enum"] = [*self.enum, *([None] if self.nullable else [])]
         return result
@@ -142,7 +149,7 @@ class Field:
                 raise ContractViolation()
             for key, field in self.fields:
                 child = f"{path}.{key}" if path else key
-                if key not in value and field.optional and field.nullable:
+                if key not in value and field.optional:
                     continue
                 if key not in value:
                     missing.append(ContractViolation(field.missing_reason or "schema_shape",
@@ -178,7 +185,7 @@ class ResponseContract:
 
     def text_format(self):
         return {"format": {"type": "json_schema", "name": self.name, "strict": True,
-                           "schema": self.root.schema()}}
+                           "schema": self.root.schema(strict=True)}}
 
     def field_instructions(self):
         return ("Fresh response contract " + self.name + ". " + self.root.instructions()

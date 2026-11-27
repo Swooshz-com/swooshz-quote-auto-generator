@@ -425,6 +425,7 @@ QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS = (
     "rich_text",
 )
 QUOTE_COMMERCIAL_REVIEW_MESSAGE = "Pricing review required: saved quote commercial state requires review before generation."
+QUOTE_EXCHANGE_RATE_INVALID_MESSAGE = "Enter an exchange rate above 0 on the Customer step."
 QUOTE_COMMERCIAL_REVIEW_SCHEMA = "swooshz.quote-commercial-review.v1"
 QUOTE_COMMERCIAL_REVIEW_VERSION = 1
 QUOTE_COMMERCIAL_REVIEW_STATUS = "REVIEW_REQUIRED"
@@ -18843,16 +18844,44 @@ def quote_commercial_review_preflight(
     job_id: str = "",
 ) -> dict[str, Any] | None:
     review = pricing_reference_authority_review(payload, auth_session=auth_session)
-    if not review:
-        return None
-    result: dict[str, Any] = {
-        "status": "blocked",
-        "errors": [QUOTE_COMMERCIAL_REVIEW_MESSAGE],
-        "quoteCommercialReview": copy.deepcopy(review),
-    }
+    if review:
+        result: dict[str, Any] = {
+            "status": "blocked",
+            "errors": [QUOTE_COMMERCIAL_REVIEW_MESSAGE],
+            "quoteCommercialReview": copy.deepcopy(review),
+        }
+    else:
+        rate_refusal = quote_exchange_rate_refusal(payload)
+        if not rate_refusal:
+            return None
+        result = {"status": "blocked", "errors": [rate_refusal]}
     if job_id:
         result["job_id"] = job_id
     return result
+
+
+def quote_exchange_rate_refusal(payload: dict[str, Any]) -> str:
+    """Refuse an exchange rate the request names but cannot use (0, negative, blank, text) instead of reading it as 1.
+
+    A new quote names its rate as `quote_exchange_rate` and in the commercials its quote session is saved with (the
+    same place `quote_session_commercials` reads); a saved quote in its own details. A request that names no rate keeps 1, the rate of a quote in the reference currency.
+    A quote already waiting for pricing review is left to that review.
+    """
+    commercial_state = quote_commercial_state(payload)
+    if commercial_state.get("review_required"):
+        return ""
+    if commercial_state.get("owned"):
+        details = commercial_state.get("details") if isinstance(commercial_state.get("details"), dict) else {}
+        named = [details["exchange_rate"]] if "exchange_rate" in details else []
+    else:
+        session = payload.get("quote_session") if isinstance(payload.get("quote_session"), dict) else payload
+        commercials = session.get("commercials") if isinstance(session.get("commercials"), dict) else {}
+        named = [source[key] for source, key in ((payload, "quote_exchange_rate"), (commercials, "exchange_rate")) if key in source]
+    for value in named:
+        rate = parse_float_or_none(value) if not isinstance(value, bool) else None
+        if rate is None or rate <= 0:
+            return QUOTE_EXCHANGE_RATE_INVALID_MESSAGE
+    return ""
 
 
 def quote_commercial_persistence_preflight(
@@ -36071,6 +36100,10 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                     },
                     status=400,
                 )
+                return
+            rate_refusal = quote_exchange_rate_refusal(payload)
+            if rate_refusal:
+                self.send_json({"status": "blocked", "errors": [rate_refusal]}, status=400)
                 return
             try:
                 storage = self.current_quote_session_storage()

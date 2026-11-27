@@ -307,6 +307,7 @@ try {
   await reopen(page, sessionId);
   expect("Re, Modify", await tagsOf(page), reEnds);
   await page.locator("#resetQuoteBasisButton").click();
+  await page.locator("#confirmResetDraftButton").click();
   await page.waitForFunction(() => !appIsBusy(), null, { timeout: 20000 });
   await toDashboard(page);
   expect("Reset Draft", { waiting: (await savedQuote(sessionId)).waiting.join() }, { waiting: "" });
@@ -340,7 +341,10 @@ try {
       const index = await editRow("deck", "unit_price_override");
       await page.locator(`[data-output-included-action][data-output-row="${index}"]`).click();
     },
-    "Reset Output": async () => { await page.locator("#resetOutputButton").click(); },
+    "Reset Output": async () => {
+      await page.locator("#resetOutputButton").click();
+      await page.locator("#confirmResetDraftButton").click();
+    },
     "a deleted row": async () => {
       await page.locator(`[data-output-delete-row="${await outputIndex("socket")}"]`).click();
       await page.locator("#confirmOutputDeleteButton").click();

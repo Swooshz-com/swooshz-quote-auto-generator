@@ -14,6 +14,7 @@ import re
 import time
 from typing import Protocol
 
+from webapp.api_catalogue import CATALOGUE
 from webapp.quote_context import QuoteContext, QUOTE_OPERATIONS
 
 
@@ -22,18 +23,9 @@ SERVICE_FLAG = "SQAG_QUOTE_API_SERVICE_ENABLED"
 STAFF_FLAG = "SQAG_QUOTE_API_STAFF_TRANSPORT_ENABLED"
 TOKEN_DOMAIN = b"sqag-quote-api-secret-v1\0"
 DUMMY_VERIFIER = hashlib.sha256(TOKEN_DOMAIN + b"unknown-credential-dummy").digest()
+# Staff writes carry the session-bound CSRF check.
+_STAFF_MUTATIONS = CATALOGUE.names(scope="quote.write")
 _TOKEN_RE = re.compile(r"sqagq1\.([A-Za-z0-9_-]{22})\.([A-Za-z0-9_-]{43})", re.ASCII)
-_ID = r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}"
-_ROUTES = (
-    ("POST", r"/api/v1/quote-requests", "create"),
-    ("POST", rf"/api/v1/quote-requests/{_ID}/drafts", "draft"),
-    ("POST", r"/api/v1/quote-steps/price", "price"),
-    ("POST", rf"/api/v1/quote-requests/{_ID}/exports", "export"),
-    ("GET", rf"/api/v1/jobs/{_ID}", "poll"),
-    ("GET", rf"/api/v1/quote-requests/{_ID}", "basis"),
-    ("GET", rf"/api/v1/quote-requests/{_ID}/result", "result"),
-    ("GET", rf"/api/v1/quote-requests/{_ID}/artifacts/(?:xlsx|pdf)", "artifact"),
-)
 _ERRORS = {
     "AUTH_REQUIRED": (401, "Authentication is required.", False),
     "SCOPE_DENIED": (403, "This operation is not permitted.", False),
@@ -62,8 +54,7 @@ def flag_enabled(value):
 
 
 def quote_operation(method, path):
-    return next((operation for verb, pattern, operation in _ROUTES
-                 if method == verb and re.fullmatch(pattern, path, re.ASCII)), None)
+    return CATALOGUE.match(method, path)
 
 
 def secret_verifier(secret):
@@ -167,7 +158,7 @@ class QuoteApiAdmission:
                 raise AdmissionError("AUTH_REQUIRED")
         if operation not in context.operations:
             raise AdmissionError("SCOPE_DENIED")
-        if not service and operation in {"create", "draft", "price", "export"}:
+        if not service and operation in _STAFF_MUTATIONS:
             if not staff_mutation_guard():
                 raise AdmissionError("CSRF_INVALID")
         return context
