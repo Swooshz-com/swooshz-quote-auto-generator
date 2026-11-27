@@ -11,13 +11,14 @@ from contextlib import contextmanager
 import json
 import re
 
+from webapp.api_catalogue import CATALOGUE
 from webapp.quote_api_auth import ServiceCredential
 from webapp.quote_context import QuoteContext
 
 
 MAX_REVISION = 9223372036854775806
 MAX_TIME = 253402300799
-OPERATIONS = ("create", "draft", "price", "export", "poll", "basis", "result", "artifact")
+OPERATIONS = CATALOGUE.stored_operations()
 ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", re.ASCII)
 RESOURCE = re.compile(r"[A-Za-z0-9_-]{1,128}", re.ASCII)
 CREDENTIAL = re.compile(r"[A-Za-z0-9_-]{21}[AQgw]", re.ASCII)
@@ -126,7 +127,7 @@ def _record(row):
         workspace_id=r["workspace_id"], caller_id=r["caller_id"], owner_subject=r["owner_subject"],
         revision=str(r["credential_revision"]),
         authority_revision=f't{r["tenant_revision"]}:c{r["caller_revision"]}',
-        operations=frozenset(op for bit, op in enumerate(OPERATIONS) if mask & (1 << bit)),
+        operations=CATALOGUE.operations_from_mask(mask),
         expires_at=r["expires_at"], enabled=r["caller_state"] == "active",
         tenant_enabled=r["tenant_state"] == "active",
         revoked="revoked" in (r["caller_state"], r["tenant_state"]))
@@ -193,7 +194,7 @@ class PostgresCredentialRegistry:
             _integer(row["expires_at"], row["created_at"] + 1, MAX_TIME)
         _integer(c["credential_revision"], 1, MAX_REVISION)
         mask = _integer(c["operations_mask"], 0, 255)
-        current_ops = frozenset(op for bit, op in enumerate(OPERATIONS) if mask & (1 << bit))
+        current_ops = CATALOGUE.operations_from_mask(mask)
         if (not context.owns(auth_mode="service", tenant_id=t["tenant_id"], workspace_id=t["workspace_id"],
                              owner_subject=c["owner_subject"], caller_id=c["caller_id"])
                 or c["tenant_id"] != t["tenant_id"] or context.auth_revision != str(c["credential_revision"])
