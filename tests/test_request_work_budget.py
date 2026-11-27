@@ -166,8 +166,9 @@ class RouteBudget:
     EXPECTED = {
         "list signed out": (401, 0, 0, 0, 0, 0),
         "profiles": (200, 1, 2, 6, 6, 0),
-        "list, 2 exported and 1 draft": (200, 1, 2, 36, 28, 2),
-        "list, 3 exported and 1 draft": (200, 1, 2, 52, 40, 3),
+        # One statement and one end fewer than before #443: the list no longer reads AI spend.
+        "list, 2 exported and 1 draft": (200, 1, 2, 35, 27, 2),
+        "list, 3 exported and 1 draft": (200, 1, 2, 51, 39, 3),
         "reopen exported quote": (200, 1, 2, 20, 16, 1),
         "download xlsx": (200, 1, 3, 17, 10, 1),
         "download pdf": (200, 1, 3, 17, 10, 1),
@@ -301,7 +302,7 @@ class RouteBudget:
             self.assertEqual(s.get_job(job_id, fixture.auth)["status"], "completed")
             self.measure(meter, "job poll", get(f"/api/jobs/{job_id}"))
 
-            with mock.patch.object(s.DatabaseSqagStorage, "quote_spend_summaries", side_effect=RuntimeError("synthetic failure")):
+            with mock.patch.object(s, "iso_timestamp_sort_value", side_effect=RuntimeError("synthetic failure")):
                 self.measure(meter, "list that fails after reading", get("/api/quote-sessions"))
 
         for name, expected in self.EXPECTED.items():

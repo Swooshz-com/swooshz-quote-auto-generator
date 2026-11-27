@@ -12951,30 +12951,21 @@ class DatabaseSqagStorage:
 
         return self._run_storage_transaction(write)
 
-    def quote_spend_summaries(self, sessions: list[tuple[dict, dict]]) -> None:
-        if not sessions:
-            return
-        ids = [session["session_id"] for session, _ in sessions]
-        grouped: dict[tuple[str, str], list[dict]] = {}
+    def quote_spend_summary(self, session_id: str, metadata: dict[str, Any]) -> dict[str, Any]:
+        incarnation = quote_spend_incarnation(metadata)
         with self.connection() as connection:
-            for offset in range(0, len(ids), 200):
-                chunk = ids[offset:offset + 200]
-                placeholders = ", ".join("?" for _ in chunk)
-                rows = self._quote_spend_query(connection,
-                    "select session_id, incarnation, category, attempts_json from public.sqag_quote_ai_spend "
-                    f"where workspace_id = ? and session_id in ({placeholders})",
-                    (self.workspace_id, *chunk),
-                ).fetchall()
-                for row in rows:
-                    grouped.setdefault((row["session_id"], row["incarnation"]), []).append({
-                        "category": row["category"], "attempts": json.loads(row["attempts_json"]),
-                    })
-        for session, metadata in sessions:
-            session["ai_spend"] = spend_summary(
-                grouped.get((session["session_id"], quote_spend_incarnation(metadata)), ()),
-                complete=metadata.get("ai_spend_coverage") is True,
-                total_only=bool(session.get("dashboard_summary_only")),
-            )
+            rows = self._quote_spend_query(connection,
+                "select session_id, incarnation, category, attempts_json from public.sqag_quote_ai_spend "
+                "where workspace_id = ? and session_id = ?",
+                (self.workspace_id, session_id),
+            ).fetchall()
+        return spend_summary(
+            (
+                {"category": row["category"], "attempts": json.loads(row["attempts_json"])}
+                for row in rows if row["incarnation"] == incarnation
+            ),
+            complete=metadata.get("ai_spend_coverage") is True,
+        )
 
     def ensure_ready(self) -> None:
         self._ensure_schema(
@@ -17815,7 +17806,6 @@ class DatabaseSqagStorage:
         with self.connection() as connection:
             rows = connection.execute("select metadata_json from sqag_quote_sessions where workspace_id = ?", (self.workspace_id,)).fetchall()
         sessions: list[dict[str, Any]] = []
-        spend_sessions = []
         for row in rows:
             try:
                 metadata = json.loads(row["metadata_json"])
@@ -17842,8 +17832,6 @@ class DatabaseSqagStorage:
                 if staff_dashboard:
                     session["created_by"] = creators.get(self._quote_session_owner_id(metadata), "")
                 sessions.append(session)
-                spend_sessions.append((session, metadata))
-        self.quote_spend_summaries(spend_sessions)
         return sorted(sessions, key=lambda item: (iso_timestamp_sort_value(item.get("updated_at")), clean_text(item.get("session_id")).casefold()), reverse=True)
 
     def get_quote_session(self, session_id: str, *, include_draft_state: bool = False) -> dict[str, Any] | None:
@@ -17860,7 +17848,7 @@ class DatabaseSqagStorage:
             if not self._quote_session_editable_by_current_user(metadata):
                 # Visible to this admin but made by someone else: the page opens it without any editing.
                 session["view_only"] = True
-            self.quote_spend_summaries([(session, metadata)])
+            session["ai_spend"] = self.quote_spend_summary(session["session_id"], metadata)
         return session or None
 
     def _publication_version_lock_identities_for_session(
@@ -32134,7 +32122,9 @@ def committed_quote_session_downloads(
     return downloads
 
 
-def get_quote_session(session_id: str, *, include_draft_state: bool = False) -> dict[str, Any] | None:
+def get_quote_session(
+    session_id: str, *, include_draft_state: bool = False, include_ai_spend: bool = True,
+) -> dict[str, Any] | None:
     safe_id = safe_quote_session_id(session_id, "")
     if not safe_id:
         return None
@@ -32152,7 +32142,8 @@ def get_quote_session(session_id: str, *, include_draft_state: bool = False) -> 
         with quote_session_mutation(safe_id):
             if quote_session_is_retired(safe_id):
                 return None
-            session["ai_spend"] = LocalSqagStorage().quote_spend_summary(metadata)
+            if include_ai_spend:
+                session["ai_spend"] = LocalSqagStorage().quote_spend_summary(metadata)
     return session or None
 
 
@@ -32171,7 +32162,8 @@ def list_quote_sessions() -> list[dict[str, Any]]:
         safe_id = safe_quote_session_id(path.name, "")
         if not safe_id:
             continue
-        session = get_quote_session(safe_id)
+        # The list carries no AI spend; only the single-quote readback does.
+        session = get_quote_session(safe_id, include_ai_spend=False)
         if session:
             sessions.append(session)
     return sorted(

@@ -51,13 +51,12 @@ def _amount(costs, complete):
     return {"status": status, "display": display}
 
 
-def spend_summary(records, *, complete, total_only=False):
+def spend_summary(records, *, complete):
     costs = {category: [] for category in OPERATIONS}
     for record in records:
         costs[record["category"]].extend(None if value is False else value for value in record["attempts"])
     summary = {"total": _amount(costs["draft"] + costs["basis_chat"], complete)}
-    if not total_only:
-        summary.update({category: _amount(values, complete) for category, values in costs.items()})
+    summary.update({category: _amount(values, complete) for category, values in costs.items()})
     return summary
 
 

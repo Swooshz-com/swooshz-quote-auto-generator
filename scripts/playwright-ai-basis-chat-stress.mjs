@@ -508,6 +508,11 @@ async function main() {
     }
   });
   page.on("pageerror", (error) => consoleProblems.push(`pageerror: ${error.message}`));
+  // An analysis or a basis chat reply must not reload the whole quote list (#443).
+  const quoteListLoads = [];
+  page.on("request", (request) => {
+    if (request.method() === "GET" && new URL(request.url()).pathname === "/api/quote-sessions") quoteListLoads.push(request.url());
+  });
 
   try {
     await installMockJobs(page);
@@ -534,6 +539,7 @@ async function main() {
     await page.waitForFunction(() => customerStepCheckpointIsCurrent(), null, { timeout: 15000 });
     await page.locator("#sideNextButton").click();
     await page.locator("#analysisConfirmModal:not([hidden])").waitFor({ timeout: 15000 });
+    const quoteListLoadsBeforeAnalysis = quoteListLoads.length;
     await page.locator("#analysisConfirmStartButton").click();
     await page.locator("#quoteBasisPanel.is-active").waitFor({ timeout: 15000 });
     try {
@@ -575,6 +581,9 @@ async function main() {
       const messages = await page.locator("#basisChatMessages").innerText().catch(() => "");
       const blockReason = await page.evaluate(() => startAnalysisBlockReason());
       throw new Error(`${error.message}\nConsole: ${consoleProblems.join("; ")}\nMessages: ${messages}\nBlock: ${blockReason}`);
+    }
+    if (quoteListLoads.length !== quoteListLoadsBeforeAnalysis) {
+      throw new Error(`The analysis or a basis chat reply reloaded the quote list ${quoteListLoads.length - quoteListLoadsBeforeAnalysis} time(s).`);
     }
     await submitBasisChat(page, "include all lighting and electrical lines");
     await page.locator("#basisChatProposal:not([hidden])", { hasText: "Mark lighting and electrical as included" }).waitFor({ timeout: 15000 });
@@ -807,6 +816,9 @@ async function main() {
     const bodyText = await page.locator("body").innerText();
     for (const forbidden of ["Traceback", "Request body must be valid JSON", "OpenAI chat returned invalid JSON"]) {
       if (bodyText.includes(forbidden)) throw new Error(`Raw internal error leaked to UI: ${forbidden}`);
+    }
+    for (const spendText of ["AI spend", "Analysis / Re-Analyse"]) {
+      if (bodyText.includes(spendText)) throw new Error(`AI spend shown on the Output step: ${spendText}`);
     }
     if (consoleProblems.length) {
       const serverOutput = serverInfo?.output?.join("")?.trim();
