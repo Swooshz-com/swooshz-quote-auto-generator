@@ -90,6 +90,7 @@ replaceOnce('  result.basisLines = draftLines.length;', `  result.basisLines = d
     await tickAndX("tick or X did not apply");
     const resetDraft = async (label) => {
       await page.locator("#resetQuoteBasisButton").click();
+      await page.locator("#confirmResetDraftButton").click();
       await idle();
       await expectRows("Confirm", "Confirm", label);
       await expectBadges({ [PM]: "Confirm", [WASTE]: "Confirm" }, label);

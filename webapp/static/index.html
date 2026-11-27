@@ -1328,6 +1328,27 @@
           </div>
         </section>
       </div>
+      <div class="modal-overlay profile-load-modal" id="resetDraftConfirmModal" role="dialog" aria-modal="true" aria-labelledby="resetDraftConfirmTitle" aria-describedby="resetDraftConfirmText" hidden>
+        <div class="modal-backdrop" data-reset-draft-confirm-close></div>
+        <section class="modal-panel profile-load-panel">
+          <header class="modal-header">
+            <div>
+              <span class="basis-chat-eyebrow">Reset Draft</span>
+              <h3 id="resetDraftConfirmTitle">Reset this step?</h3>
+            </div>
+          </header>
+          <div class="profile-load-body">
+            <div class="profile-load-warning" id="resetDraftConfirmText">
+              <strong>Your changes on this step will be lost.</strong>
+              <span id="resetDraftConfirmDetail" hidden>This also clears Quote Basis and Output.</span>
+            </div>
+          </div>
+          <div class="modal-actions profile-load-actions">
+            <button class="secondary-button" type="button" id="cancelResetDraftButton">Cancel</button>
+            <button class="secondary-button danger-button" type="button" id="confirmResetDraftButton">Reset Draft</button>
+          </div>
+        </section>
+      </div>
       <div class="modal-overlay" id="analysisConfirmModal" role="dialog" aria-modal="true" aria-labelledby="analysisConfirmTitle" hidden>
         <div class="modal-backdrop" data-analysis-confirm-close></div>
         <section class="modal-panel analysis-confirm-panel">
