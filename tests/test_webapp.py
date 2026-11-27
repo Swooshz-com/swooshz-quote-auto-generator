@@ -29032,6 +29032,8 @@ const showQuoteNotSavedModal = message => notSavedDialogs.push(message);
 const clearDashboardOperation = () => { state.dashboardOperation = null; };
 const renderQuoteDashboard = () => {};
 const scrollDashboardSessionIntoView = () => {};
+// The step message popup is a screen effect (its own browser test covers it).
+const stepMessagePopup = { show() {}, close() {} };
 const required = ["isPlainObject", "objectHasExactKeys", "safeQuoteSessionId", "quoteCommercialReviewIdentity",
   "normalizeQuoteCommercialReview", "quoteCommercialReviewRequired", "serverQuoteCommercialReviewFromResponse",
   "adoptServerQuoteCommercialReview", "errorReferenceFrom", "genericFailureMessage", "genericFailureMessages",
