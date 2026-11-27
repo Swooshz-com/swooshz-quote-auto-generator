@@ -271,6 +271,10 @@ DRAFT_SYNTHESIS = ResponseContract("draft_synthesis_v1", obj(
                                 instruction="true only when the line describes the booth itself (its size, floor area, shape, "
                                             "open sides, height or layout) and names nothing to build, supply, hire or do"),
             pricing_keyword=Field("string", nullable=True),
+            # #447: links a line to the design model parts it counts or measures, so the server can check it.
+            model_part_ids=Field("array", nullable=True, optional=True, item=Field("string", nonblank=True),
+                                 instruction="ids from project.design_model_facts.parts this line counts or measures; "
+                                             "null when there are no design_model_facts or the line uses none"),
         )),
     )),
     line_items=Field("array", item=obj(
