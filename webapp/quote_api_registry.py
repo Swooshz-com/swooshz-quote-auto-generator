@@ -17,6 +17,11 @@ from webapp.quote_context import QuoteContext
 
 
 MAX_REVISION = 9223372036854775806
+# Sandbox quotas, also enforced by migration 012's column checks.
+CREATES_PER_MINUTE_PER_TENANT = 15
+ACCEPTED_REQUESTS_PER_UTC_DAY_PER_TENANT = 100
+ACTIVE_JOBS_PER_TENANT = 2
+POLLS_PER_MINUTE_PER_CALLER = 120
 MAX_TIME = 253402300799
 OPERATIONS = CATALOGUE.stored_operations()
 ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", re.ASCII)
@@ -250,12 +255,16 @@ class PostgresCredentialRegistry:
         with self._atomic(connection):
             t, c, now = self._locked(connection, context, operation)
             _require(t["counter_revision"] < MAX_REVISION and c["counter_revision"] < MAX_REVISION)
-            minute, creates = self._bucket(t["create_minute_start"], t["create_minute_count"], now, 60, 15)
-            day, daily = self._bucket(t["create_day_start"], t["create_day_count"], now, 86400, 100)
-            poll_minute, polls = self._bucket(c["poll_minute_start"], c["poll_minute_count"], now, 60, 120)
-            _integer(t["active_jobs"], 0, 2)
+            minute, creates = self._bucket(t["create_minute_start"], t["create_minute_count"], now, 60,
+                                           CREATES_PER_MINUTE_PER_TENANT)
+            day, daily = self._bucket(t["create_day_start"], t["create_day_count"], now, 86400,
+                                      ACCEPTED_REQUESTS_PER_UTC_DAY_PER_TENANT)
+            poll_minute, polls = self._bucket(c["poll_minute_start"], c["poll_minute_count"], now, 60,
+                                              POLLS_PER_MINUTE_PER_CALLER)
+            _integer(t["active_jobs"], 0, ACTIVE_JOBS_PER_TENANT)
             if operation == "create":
-                if creates >= 15 or daily >= 100 or t["active_jobs"] >= 2:
+                if (creates >= CREATES_PER_MINUTE_PER_TENANT or daily >= ACCEPTED_REQUESTS_PER_UTC_DAY_PER_TENANT
+                        or t["active_jobs"] >= ACTIVE_JOBS_PER_TENANT):
                     raise RegistryDenied()
                 changed = connection.execute(self._sql(
                     "update public.sqag_quote_api_tenants set create_minute_start=?, create_minute_count=?, "
@@ -268,7 +277,7 @@ class PostgresCredentialRegistry:
                     "where tenant_id=? and caller_id=? and counter_revision=?"),
                     (c["tenant_id"], c["caller_id"], c["counter_revision"]))
             else:
-                if polls >= 120:
+                if polls >= POLLS_PER_MINUTE_PER_CALLER:
                     raise RegistryDenied()
                 changed = connection.execute(self._sql(
                     "update public.sqag_quote_api_callers set poll_minute_start=?, poll_minute_count=?, "
