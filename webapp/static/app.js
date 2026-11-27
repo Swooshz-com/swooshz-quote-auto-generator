@@ -62,6 +62,7 @@ const QUOTE_COMMERCIAL_REVIEW_SCHEMA = "swooshz.quote-commercial-review.v1";
 const QUOTE_COMMERCIAL_REVIEW_VERSION = 1;
 const QUOTE_COMMERCIAL_REVIEW_STATUS = "REVIEW_REQUIRED";
 const QUOTE_COMMERCIAL_REVIEW_MESSAGE = "Pricing review required: saved quote commercial state requires review before generation.";
+const QUOTE_EXCHANGE_RATE_INVALID_MESSAGE = "Enter an exchange rate above 0.";
 const QUOTE_COMMERCIAL_REVIEW_REASONS = new Set([
   "missing_snapshot",
   "invalid_snapshot",
@@ -688,6 +689,10 @@ const elements = {
   quoteDependencyConfirmText: qs("#quoteDependencyConfirmText"),
   cancelQuoteDependencyConfirmButton: qs("#cancelQuoteDependencyConfirmButton"),
   confirmQuoteDependencyChangeButton: qs("#confirmQuoteDependencyChangeButton"),
+  resetDraftConfirmModal: qs("#resetDraftConfirmModal"),
+  resetDraftConfirmDetail: qs("#resetDraftConfirmDetail"),
+  cancelResetDraftButton: qs("#cancelResetDraftButton"),
+  confirmResetDraftButton: qs("#confirmResetDraftButton"),
   analysisConfirmModal: qs("#analysisConfirmModal"),
   analysisConfirmCancelButton: qs("#analysisConfirmCancelButton"),
   analysisConfirmHighQualityButton: qs("#analysisConfirmHighQualityButton"),
@@ -14565,6 +14570,8 @@ function missingCustomerFields() {
   if (!elements.showName.value.trim()) missing.push("Show name");
   if (!elements.quoteDate.value.trim()) missing.push("Quote date");
   if (!elements.projectNumber.value.trim()) missing.push("Project number");
+  // A rate that is needed and not above 0 is refused, never read as 1 (#442).
+  if (collectQuoteExchangeRate() === null) missing.push("Exchange rate above 0");
   return missing;
 }
 
@@ -16205,6 +16212,10 @@ function handleQuoteDetailFieldChange(event = {}) {
   }
   markQuoteCommercialFieldTouched(event.target);
   syncQuoteExchangeRateField();
+  if (event.type === "change" && event.target === elements.quoteExchangeRate && collectQuoteExchangeRate() === null) {
+    elements.quoteExchangeRate.setCustomValidity(QUOTE_EXCHANGE_RATE_INVALID_MESSAGE);
+    elements.quoteExchangeRate.reportValidity?.();
+  }
   if (commercialChanged && (state.outputRows.length || state.downloadFile || state.pdfFile)) {
     markOutputRowsDirty();
   } else if (quoteCompanyChanged) {
@@ -19201,6 +19212,7 @@ function updateSidePanelNav() {
   const isBasisStep = state.activeSidePanel === "basis";
   const isOutputStep = state.activeSidePanel === "output";
   const busy = appIsBusy() || state.customerStepCheckpointSaveBusy;
+  elements.quoteExchangeRate?.setCustomValidity?.(collectQuoteExchangeRate() === null ? QUOTE_EXCHANGE_RATE_INVALID_MESSAGE : "");
   elements.resetImagesButton.hidden = state.activeSidePanel !== "images";
   elements.clearCustomerButton.hidden = state.activeSidePanel !== "customer";
   elements.clearQuoteCompanyButton.hidden = state.activeSidePanel !== "quote_company";
@@ -19344,6 +19356,96 @@ class ViewOnlyQuoteGuard {
 const viewOnlyQuoteGuard = new ViewOnlyQuoteGuard(elements.quoteFlowPanel, () => state.quoteViewOnly, () => {
   syncControlStates();
   updatePresetButtons();
+});
+
+// Reset Draft asks first on every step (owner, INT-SQAG-202611270008). Cancel, Escape or a click beside the
+// dialog leave the step as it is; Reset Draft in the dialog clears the step exactly as the button did before.
+class ResetDraftConfirm {
+  static RESETS = {
+    images: resetImagesDraft,
+    customer: clearCustomerDetails,
+    quote_company: clearQuoteCompanyDetails,
+    basis: resetQuoteBasisToOriginal,
+    output: resetOutputDraft,
+  };
+
+  constructor({ modal, detail, cancelButton, confirmButton }) {
+    this.modal = modal;
+    this.detail = detail;
+    this.cancelButton = cancelButton;
+    this.confirmButton = confirmButton;
+    this.step = "";
+    this.button = null;
+    this.buttonWatch = null;
+  }
+
+  bind(buttons) {
+    Object.entries(buttons).forEach(([step, button]) => button?.addEventListener("click", () => this.ask(step, button)));
+    this.cancelButton?.addEventListener("click", () => this.cancel());
+    this.confirmButton?.addEventListener("click", () => this.confirm());
+    this.modal?.addEventListener("click", (event) => {
+      if (event.target === this.modal || event.target.closest("[data-reset-draft-confirm-close]")) this.cancel();
+    });
+  }
+
+  isOpen() {
+    return Boolean(this.modal && !this.modal.hidden);
+  }
+
+  // Work that starts while the dialog is open greys out its Reset Draft, as it does the step's own button.
+  sync() {
+    if (!this.confirmButton) return;
+    const waiting = Boolean(this.button?.disabled);
+    this.confirmButton.disabled = waiting;
+    this.confirmButton.title = waiting ? appBusyTitle() || "Please wait until the current work finishes." : "";
+  }
+
+  ask(step, button) {
+    if (!this.modal || !ResetDraftConfirm.RESETS[step]) return;
+    this.step = step;
+    this.button = button;
+    // Customer's reset also clears what was built from it.
+    if (this.detail) this.detail.hidden = step !== "customer";
+    this.sync();
+    if (button) {
+      this.buttonWatch ||= new MutationObserver(() => this.sync());
+      this.buttonWatch.observe(button, { attributes: true, attributeFilter: ["disabled"] });
+    }
+    this.modal.hidden = false;
+    this.modal.classList.add("is-open");
+    window.setTimeout(() => this.cancelButton?.focus(), 0);
+  }
+
+  close() {
+    const button = this.button;
+    this.buttonWatch?.disconnect();
+    this.step = "";
+    this.button = null;
+    if (this.modal) {
+      this.modal.classList.remove("is-open");
+      this.modal.hidden = true;
+    }
+    return button;
+  }
+
+  cancel() {
+    this.close()?.focus();
+  }
+
+  confirm() {
+    if (this.confirmButton?.disabled) return;
+    const reset = ResetDraftConfirm.RESETS[this.step];
+    const button = this.close();
+    if (reset) reset();
+    if (button && !button.hidden && !button.disabled) button.focus();
+  }
+}
+
+const resetDraftConfirm = new ResetDraftConfirm({
+  modal: elements.resetDraftConfirmModal,
+  detail: elements.resetDraftConfirmDetail,
+  cancelButton: elements.cancelResetDraftButton,
+  confirmButton: elements.confirmResetDraftButton,
 });
 
 function showQuoteNotSavedModal(message) {
@@ -19713,6 +19815,8 @@ function wireEvents() {
         closePricingReferenceTableOverlay();
       } else if (!elements.basisChatOverlay.hidden) {
         closeBasisChatOverlay();
+      } else if (resetDraftConfirm.isOpen()) {
+        resetDraftConfirm.cancel();
       } else if (elements.quoteDependencyConfirmModal && !elements.quoteDependencyConfirmModal.hidden) {
         hideQuoteDependencyConfirmModal({ focusButton: true });
       } else if (elements.profileLoadModal && !elements.profileLoadModal.hidden) {
@@ -19908,13 +20012,17 @@ function wireEvents() {
   elements.pricingMatchesBody.addEventListener("keydown", handleOutputCellKeydown);
   elements.pricingMatchesBody.addEventListener("focusout", handleOutputEditorCommit);
   elements.pricingMatchesBody.addEventListener("change", handleOutputEditorCommit);
-  elements.resetImagesButton.addEventListener("click", resetImagesDraft);
+  resetDraftConfirm.bind({
+    images: elements.resetImagesButton,
+    customer: elements.clearCustomerButton,
+    quote_company: elements.clearQuoteCompanyButton,
+    basis: elements.resetQuoteBasisButton,
+    output: elements.resetOutputButton,
+  });
   elements.analyseAgainButton.addEventListener("click", () => {
     state.pendingFeedback = "";
     requestStartAnalysis("standard");
   });
-  elements.resetQuoteBasisButton.addEventListener("click", resetQuoteBasisToOriginal);
-  elements.resetOutputButton.addEventListener("click", resetOutputDraft);
   elements.presetSelect.addEventListener("change", handlePresetSelectChange);
   elements.loadPresetButton?.addEventListener("click", loadCurrentPreset);
   elements.savePresetButton.addEventListener("click", saveCurrentPreset);
@@ -19987,9 +20095,7 @@ function wireEvents() {
     closeProfileActionsMenu();
     exportCurrentPreset(event);
   });
-  elements.clearCustomerButton.addEventListener("click", clearCustomerDetails);
   elements.knownDetails?.addEventListener("input", handleKnownDetailsChange);
-  elements.clearQuoteCompanyButton.addEventListener("click", clearQuoteCompanyDetails);
   [
     elements.clientName,
     elements.clientAttention,

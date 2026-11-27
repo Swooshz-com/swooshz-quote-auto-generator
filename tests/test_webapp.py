@@ -20605,6 +20605,8 @@ const elements = {
 // This component checks existing detail blockers after a verified saved checkpoint.
 let checkpointVerified = true;
 function customerStepCheckpointIsCurrent() { return checkpointVerified; }
+// A usable rate; the refusal of one that is not is covered by scripts/playwright-reset-draft-confirm.mjs.
+function collectQuoteExchangeRate() { return 1; }
 
 const UNRESOLVED_BASIS_LINES_MESSAGE = source.match(/const UNRESOLVED_BASIS_LINES_MESSAGE = "(.*)";/)[1];
 eval([
