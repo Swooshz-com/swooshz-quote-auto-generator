@@ -63,12 +63,17 @@ try {
   await run.start(scenario);
   const page = await run.signedInPage();
 
-  // A finished quote: Quote Basis decided (one line X'd), Output confirmed and an Excel generated.
+  // A finished quote: Quote Basis decided (one line X'd), Output confirmed, one row deleted in Output, an Excel generated.
   await run.buildToBasis(page);
   await run.tickOpenLines(page);
   await run.tag(page, "chair", "Exclude");
   await run.confirm(page);
   await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 60000 });
+  await idle(page);
+  const deletedIndex = await page.evaluate(() => state.outputRows.findIndex((row) => row.source_basis_line_id === "spotlight"));
+  assert(deletedIndex >= 0, "the source has no spotlight row to delete");
+  await page.locator(`[data-output-delete-row="${deletedIndex}"]`).click();
+  await page.locator("#confirmOutputDeleteButton").click();
   await idle(page);
   const sourceId = await page.evaluate(() => state.quoteSessionId);
   const download = page.waitForEvent("download", { timeout: 90000 });
@@ -77,9 +82,11 @@ try {
   await idle(page);
   const source = await quoteOnScreen(page);
   assert(source.step === "output" && source.files[0] && !source.outputErrors, "the source quote did not finish", source);
-  assert(Object.values(source.output).some(([mode, variant, price]) => mode === "Priced" && variant === "catalog" && price > 0),
-    "the source has no catalogue price", source.output);
-  const sourceRecord = JSON.stringify((await run.record(sourceId)).draft_state.outputRows);
+  assert(Object.values(source.output).some(([mode, variant, price]) => mode === "Priced" && variant === "catalog" && price > 0)
+    && !("spotlight" in source.output), "the source has no catalogue price or kept the deleted row", source.output);
+  const sourceDraft = (await run.record(sourceId)).draft_state;
+  const sourceRecord = JSON.stringify(sourceDraft.outputRows);
+  const rowIds = (rows) => (rows || []).map((row) => row.source_basis_line_id);
   const sourceFiles = await savedFiles(sourceId);
   assert(sourceFiles.xlsx, "the source has no saved Excel", sourceFiles);
 
@@ -111,7 +118,8 @@ try {
   const reopened = await quoteOnScreen(page);
   assert(reopened.step === "output" && JSON.stringify(reopened.output) === JSON.stringify(source.output), "Modify did not open the source at Output", reopened);
 
-  // If the copy cannot be priced (the pricing request fails), it stays at Quote Basis for staff to confirm.
+  // If the copy cannot be priced (the pricing request fails), it keeps its source's Output and Reset rows, the row deleted in
+  // Output stays deleted, and it opens at Output with its catalogue rows asking for a price; nothing is rebuilt from the basis.
   const refusePricing = (route) => route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ status: "failed", errors: ["Synthetic failure."] }) });
   await page.route("**/api/quote-sessions/pricing-selections", refusePricing);
   const unpricedId = await duplicate(page, sourceId);
@@ -119,9 +127,16 @@ try {
   await run.openDashboardQuote(page, unpricedId);
   const unpriced = await quoteOnScreen(page);
   const unpricedDraft = (await run.record(unpricedId)).draft_state;
-  assert(unpriced.step === "basis" && JSON.stringify(unpriced.tags) === JSON.stringify(source.tags)
-    && unpricedDraft.basisConfirmed === false && !(unpricedDraft.outputRows || []).length,
-    "a copy whose pricing failed did not stay at Quote Basis", { unpriced, saved: [unpricedDraft.basisConfirmed, (unpricedDraft.outputRows || []).length] });
+  const kept = {
+    step: unpriced.step, confirmed: unpricedDraft.basisConfirmed,
+    saved: rowIds(unpricedDraft.outputRows), reset: rowIds(unpricedDraft.originalOutputRows), shown: Object.keys(unpriced.output),
+    catalogue: Object.values(unpriced.output).filter(([, variant]) => variant === "catalog").length,
+  };
+  assert(kept.step === "output" && kept.confirmed === true && JSON.stringify(unpriced.tags) === JSON.stringify(source.tags)
+    && JSON.stringify(kept.saved) === JSON.stringify(rowIds(sourceDraft.outputRows))
+    && JSON.stringify(kept.reset) === JSON.stringify(rowIds(sourceDraft.originalOutputRows))
+    && JSON.stringify(kept.shown) === JSON.stringify(Object.keys(source.output)) && !kept.catalogue,
+    "a copy whose pricing failed lost its source's Output, brought back the deleted row or kept a source price", kept);
   result.pricingFailed = { copy: unpricedId, step: unpriced.step };
 
   // A quote that stopped at Quote Basis gives a copy at Quote Basis with the same decisions.
