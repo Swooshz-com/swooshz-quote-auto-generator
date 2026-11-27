@@ -1,0 +1,55 @@
+{
+  "schema": "toolkit-test-shards/v2",
+  "description": "This repository's tests split into parallel CI shards (Toolkit). Shard Timings rebalances the named shards from measured times.",
+  "systems": {
+    "linux": {
+      "command": [
+        "node",
+        "--test",
+        "{files}"
+      ],
+      "discover": "**/*.test.cjs",
+      "shards": [
+        {
+          "id": "linux-1",
+          "files": [
+            ".claude/worktrees/443-g2-review-70ad82/.tmp/ev/state/Swooshz-com/swooshz-quote-auto-generator/evidence/373/g1-pr377-0aa58bb-persisted-board.test.cjs",
+            ".claude/worktrees/brave-mclean-aeac92/.tmp/st/state/Swooshz-com/swooshz-quote-auto-generator/evidence/373/g2-pr376-36c4c54.test.cjs",
+            ".claude/worktrees/quirky-kepler-22a64f/.tmp/ts/state/Swooshz-com/swooshz-quote-auto-generator/evidence/373/g1-pr377-0aa58bb-persisted-board.test.cjs",
+            ".claude/worktrees/zen-hellman-7f6d79/.tmp/s451/state/Swooshz-com/swooshz-quote-auto-generator/evidence/373/g2-pr376-36c4c54.test.cjs"
+          ]
+        },
+        {
+          "id": "linux-2",
+          "files": [
+            ".claude/worktrees/443-g2-review-70ad82/.tmp/ev/state/Swooshz-com/swooshz-quote-auto-generator/evidence/373/g2-pr376-36c4c54.test.cjs",
+            ".claude/worktrees/nifty-bhaskara-a8b4f1/.tmp/st/state/Swooshz-com/swooshz-quote-auto-generator/evidence/373/g1-pr377-0aa58bb-persisted-board.test.cjs",
+            ".claude/worktrees/quirky-kepler-22a64f/.tmp/ts/state/Swooshz-com/swooshz-quote-auto-generator/evidence/373/g2-pr376-36c4c54.test.cjs",
+            ".claude/worktrees/zen-hellman-7f6d79/.tmp/st/state/Swooshz-com/swooshz-quote-auto-generator/evidence/373/g1-pr377-0aa58bb-persisted-board.test.cjs"
+          ]
+        },
+        {
+          "id": "linux-3",
+          "files": [
+            ".claude/worktrees/443-polish-afdd25/.tmp/st/state/Swooshz-com/swooshz-quote-auto-generator/evidence/373/g1-pr377-0aa58bb-persisted-board.test.cjs",
+            ".claude/worktrees/nifty-bhaskara-a8b4f1/.tmp/st/state/Swooshz-com/swooshz-quote-auto-generator/evidence/373/g2-pr376-36c4c54.test.cjs",
+            ".claude/worktrees/zealous-saha-6557aa/.tmp/ev/state/Swooshz-com/swooshz-quote-auto-generator/evidence/373/g1-pr377-0aa58bb-persisted-board.test.cjs",
+            ".claude/worktrees/zen-hellman-7f6d79/.tmp/st/state/Swooshz-com/swooshz-quote-auto-generator/evidence/373/g2-pr376-36c4c54.test.cjs"
+          ]
+        },
+        {
+          "id": "linux-4",
+          "files": [
+            ".claude/worktrees/443-polish-afdd25/.tmp/st/state/Swooshz-com/swooshz-quote-auto-generator/evidence/373/g2-pr376-36c4c54.test.cjs",
+            ".claude/worktrees/quirky-kepler-22a64f/.tmp/st/state/Swooshz-com/swooshz-quote-auto-generator/evidence/373/g1-pr377-0aa58bb-persisted-board.test.cjs",
+            ".claude/worktrees/zealous-saha-6557aa/.tmp/ev/state/Swooshz-com/swooshz-quote-auto-generator/evidence/373/g2-pr376-36c4c54.test.cjs"
+          ]
+        },
+        {
+          "id": "linux-5",
+          "rest": true
+        }
+      ]
+    }
+  }
+}
