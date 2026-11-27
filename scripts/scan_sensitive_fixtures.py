@@ -64,6 +64,8 @@ KNOWN_SYNTHETIC_REVIEW_ALLOWLIST = {
     ("internal-pricing-field", "docs/pricing-catalog-import.md"),
     ("internal-pricing-field", "docs/quotation-api-v1.md"),
     ("internal-pricing-field", "docs/quotation-api-v1.openapi.json"),
+    # A copy of the generated spec, which names internal fields only to forbid them.
+    ("internal-pricing-field", "docs/api/quotation-api-v1-baseline.json"),
     (
         "internal-pricing-field",
         "tests/fixtures/quote-generator/pricing-references/synthetic-exhibition-fixture-pricing/pricing-catalog.json",
