@@ -28776,7 +28776,7 @@ if (scenario.path === "duplicate") constantNames.push("QUOTE_SESSION_FILE_STORE_
   "QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA", "QUOTE_COMMERCIAL_SNAPSHOT_VERSION", "QUOTE_COMMERCIAL_LIFECYCLES",
   "QUOTE_COMMERCIAL_SNAPSHOT_ORIGINS", "QUOTE_COMMERCIAL_PRESENCE_VALUES",
   "QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS", "PRICING_REFERENCE_DIGEST_RE", "PRICING_REFERENCE_SETTINGS_MODE_MANAGE",
-  "DEFAULT_CURRENCY_LABEL");
+  "DEFAULT_CURRENCY_LABEL", "CUSTOMER_STEP_CHECKPOINT_ADDED_FIELDS");
 if (scenario.originalBoundary || scenario.path === "duplicate") constantNames.push("QUOTE_SESSION_STORAGE_KEY", "QUOTE_SESSION_STATE_VERSION",
   "MAX_REFERENCE_IMAGES");
 constantNames.push("PRICING_AUTHORITY_VARIANTS");
@@ -29043,7 +29043,8 @@ const required = ["isPlainObject", "objectHasExactKeys", "safeQuoteSessionId", "
   "quoteSessionDraftIsConfirmed", "currentQuoteSessionIsRestoredFromDashboard", "quoteSessionDraftStateCanSave",
   "clearQuoteSessionDraftSaveTimer", "saveCurrentQuoteSession", "saveQuoteSessionDraftState", "ensureQuoteSession",
   "quoteSessionDraftSynchronizationFailureMessage", "standardServiceDecisionsForSave", "currentStandardServiceDecisions", "normalizeStandardServiceDecisions", "handleDraftBasis", "handleGenerate", "currentReinclusionRows", "withoutReincludedSelection", "retainExcludedBasisPricingRows",
-  "ensureSavedServerJobStarted", "startJob", "duplicateDashboardQuote", "finishDashboardOperation", "copiedQuotePricingRow", "sameLineItemSourceIdentities", "adoptGenerationOutputRows", "authenticationRecoveryNavigating"];
+  "ensureSavedServerJobStarted", "startJob", "duplicateDashboardQuote", "finishDashboardOperation", "copiedQuotePricingRow",
+  "restampCopiedCustomerStepCheckpoint", "customerStepCheckpointWithAddedFieldDefaults", "priceDuplicatedOutput", "sameLineItemSourceIdentities", "adoptGenerationOutputRows", "authenticationRecoveryNavigating"];
 if (scenario.realRefresh || scenario.kind === "excel" || scenario.kind === "dashboard-failure") required.push("getJson", "applySessionData", "renderAuthState");
 if (scenario.refreshBoundary) required.push("markPageUnloading");
 if (scenario.tentativeBoundary) required.push("handleBeforeUnload");

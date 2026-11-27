@@ -83,6 +83,11 @@ try {
   await run.confirm(operator);
   await operator.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 60000 });
   await idle(operator);
+  // One row deleted in Output: a copy of this quote must keep it deleted.
+  const graphicIndex = await operator.evaluate(() => state.outputRows.findIndex((row) => row.source_basis_line_id === "vo-graphic"));
+  await operator.locator(`[data-output-delete-row="${graphicIndex}"]`).click();
+  await operator.locator("#confirmOutputDeleteButton").click();
+  await idle(operator);
   let generatePayload = null;
   operator.on("request", (request) => {
     if (request.method() === "POST" && new URL(request.url()).pathname === "/api/jobs" && request.postDataJSON()?.type === "generate") generatePayload = request.postDataJSON().payload;
@@ -252,6 +257,34 @@ try {
   if (await operator.evaluate(() => state.activeAppView !== "dashboard")) await toDashboard(operator);
   await run.openDashboardQuote(operator, draftId);
   assert(await operator.evaluate(() => state.quoteViewOnly === false) && (await view(operator)).open.length > 0, "an operator's own quote opened view only");
+  // Duplicate of another staff member's finished quote: the copy is the admin's own, editable quote; it stops at
+  // Customer until Next (the Customer step was acknowledged by its owner), and the source keeps its file.
+  if (await admin.evaluate(() => state.activeAppView !== "dashboard")) await toDashboard(admin);
+  const sourceCard = admin.locator(`#dashboardSessionsList [data-quote-session-id="${generatedId}"]`);
+  await sourceCard.click();
+  await admin.locator('#dashboardSelectedSessionPanel [data-dashboard-panel-action="duplicate-session"]').click();
+  await admin.waitForFunction((id) => !appIsBusy() && !state.quoteSessionRestoreBusy && state.dashboardActiveSessionId
+    && state.dashboardActiveSessionId !== id, generatedId, { timeout: 90000 });
+  const copyId = await admin.evaluate(() => state.dashboardActiveSessionId);
+  const copied = await detail(admin, copyId);
+  assert(copied.status === 200 && !("view_only" in copied.session) && (await detail(operator, copyId)).status === 404,
+    "the copy of another user's quote is not the admin's own", copied.status);
+  // The copy keeps the source's Output and Reset rows (the row deleted there stays deleted) and does not name the source.
+  const ids = (rows) => (rows || []).map((row) => row.source_basis_line_id);
+  const sourceDraft = (await detail(operator, generatedId)).session.draft_state;
+  const copyDraft = copied.session.draft_state;
+  const keptOutput = { output: ids(copyDraft.outputRows), reset: ids(copyDraft.originalOutputRows), confirmed: copyDraft.basisConfirmed,
+    checkpoint: copyDraft.customerStepCheckpoint?.sessionId || null };
+  assert(keptOutput.output.length && JSON.stringify(keptOutput.output) === JSON.stringify(ids(sourceDraft.outputRows)) && !keptOutput.output.includes("vo-graphic")
+    && JSON.stringify(keptOutput.reset) === JSON.stringify(ids(sourceDraft.originalOutputRows)) && keptOutput.confirmed === true
+    && keptOutput.checkpoint !== generatedId, "the copy of another user's quote lost its Output, brought back a deleted row or names the source", keptOutput);
+  await run.openDashboardQuote(admin, copyId);
+  seen = await view(admin);
+  assert(await admin.evaluate(() => state.quoteViewOnly === false) && seen.panel === "customer" && seen.rail.output.startsWith("Click Next in Customer"),
+    "the copy of another user's quote does not open as the admin's own quote at Customer", seen);
+  assert((await detail(operator, generatedId)).session.exports.xlsx.sha256 === before.generated.session.exports.xlsx.sha256,
+    "duplicating changed the source quote's file");
+  result.duplicateOfOtherUser = { copy: copyId, panel: seen.panel, ...keptOutput };
   await operator.context().close();
   await admin.context().close();
 

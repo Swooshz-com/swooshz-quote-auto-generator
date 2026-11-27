@@ -788,9 +788,9 @@ try {
     assert(exitCode === 0, "XLSX amounts", checkOut);
     result.xlsx = { status: "PASS", expectedRows, validator: checkOut.trim() };
     if (outputReferenceSelection) {
-      // A normal duplicated quote has no source-bound grants. Keep the edited
-      // Output subset and its manual price; select one compatible row directly
-      // in Output without Confirm rebuilding rows from the complete basis.
+      // A duplicated quote has no source-bound grants. It keeps the source's edited Output subset and manual price,
+      // and its catalogue row is priced for the copy by one conditional selection, without Confirm rebuilding rows
+      // from the complete basis; the copy opens at Output, where its source ended (#445).
       const keep = ["u1-count", "u1-graphic"];
       while (true) {
         const index = await page.evaluate((ids) => state.outputRows.findIndex((row) => !ids.includes(row.source_basis_line_id)), keep);
@@ -801,49 +801,38 @@ try {
       await page.evaluate(() => saveQuoteSessionDraftState({ quoteGenerated: true }));
       const originalPath = path.join(dirs.data, "quote-sessions", sessionId, "quote-session.json");
       const originalMetadata = await fs.readFile(originalPath, "utf8");
+      const sourceGraphic = await page.evaluate(() => state.outputRows.find((row) => row.source_basis_line_id === "u1-graphic"));
+      const sourceOrder = await page.evaluate(() => state.outputRows.map((row) => row.source_basis_line_id));
       await page.locator("#backToDashboardButton").click();
       await page.waitForFunction(() => !appIsBusy() && state.activeAppView === "dashboard");
+      const selectionsBefore = result.selectionStatuses.length;
       await page.locator('[data-quote-session-id="' + sessionId + '"]').first().click();
       await page.locator('[data-dashboard-panel-action="duplicate-session"]').click();
       await page.waitForFunction((id) => !appIsBusy() && state.dashboardActiveSessionId && state.dashboardActiveSessionId !== id, sessionId);
       const targetId = await page.evaluate(() => state.dashboardActiveSessionId);
       await page.locator('[data-dashboard-panel-action="modify-session"]').click();
       await page.waitForFunction((id) => !appIsBusy() && state.activeAppView === "quote" && state.quoteSessionId === id, targetId);
-      await page.locator("#sideNextButton").click();
-      await page.waitForFunction(() => !appIsBusy());
-      await page.locator('button[data-side-panel="output"]').click();
+      assert(await page.evaluate(() => state.activeSidePanel) === "output", "the duplicated quote did not open at Output");
       const before = await page.evaluate(() => ({ rows: state.outputRows, reset: state.originalOutputRows, fx: collectQuoteExchangeRate() }));
       const targetPath = path.join(dirs.data, "quote-sessions", targetId, "quote-session.json");
-      const ungranted = JSON.parse(await fs.readFile(targetPath, "utf8"));
-      assert(before.rows.length === 2 && !ungranted.pricing_ledger?.rows?.["u1-count"]?.grant,
-        "duplicate did not retain the subset without a target grant");
-      assert(before.rows.find((row) => row.source_basis_line_id === "u1-count")?.pricing_authority?.variant !== "catalog",
-        "duplicate retained source catalogue authority");
-      const selectionsBefore = result.selectionStatuses.length;
-      const index = await page.evaluate(() => state.outputRows.findIndex((row) => row.source_basis_line_id === "u1-count"));
-      await page.locator('[data-output-row="' + index + '"][data-output-edit-field="unit_price_override"][data-output-denomination="quote"]').first().click();
-      const outputSelectionResponse = page.waitForResponse((response) => response.request().method() === "POST"
-        && new URL(response.url()).pathname === "/api/quote-sessions/pricing-selections", { timeout: 15000 });
-      await page.locator("[data-output-reference-action]").click();
-      await page.waitForFunction(() => !appIsBusy());
+      assert(JSON.stringify(before.rows.map((row) => row.source_basis_line_id)) === JSON.stringify(sourceOrder) && sourceOrder.length === keep.length,
+        "duplicate did not retain the edited Output subset", before.rows.map((row) => [row.source_basis_line_id, row.pricing_authority?.variant]));
+      const graphic = await page.evaluate((source) => {
+        const row = state.outputRows.find((entry) => entry.source_basis_line_id === "u1-graphic");
+        return { variant: row?.pricing_authority?.variant, price: effectiveOutputUnitPrice(row), sourcePrice: effectiveOutputUnitPrice(source),
+          sameWords: row?.description === source.description, sameQuantity: Number(row?.quantity) === Number(source.quantity) };
+      }, sourceGraphic);
+      assert(graphic.variant === "manual" && graphic.price === graphic.sourcePrice && graphic.price > 0 && graphic.sameWords && graphic.sameQuantity,
+        "duplicate changed the manual Output row", graphic);
       const selected = await rowFor("u1-count");
       assert(selected?.authority?.variant === "catalog" && selected.authority.price === byName("Bar Stool").sale_unit_price,
-        "Output reference selection did not obtain target pricing authority", selected);
+        "the duplicate did not price its catalogue row for the copy", selected);
       assert(result.selectionStatuses.length === selectionsBefore + 1 && result.selectionStatuses.at(-1) === 200,
-        "Output action did not make one successful conditional selection", result.selectionStatuses);
-      const outputReceiptResponse = await outputSelectionResponse;
-      const outputRequest = outputReceiptResponse.request().postDataJSON();
-      const outputReceipt = (await outputReceiptResponse.json()).quote_session;
-      const outputRevision = outputReceipt.pricing_ledger.rows["u1-count"];
-      assert(outputReceipt.session_id === targetId && /^[a-f0-9]{64}$/.test(outputReceipt.draft_version)
-        && outputReceipt.draft_version !== outputRequest.expected_draft_version
-        && outputRevision > outputRequest.pricing_selections[0].expected_revision,
-        "A new Output grant did not advance both the draft version and row revision");
-      await page.evaluate(() => saveQuoteSessionDraftState({ quoteGenerated: true }));
+        "the duplicate did not make one successful conditional selection", result.selectionStatuses);
       const granted = JSON.parse(await fs.readFile(targetPath, "utf8"));
       assert(granted.pricing_ledger?.rows?.["u1-count"]?.grant?.catalog_item_id === byName("Bar Stool").id
-        && granted.pricing_ledger.rows["u1-count"].rev === outputRevision,
-        "selection was not persisted in the target ledger");
+        && granted.pricing_ledger.rows["u1-count"].rev > 0 && !granted.pricing_ledger.rows["u1-graphic"]?.grant,
+        "the copy's selection was not persisted in the target ledger", granted.pricing_ledger);
       // A transient reference outage must not admit saved rows against an empty
       // catalogue and persist demoted catalogue/manual authority over recovery.
       const profileRecoveryFaults = ["unavailable", "empty", "invalid", "missing-authority-items",
