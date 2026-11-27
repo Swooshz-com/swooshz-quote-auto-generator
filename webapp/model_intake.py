@@ -195,31 +195,35 @@ def _no_constant(_):
     raise ValueError("non-finite number")
 
 
-_END = object()
+_CONTAINERS = (dict, list)
 
 
-def _children(node):
-    return iter(node.values() if isinstance(node, dict) else node)
+def _depth_within(value, limit) -> bool:
+    """Walk one level at a time, keeping only container children (the container cap bounds each level), so a
+    scalar costs one C-speed type check and memory follows the cap rather than the nesting."""
+    level, depth = [value] if type(value) in _CONTAINERS else [], 1
+    while level:
+        if depth > limit:
+            return False
+        following = []
+        for node in level:
+            following += [child for child in (node.values() if type(node) is dict else node)
+                          if type(child) in _CONTAINERS]
+        level, depth = following, depth + 1
+    return True
 
 
 def _load_json(raw: bytes, *, max_bytes: int, max_containers: int, too_large: str, unreadable: str):
-    """Bound bytes and containers before parsing (both linear), parse, then bound the depth with one iterator
-    per level, so the cost follows the caps rather than the upload's compressed size."""
+    """Bound bytes and containers before parsing (both linear), parse, then bound the depth level by level,
+    so the cost follows the caps rather than the upload's compressed size."""
     if len(raw) > max_bytes or raw.count(b"[") + raw.count(b"{") > max_containers:
         raise IntakeRefused(too_large)
     try:
         value = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_pairs, parse_constant=_no_constant)
     except (UnicodeDecodeError, ValueError, RecursionError):
         raise IntakeRefused(unreadable) from None
-    stack = [_children(value)] if isinstance(value, (dict, list)) else []
-    while stack:
-        if len(stack) > LIMITS["json_depth"]:
-            raise IntakeRefused(unreadable)
-        child = next(stack[-1], _END)
-        if child is _END:
-            stack.pop()
-        elif isinstance(child, (dict, list)):
-            stack.append(_children(child))
+    if not _depth_within(value, LIMITS["json_depth"]):
+        raise IntakeRefused(unreadable)
     return value
 
 
@@ -258,7 +262,14 @@ def _plain_text(value, limit):
 # ----------------------------------------------------------------- glTF
 
 def _mat_mul(a, b):
-    return tuple(sum(a[k * 4 + row] * b[col * 4 + k] for k in range(4)) for col in range(4) for row in range(4))
+    """Column-major 4x4 product a @ b, written out (a loop here dominates the cost of a large model)."""
+    a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15 = a
+    result = []
+    for col in range(4):
+        b0, b1, b2, b3 = b[col * 4:col * 4 + 4]
+        result += (a0 * b0 + a4 * b1 + a8 * b2 + a12 * b3, a1 * b0 + a5 * b1 + a9 * b2 + a13 * b3,
+                   a2 * b0 + a6 * b1 + a10 * b2 + a14 * b3, a3 * b0 + a7 * b1 + a11 * b2 + a15 * b3)
+    return tuple(result)
 
 
 def _local_matrix(node):
@@ -289,10 +300,15 @@ def _local_matrix(node):
 
 
 def _world_box(matrix, low, high):
-    points = [(x, y, z) for x in (low[0], high[0]) for y in (low[1], high[1]) for z in (low[2], high[2])]
-    moved = [tuple(matrix[axis] * x + matrix[4 + axis] * y + matrix[8 + axis] * z + matrix[12 + axis]
-                   for axis in range(3)) for x, y, z in points]
-    return tuple(min(p[a] for p in moved) for a in range(3)), tuple(max(p[a] for p in moved) for a in range(3))
+    """The axis-aligned box around an affine-transformed box: centre moved, half-sizes through |M|."""
+    cx, cy, cz = ((low[i] + high[i]) / 2 for i in range(3))
+    ex, ey, ez = ((high[i] - low[i]) / 2 for i in range(3))
+    centre, extent = [], []
+    for axis in range(3):
+        m0, m1, m2 = matrix[axis], matrix[4 + axis], matrix[8 + axis]
+        centre.append(m0 * cx + m1 * cy + m2 * cz + matrix[12 + axis])
+        extent.append(abs(m0) * ex + abs(m1) * ey + abs(m2) * ez)
+    return (tuple(c - e for c, e in zip(centre, extent)), tuple(c + e for c, e in zip(centre, extent)))
 
 
 def _union(box, other):
@@ -378,6 +394,44 @@ def read_glb(data: bytes):
     return _scene_boxes(document)
 
 
+class _MeshBoxes:
+    """Each mesh's box in its own space, worked out once however many nodes draw it; primitives counted once."""
+
+    def __init__(self, meshes, accessors, notes):
+        self._meshes, self._accessors, self._notes = meshes, accessors, notes
+        self._boxes = {}
+        self._primitives = 0
+
+    def box(self, mesh_index):
+        index = _index(mesh_index, len(self._meshes))
+        if index not in self._boxes:
+            self._boxes[index] = self._measure(self._meshes[index])
+        return self._boxes[index]
+
+    def _measure(self, mesh):
+        primitive_list = mesh.get("primitives", [])
+        if not isinstance(primitive_list, list):
+            raise IntakeRefused("model_unreadable")
+        self._primitives += len(primitive_list)
+        if self._primitives > LIMITS["primitives"]:
+            raise IntakeRefused("model_too_large")
+        box = None
+        for primitive in primitive_list:
+            attributes = primitive.get("attributes") if isinstance(primitive, dict) else None
+            if not isinstance(attributes, dict) or "POSITION" not in attributes:
+                continue
+            accessor = self._accessors[_index(attributes["POSITION"], len(self._accessors))]
+            low, high = accessor.get("min"), accessor.get("max")
+            if not (isinstance(low, list) and isinstance(high, list) and len(low) == len(high) == 3
+                    and all(map(_finite, low + high))):
+                raise IntakeRefused("model_unreadable")
+            if accessor.get("normalized") or accessor.get("componentType", _FLOAT) != _FLOAT:
+                self._notes.add("Some 3D model sizes are stored in compressed form and were left out.")
+                continue
+            box = _union(box, (tuple(float(v) for v in low), tuple(float(v) for v in high)))
+        return box
+
+
 def _scene_boxes(document):
     notes = set()
     nodes = _items(document, "nodes", "nodes")
@@ -401,10 +455,15 @@ def _scene_boxes(document):
         roots = scenes[_index(document.get("scene", 0), len(scenes))].get("nodes", [])
         if not isinstance(roots, list):
             raise IntakeRefused("model_unreadable")
+        if len(roots) > len(nodes):  # More roots than nodes repeats one; refuse before any per-root work.
+            raise IntakeRefused("model_unreadable")
         roots = [_index(root, len(nodes)) for root in roots]
+        if len(set(roots)) != len(roots) or any(root in parents for root in roots):
+            raise IntakeRefused("model_unreadable")
     else:
         roots = [index for index in range(len(nodes)) if index not in parents]
-    booth, parts, primitives, seen = None, [], 0, set()
+    booth, parts, seen = None, [], set()
+    mesh_boxes = _MeshBoxes(meshes, accessors, notes)
     stack = [(root, _IDENTITY, None, 0) for root in reversed(roots)]
     while stack:
         index, parent_matrix, part, depth = stack.pop()
@@ -413,38 +472,20 @@ def _scene_boxes(document):
         seen.add(index)
         node = nodes[index]
         matrix = _mat_mul(parent_matrix, _local_matrix(node))
-        if not all(math.isfinite(value) for value in matrix):
+        if not math.isfinite(sum(matrix)):  # Any NaN or infinity (or a sum that overflows) is not a booth.
             raise IntakeRefused("model_unreadable")
         identity = _part_identity(node, notes)
         if identity is not None and part is None:
             part = len(parts)
             parts.append([identity[0], identity[1], None])
-        if "mesh" in node:
-            mesh = meshes[_index(node["mesh"], len(meshes))]
-            primitive_list = mesh.get("primitives", [])
-            if not isinstance(primitive_list, list):
+        local = mesh_boxes.box(node["mesh"]) if "mesh" in node else None
+        if local is not None:
+            box = _world_box(matrix, *local)
+            if not math.isfinite(sum(box[0]) + sum(box[1])):
                 raise IntakeRefused("model_unreadable")
-            primitives += len(primitive_list)
-            if primitives > LIMITS["primitives"]:
-                raise IntakeRefused("model_too_large")
-            for primitive in primitive_list:
-                attributes = primitive.get("attributes") if isinstance(primitive, dict) else None
-                if not isinstance(attributes, dict) or "POSITION" not in attributes:
-                    continue
-                accessor = accessors[_index(attributes["POSITION"], len(accessors))]
-                low, high = accessor.get("min"), accessor.get("max")
-                if not (isinstance(low, list) and isinstance(high, list) and len(low) == len(high) == 3
-                        and all(map(_finite, low + high))):
-                    raise IntakeRefused("model_unreadable")
-                if accessor.get("normalized") or accessor.get("componentType", _FLOAT) != _FLOAT:
-                    notes.add("Some 3D model sizes are stored in compressed form and were left out.")
-                    continue
-                box = _world_box(matrix, low, high)
-                if not all(math.isfinite(value) for corner in box for value in corner):
-                    raise IntakeRefused("model_unreadable")
-                booth = _union(booth, box)
-                if part is not None:
-                    parts[part][2] = _union(parts[part][2], box)
+            booth = _union(booth, box)
+            if part is not None:
+                parts[part][2] = _union(parts[part][2], box)
         children = node.get("children", [])
         stack.extend((child, matrix, part, depth + 1) for child in reversed(children))
     return booth, [tuple(entry) for entry in parts], notes
@@ -510,7 +551,7 @@ def _package_model(raw, sha256, up, booth, parts, notes):
     if up is not None:
         return _model_evidence(raw, sha256, up)
     if booth is None or booth.width is None or booth.depth is None:
-        notes.add(UP_UNKNOWN)
+        notes.add("The parts list gives no booth size to check the 3D model against, so its sizes were not used.")
         return None
     fitting = [axis for axis in ("y", "z") if _fits(raw[0], axis, booth)]
     if len(fitting) != 1:
@@ -520,6 +561,12 @@ def _package_model(raw, sha256, up, booth, parts, notes):
     model = _model_evidence(raw, sha256, fitting[0])
     if not _parts_agree(parts, model.parts):
         notes.add("The 3D model's parts do not match the parts list, so its sizes were not used.")
+        return None
+    # A margin: the other way up must disagree on a size the parts list states. Widths, and parts whose depth
+    # equals their height, read the same both ways and prove nothing.
+    other = _model_evidence(raw, sha256, "y" if fitting[0] == "z" else "z")
+    if _parts_agree(parts, other.parts) or not _parts_compared(parts, other.parts):
+        notes.add("The 3D model's parts read the same either way up, so its sizes were not used.")
         return None
     return model
 
@@ -629,6 +676,8 @@ def _parts_from_record(components, notes):
         heights = component.get("heights")
         height = _size(component.get("height"), unreadable="package_unreadable")
         if height is None and isinstance(heights, list) and heights:
+            if len(heights) > 64:  # A wall's height steps; a longer list is not a booth part.
+                raise IntakeRefused("package_too_large")
             if not all(_finite(value) for value in heights):
                 raise IntakeRefused("package_unreadable")
             height = max(_size(value, unreadable="package_unreadable") for value in heights)
@@ -687,6 +736,13 @@ def _compare_part(part, model):
     return True, compared, changes
 
 
+def _parts_compared(parts, model_parts):
+    """True when at least one size was compared between the two (agreeing or not)."""
+    by_index = {part.index: part for part in model_parts if part.index is not None}
+    return any(_compare_part(part, by_index[part.index])[1] or by_index[part.index].type != part.type
+               for part in parts if part.index in by_index)
+
+
 def _parts_agree(parts, model_parts):
     """True when every part both sources describe agrees and at least one size was compared."""
     by_index = {part.index: part for part in model_parts if part.index is not None}
@@ -725,6 +781,8 @@ def _declared_member_count(data):
     position = data.rfind(b"PK\x05\x06", max(0, len(data) - 65_557))
     if position < 0 or position + 22 > len(data):
         raise IntakeRefused("package_unreadable")
+    if data[max(0, position - 20):position - 16] == b"PK\x06\x07":
+        raise IntakeRefused("package_too_large")  # A ZIP64 locator: zipfile would read the directory from it.
     on_disk, total, directory_size = struct.unpack_from("<HHI", data, position + 8)
     if 0xFFFF in (on_disk, total) or directory_size == 0xFFFFFFFF:
         raise IntakeRefused("package_too_large")  # A ZIP64 package is beyond every limit here.
@@ -791,6 +849,8 @@ def _read_package(data):
             renders = scene.get("renders", [])
             if not isinstance(renders, list):
                 raise IntakeRefused("package_unreadable")
+            if len(renders) > LIMITS["package_members"]:
+                raise IntakeRefused("package_too_large")
             missing = 0
             for render in renders:
                 if not isinstance(render, dict) or not isinstance(render.get("file"), str):
@@ -1002,7 +1062,9 @@ def check_basis(ai_basis, evidence: DesignEvidence) -> list[str]:
                     notes.append(f"Line {label} quantity differs from what the design model measures.")
             # The server turns the AI's quantity_estimated flag into its own quantity_estimate mark.
             estimated = line.get("quantity_estimated") is True or isinstance(line.get("quantity_estimate"), dict)
-            if known and estimated and (evidence.sizes_trusted or (family is not None and family[0] == "count")):
+            measures = family is not None and (family[0] == "count" or (
+                evidence.sizes_trusted and bool(_measured(known, family[0]))))
+            if known and estimated and measures:
                 notes.append(f"Line {label} uses measured design model parts but is marked estimated.")
     for part in evidence.parts:
         if part.id not in used:
