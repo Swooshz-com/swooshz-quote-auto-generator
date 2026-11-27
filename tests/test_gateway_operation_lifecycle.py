@@ -9,13 +9,13 @@ import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 from webapp import ai_gateway, server
-from tests.gateway_test_support import synthetic_configuration, json_response, FixtureHttpResponse, responses_envelope, install_mock_responses_transport
+from tests.gateway_test_support import synthetic_configuration, json_response, FixtureHttpResponse, responses_envelope, install_mock_responses_transport, revise_line_reply
 from tests import test_webapp as existing
 from tests.test_openai_draft_request_contract import synthetic_image
 from tests.test_provider_response_admission import CATALOG, draft
 from tests.test_pricing_import_telemetry import imported_rows
 
-FEATURES={"draft":"draft_quote_basis","draft_high_quality":"draft_quote_basis","basis_line":"basis_chat","basis_answer":"basis_chat","pricing_import":"pricing_reference_import","pricing_metadata":"pricing_reference_metadata_enrichment"}
+FEATURES={"draft":"draft_quote_basis","draft_high_quality":"draft_quote_basis","basis_line":"basis_chat","pricing_import":"pricing_reference_import","pricing_metadata":"pricing_reference_metadata_enrichment"}
 
 
 class GatewayOperationLifecycleTest(unittest.TestCase):
@@ -54,10 +54,7 @@ class GatewayOperationLifecycleTest(unittest.TestCase):
         if operation in {"draft","draft_high_quality"}:
             return draft()
         if operation=="basis_line":
-            return {"intent":"proposal","proposal":{"message":"Change the platform height?",
-                    "replacement_line":{"tag":"Confirm","text":"150mm raised platform with needle punch carpet.","confidence_pct":90}}}
-        if operation=="basis_answer":
-            return {"intent":"answer","answer":"Synthetic answer"}
+            return revise_line_reply(text="150mm raised platform with needle punch carpet.", message="Change the platform height?")
         if operation=="pricing_import":
             return imported_rows()
         return {"items":[{"id":row["id"],"match_terms":[row["description"].lower()],"object_families":["synthetic_panel"]} for row in self.source_rows()]}
@@ -75,15 +72,13 @@ class GatewayOperationLifecycleTest(unittest.TestCase):
             result=server.request_openai_quote_basis(payload,"synthetic-key",draft_configuration=config)
             self.assertTrue(result["line_items"])
             return result
-        if operation in {"basis_line","basis_answer"}:
+        if operation=="basis_line":
             payload["quote_basis_sections"]=[{"id":"platform","title":"Platform","lines":[{"tag":"Confirm","text":"100mm raised platform with needle punch carpet."}]}]
             payload["quote_basis"]=server.quote_basis_from_sections(payload["quote_basis_sections"])
-            payload["basis_chat"]={"question":"change 100mm to 150mm" if operation=="basis_line" else "What is included?",
-                "scope":"line" if operation=="basis_line" else "quote","field":"platform","line_index":0,
-                "line":"Confirm: 100mm raised platform with needle punch carpet." if operation=="basis_line" else ""}
+            payload["basis_chat"]={"question":"change 100mm to 150mm","scope":"line","field":"platform","line_index":0,
+                "line":"Confirm: 100mm raised platform with needle punch carpet."}
             result=server.request_configured_basis_chat(payload)
-            self.assertEqual(result["type"],"proposal" if operation=="basis_line" else "answer")
-            if operation=="basis_answer":self.assertEqual(result["answer"],"Synthetic answer")
+            self.assertEqual(result["type"],"proposal")
             return result
         rows=self.source_rows()
         if operation=="pricing_import":
@@ -115,7 +110,7 @@ class GatewayOperationLifecycleTest(unittest.TestCase):
         owner.operation.update(attempt_number=7,usage={"input_tokens":101,"output_tokens":202,"total_tokens":303})
         return owner
 
-    def test_all_six_routes_restore_identical_same_feature_parent_on_every_exit(self):
+    def test_all_routes_restore_identical_same_feature_parent_on_every_exit(self):
         cases=("missing_route","missing_key","malformed_key","envelope","success","http","refusal","shape","model_json")
         for operation in ai_gateway.ROUTE_KEYS:
             route_cases=cases+("missing_media",) if operation in {"draft","draft_high_quality"} else cases
@@ -213,21 +208,21 @@ class GatewayOperationLifecycleTest(unittest.TestCase):
                 finally:parent.__exit__(None,None,None)
 
     def test_tracking_scope_restores_parent_owner_operation_and_metadata_identity(self):
-        parent=self.parent("basis_answer");before=copy.deepcopy(parent.operation)
+        parent=self.parent("basis_line");before=copy.deepcopy(parent.operation)
         metadata={"module":"sqag","purpose":"synthetic_parent"}
         try:
             with mock.patch.object(server.AI_LOG_TRACKING_CONTEXT,"metadata",metadata,create=True):
                 with server.ai_log_tracking_scope({"purpose":"synthetic_child"}):
                     self.assertIsNone(server.current_ai_transport_owner())
                     with mock.patch.dict(self.values,{"OPENROUTER_API_KEY":""}):
-                        with self.assertRaises(server.AIConfigurationError):self.invoke("basis_answer")
+                        with self.assertRaises(server.AIConfigurationError):self.invoke("basis_line")
                 self.assertIs(server.AI_LOG_TRACKING_CONTEXT.metadata,metadata)
                 self.assertIs(server.AI_LOG_TRACKING_CONTEXT.transport_operation,parent.operation)
                 self.assertIs(server.current_ai_transport_owner(),parent)
                 self.assertEqual(parent.operation,before)
         finally:parent.__exit__(None,None,None)
 
-    def test_all_six_routes_have_independent_parent_and_lineage_in_parallel_threads(self):
+    def test_all_routes_have_independent_parent_and_lineage_in_parallel_threads(self):
         operation_by_model={self.model(operation):operation for operation in ai_gateway.ROUTE_KEYS}
         def respond(request,**kwargs):
             model=json.loads(request.data)["model"]
@@ -239,9 +234,9 @@ class GatewayOperationLifecycleTest(unittest.TestCase):
                 self.invoke(operation)
                 return server.AI_LOG_TRACKING_CONTEXT.transport_operation is parent.operation and parent.operation==before
             finally:parent.__exit__(None,None,None)
-        with ThreadPoolExecutor(max_workers=6) as pool:self.assertEqual(list(pool.map(run,ai_gateway.ROUTE_KEYS)),[True]*6)
-        attempts=self.attempts();self.assertEqual(len(attempts),6)
-        self.assertEqual(len({row["retry_lineage_id"] for row in attempts}),6)
+        with ThreadPoolExecutor(max_workers=len(ai_gateway.ROUTE_KEYS)) as pool:self.assertEqual(list(pool.map(run,ai_gateway.ROUTE_KEYS)),[True]*len(ai_gateway.ROUTE_KEYS))
+        attempts=self.attempts();self.assertEqual(len(attempts),len(ai_gateway.ROUTE_KEYS))
+        self.assertEqual(len({row["retry_lineage_id"] for row in attempts}),len(ai_gateway.ROUTE_KEYS))
         self.assertEqual({row["attempt_number"] for row in attempts},{1})
 
     def test_metadata_batches_retain_one_configuration_and_distinct_terminal_lineages(self):

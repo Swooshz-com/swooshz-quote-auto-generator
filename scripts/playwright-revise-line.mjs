@@ -43,7 +43,8 @@ const scenario = { basis_chat_reply: true, mark_estimates: true, raw: {
 const IDS = [...LINES.map((line) => line.id), "standard-project-management-fee", "standard-waste-disposal"];
 
 const idle = (page) => page.waitForFunction(() => !appIsBusy() && !quoteSessionDraftSaveTimer && !quoteSessionDraftSavePromise, null, { timeout: 60000 });
-const reply = (line) => fs.writeFile(path.join(run.runRoot, "basis-chat-reply.json"), JSON.stringify({ confidence_pct: 95, ...line }));
+// A revise_line_v1 replacement row: null keeps the line's tag, quantity or unit (#430 R2).
+const reply = (line) => fs.writeFile(path.join(run.runRoot, "basis-chat-reply.json"), JSON.stringify({ tag: null, quantity: null, unit: null, ...line }));
 const basisLine = (page, id) => page.evaluate((wanted) => state.quoteBasisSections.flatMap((section) => section.lines || []).find((line) => line.id === wanted) || null, id);
 const target = (page, id) => page.evaluate((wanted) => {
   for (const section of state.quoteBasisSections) {

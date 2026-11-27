@@ -7,7 +7,7 @@ import secrets
 
 OPERATIONS = {
     "draft": frozenset({"draft", "draft_high_quality"}),
-    "basis_chat": frozenset({"basis_line", "basis_answer"}),
+    "basis_chat": frozenset({"basis_line"}),
 }
 
 

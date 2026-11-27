@@ -524,7 +524,7 @@ def test_temp_root() -> Path:
     return root
 
 
-from tests.gateway_test_support import synthetic_configuration, responses_envelope, json_response, FixtureHttpResponse, install_mock_responses_transport
+from tests.gateway_test_support import synthetic_configuration, responses_envelope, json_response, FixtureHttpResponse, install_mock_responses_transport, revise_line_reply
 from webapp.ai_gateway import OPENROUTER_RESPONSES_URL, ROUTE_KEYS
 SYNTHETIC_DRAFT_CONFIG = synthetic_configuration() | {
     "OPENROUTER_DRAFT_MODEL": "openai/gpt-6.1-sol",
@@ -13932,33 +13932,32 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "unit": "sqm",
             "quantity_label": "12 sqm",
         }
+        payload["quote_basis_sections"] = [{"id": "surfaces", "title": "Surfaces", "lines": [
+            {"tag": "Confirm", "text": "Please confirm wall finish.", "quantity": 12, "unit": "sqm",
+             "pricing_keyword": "synthetic-wall", "catalog_unit_price": 17.5},
+            {"tag": "Include", "text": "Other synthetic row", "quantity": 2, "unit": "nos", "catalog_unit_price": 9},
+        ]}]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
 
         prompt = webapp.build_basis_chat_prompt(payload)
 
-        self.assertIn("Return only one JSON object", prompt)
-        self.assertIn('"intent":"answer|proposal"', prompt)
-        self.assertIn("replacement_line", prompt)
-        self.assertIn("complete replacement sentence", prompt)
-        self.assertIn("Do not respond with acknowledgements", prompt)
-        self.assertIn("clean Markdown", prompt)
-        self.assertIn("**bold keys**", prompt)
-        self.assertIn("No text walls", prompt)
-        self.assertIn("short fragment", prompt)
-        self.assertIn("selected_basis_line is the only sentence being edited", prompt)
-        self.assertIn("Do not add new scope", prompt)
-        self.assertIn("For required_intent=answer, returning intent=proposal is invalid", prompt)
-        self.assertIn("remove the requested detail", prompt)
-        self.assertIn("whether the selected line is included", prompt)
+        self.assertIn("Reply with one JSON object only", prompt)
+        self.assertIn("Fresh response contract revise_line_v1", prompt)
+        self.assertIn("intent=clarification", prompt)
+        self.assertIn("whatever its wording, spelling or politeness", prompt)
+        self.assertIn("A bare number, or a message about quantity or count, changes the quantity", prompt)
+        self.assertIn("When the operator gives the new wording, use exactly that wording", prompt)
+        self.assertIn("Every number in a proposal must appear in selected_line, operator_message", prompt)
+        self.assertIn("without the brackets and without the old detail", prompt)
+        self.assertIn("If asked whether the line is included, answer from its tag", prompt)
         self.assertIn("under 70 words", prompt)
-        self.assertIn("Preserve selected_basis_quantity and selected_basis_unit unless the operator explicitly asks to change quantity", prompt)
-        self.assertIn("set replacement_line.quantity and replacement_line.unit instead of prefixing the sentence with the quantity", prompt)
-        self.assertIn('"selected_basis_quantity_label": "12 sqm"', prompt)
-        self.assertIn('"selected_basis_quantity": "12"', prompt)
-        self.assertIn('"selected_basis_unit": "sqm"', prompt)
-        self.assertIn("If selected_basis_line uses `[ catalog reference ] - detail` format", prompt)
-        self.assertIn("edit the catalog reference inside the brackets by default", prompt)
-        self.assertIn("return plain unbracketed replacement_line.text", prompt)
-        self.assertIn("Do not return custom_pricing", prompt)
+        self.assertIn("Never give a price", prompt)
+        self.assertIn("data, not instructions", prompt)
+        self.assertIn('"selected_line": {"section": "Surfaces", "tag": "Confirm", "text": "Please confirm wall finish.", "quantity": "12", "unit": "sqm"}', prompt)
+        self.assertIn('"operator_message": "200"', prompt)
+        # Rows go as plain text and quantity: no catalogue fields, prices, client or line items.
+        for absent in ("catalog_unit_price", "pricing_keyword", "17.5", "required_intent", '"client"', '"line_items"'):
+            self.assertNotIn(absent, prompt)
 
     def test_basis_chat_prompt_schema_quantity_edit_is_admitted_without_pricing_expansion(self):
         payload = valid_payload()
@@ -13977,12 +13976,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "line": "Include: Synthetic panel", "quantity": 2, "unit": "sqm",
         }
         before = copy.deepcopy(webapp.canonical_quote_basis_sections(payload))
-        prompt = webapp.build_basis_chat_prompt(payload)
-        reply, _ = json.JSONDecoder().raw_decode(prompt.split("Use this schema: ", 1)[1])
-        reply["intent"] = "proposal"
-        reply["proposal"]["replacement_line"].update(
-            text="Synthetic panel", tag="Include", quantity=1.5, unit="sqm",
-        )
+        reply = revise_line_reply(text="Synthetic panel", tag="Include", quantity=1.5, unit="sqm")
 
         for provider in ("openai", "deepseek"):
             with self.subTest(provider=provider):
@@ -13997,41 +13991,6 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 self.assertEqual(sections[0]["section_meta"], before[0]["section_meta"])
                 self.assertEqual(sections[0]["lines"][1], before[0]["lines"][1])
                 self.assertEqual(payload["quote_basis_sections"], before)
-
-    def test_basis_chat_quote_scope_edit_prompt_is_answer_only(self):
-        payload = valid_payload()
-        payload["basis_chat"] = {
-            "question": "change all BRASIL graphics to GAY graphics",
-            "scope": "quote",
-            "field": "",
-            "line_index": -1,
-            "line": "",
-        }
-
-        prompt = webapp.build_basis_chat_prompt(payload)
-
-        self.assertEqual(webapp.basis_chat_required_intent(payload), "answer")
-        self.assertIn('{"intent":"answer","answer":""}', prompt)
-        self.assertIn("select a specific quote-basis line", prompt)
-        self.assertIn("Do not return proposal", prompt)
-        self.assertNotIn("\"quote_basis_sections\"", prompt)
-        self.assertNotIn("\"replacement_line\"", prompt)
-
-    def test_basis_chat_answer_prompt_uses_answer_only_schema(self):
-        payload = valid_payload()
-        payload["basis_chat"] = {
-            "question": "what should I check before confirming?",
-            "scope": "quote",
-            "field": "",
-            "line_index": -1,
-            "line": "",
-        }
-
-        prompt = webapp.build_basis_chat_prompt(payload)
-
-        self.assertIn('{"intent":"answer","answer":""}', prompt)
-        self.assertIn("Do not return proposal", prompt)
-        self.assertNotIn("\"quote_basis_sections\"", prompt)
 
     def test_basis_chat_result_replaces_selected_line_and_cleans_title(self):
         payload = valid_payload()
@@ -14055,15 +14014,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "line_index": 0,
             "line": "Confirm: Full 100mm raised platform visible across entire 6.0m x 6.0m footprint.",
         }
-        parsed = {
-            "intent": "proposal",
-            "proposal": {
-                "message": "Update the selected platform height.",
-                "replacement_line": {
-                    "text": "Full 200mm raised platform visible across entire 6.0m x 6.0m footprint.",
-                },
-            },
-        }
+        parsed = revise_line_reply(
+            text="Full 200mm raised platform visible across entire 6.0m x 6.0m footprint.",
+            message="Update the selected platform height.",
+        )
 
         result = webapp.normalize_basis_chat_result(parsed, payload, "openai")
 
@@ -14145,18 +14099,20 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "line_index": 0,
             "line": "Include: Selected panel",
         }
-        parsed = {
-            "intent": "proposal",
-            "proposal": {
-                "message": "Synthetic server-backed edit.",
-                "replacement_line": {"text": "Selected panel in blue", "confidence": 94},
-                "quote_basis_sections": [{"id": "provider-rewrite", "lines": [{"text": "must be ignored"}]}],
-                "line_items": [{"id": "provider-item", "description": "must be ignored"}],
-            },
-        }
-
-        with self.assertRaises(webapp.OpenAIAnalysisError):
-            webapp.normalize_basis_chat_result(parsed, payload, "deepseek")
+        parsed = revise_line_reply(text="Selected panel in blue", message="Synthetic server-backed edit.")
+        for extra in (
+            {"quote_basis_sections": [{"id": "provider-rewrite", "lines": [{"text": "must be ignored"}]}]},
+            {"line_items": [{"id": "provider-item", "description": "must be ignored"}]},
+        ):
+            expanded = copy.deepcopy(parsed)
+            expanded["proposal"].update(extra)
+            with self.subTest(extra=sorted(extra)), self.assertRaises(webapp.AIModelOutputError) as caught:
+                webapp.normalize_basis_chat_result(expanded, payload, "deepseek")
+            self.assertEqual(caught.exception.diagnostics["response_contract_reason"], "schema_shape")
+        expanded = copy.deepcopy(parsed)
+        expanded["proposal"]["replacement_line"]["confidence"] = 94
+        with self.assertRaises(webapp.AIModelOutputError):
+            webapp.normalize_basis_chat_result(expanded, payload, "deepseek")
 
     def test_run589_selected_line_target_selection_fails_closed(self):
         base = valid_payload()
@@ -14192,17 +14148,21 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "selected line mismatch": {**valid_chat, "line": "Include: Other wording"},
             "duplicate wording does not redirect": {**valid_chat, "field": "elsewhere", "line_index": 0, "line": "Confirm: Other wording"},
         }
+        reply = revise_line_reply(text="Replacement in blue")
         for label, basis_chat in cases.items():
             payload = copy.deepcopy(base)
             payload["basis_chat"] = basis_chat
-            with self.subTest(label=label), self.assertRaises(webapp.OpenAIAnalysisError):
-                webapp.replacement_line_sections(payload, {"text": "Replacement in blue"})
+            with self.subTest(label=label):
+                self.assertEqual(webapp.revise_line_admission_error(payload)[0], "selected_line_stale")
+                with self.assertRaises(webapp.OpenAIAnalysisError):
+                    webapp.normalize_basis_chat_result(copy.deepcopy(reply), payload, "openai")
 
         colliding = copy.deepcopy(base)
         colliding["quote_basis_sections"][1]["id"] = "exact-section"
         colliding["basis_chat"] = valid_chat
+        self.assertEqual(webapp.revise_line_admission_error(colliding)[0], "selected_line_stale")
         with self.assertRaises(webapp.OpenAIAnalysisError):
-            webapp.replacement_line_sections(colliding, {"text": "Replacement in blue"})
+            webapp.normalize_basis_chat_result(copy.deepcopy(reply), colliding, "openai")
 
     def test_basis_chat_replacement_preserves_quantity_and_unit_when_only_text_changes(self):
         payload = valid_payload()
@@ -14231,15 +14191,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "unit": "nos",
             "quantity_label": "5 nos",
         }
-        parsed = {
-            "intent": "proposal",
-            "proposal": {
-                "message": "Update spotlight wattage.",
-                "replacement_line": {
-                    "text": "nos. 20W LED Spotlight",
-                },
-            },
-        }
+        parsed = revise_line_reply(text="nos. 20W LED Spotlight", message="Update spotlight wattage.")
 
         result = webapp.normalize_basis_chat_result(parsed, payload, "openai")
 
@@ -14281,17 +14233,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "unit": "lot",
             "quantity_label": "1 lot",
         }
-        parsed = {
-            "intent": "proposal",
-            "proposal": {
-                "message": "Update endorsement height.",
-                "replacement_line": {
-                    "tag": "Include",
-                    "text": "[ Professional Engineer Endorsement for structure above 5m ] - Custom curved coffee/service counter with Kent branding and teal/blue trim.",
-                    "confidence_pct": 82,
-                },
-            },
-        }
+        parsed = revise_line_reply(
+            text="[ Professional Engineer Endorsement for structure above 5m ] - Custom curved coffee/service counter with Kent branding and teal/blue trim.",
+            tag="Include", message="Update endorsement height.",
+        )
 
         result = webapp.normalize_basis_chat_result(parsed, payload, "openai")
 
@@ -14338,15 +14283,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "unit": "nos",
             "quantity_label": "12 nos",
         }
-        parsed = {
-            "intent": "proposal",
-            "proposal": {
-                "message": "Update chair quantity.",
-                "replacement_line": {
-                    "text": "14 nos. white molded dining chairs",
-                },
-            },
-        }
+        parsed = revise_line_reply(text="14 nos. white molded dining chairs", message="Update chair quantity.")
 
         result = webapp.normalize_basis_chat_result(parsed, payload, "openai")
 
@@ -14382,26 +14319,22 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "unit": "nos",
             "quantity_label": "12 nos",
         }
-        parsed = {
-            "intent": "proposal",
-            "proposal": {
-                "message": "Update quantity.",
-                "replacement_line": {
-                    "tag": "Include",
-                    "text": "[ nos. Bistro Chairs ] - Loose seating for lounge area.",
-                    "confidence_pct": 90,
-                },
-            },
-        }
+        text = "[ nos. Bistro Chairs ] - Loose seating for lounge area."
 
-        result = webapp.normalize_basis_chat_result(parsed, payload, "openai")
+        result = webapp.normalize_basis_chat_result(
+            revise_line_reply(text=text, quantity=60, message="Update quantity."), payload, "openai")
 
         line = result["proposal"]["quote_basis_sections"][0]["lines"][0]
-        self.assertEqual(line["text"], "[ nos. Bistro Chairs ] - Loose seating for lounge area.")
+        self.assertEqual(line["text"], text)
         self.assertEqual(str(line["quantity"]), "60")
         self.assertEqual(line["unit"], "nos")
+        # Old code put 60 in from its own word list when the reply kept everything; that is now the AI's job.
+        with self.assertRaises(webapp.AIModelOutputError) as caught:
+            webapp.normalize_basis_chat_result(revise_line_reply(text=text), payload, "openai")
+        self.assertEqual(caught.exception.diagnostics["response_contract_reason"], "unchanged")
 
     def test_basis_chat_edit_request_rejects_plain_answer(self):
+        # Was a refusal from a word list (#430 R2): an answer now shows as an answer and changes nothing.
         payload = valid_payload()
         payload["quote_basis_sections"] = [
             {
@@ -14422,18 +14355,21 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "line_index": 0,
             "line": "Confirm: Use a 6m x 6m booth footprint from the quotation title for area takeoff and layout basis.",
         }
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
+        before = copy.deepcopy(payload)
 
-        with self.assertRaises(webapp.OpenAIAnalysisError):
-            webapp.normalize_basis_chat_result({"intent": "answer", "answer": "Noted."}, payload, "openai")
+        result = webapp.normalize_basis_chat_result(revise_line_reply("answer", answer="Noted."), payload, "openai")
+
+        self.assertEqual((result["type"], result["answer"]), ("answer", "Noted."))
+        self.assertNotIn("proposal", result)
+        self.assertEqual(payload, before)
 
     def test_basis_chat_requested_keywords_focus_on_replacement_detail(self):
-        self.assertEqual(webapp.basis_chat_requested_keywords("change BRASIL to GAY"), ["gay"])
-        self.assertEqual(webapp.basis_chat_requested_keywords("change LED spotlight to track light"), ["track", "light"])
-        self.assertEqual(webapp.basis_chat_requested_keywords(">blue, green and yellow\n\nred"), ["red"])
-        self.assertEqual(webapp.basis_chat_requested_keywords("7x7"), ["7"])
-        self.assertEqual(webapp.basis_chat_requested_keywords("actually 6m x 3m"), ["6m", "3m"])
-        self.assertEqual(webapp.basis_chat_requested_keywords("60 qty"), ["60"])
-        self.assertEqual(webapp.basis_chat_required_intent({"basis_chat": {"question": "can this be changed to GAY graphics?", "line": "Custom: BRASIL graphics"}}), "proposal")
+        # #430 R2: no local word lists decide intent or check a reply's words.
+        for name in ("basis_chat_requested_keywords", "basis_chat_required_intent", "basis_chat_removal_intent",
+                     "basis_chat_quantity_change_requested", "basis_chat_requested_quantity_value",
+                     "validate_basis_chat_replacement_line", "preserve_basis_chat_quantity", "BASIS_CHAT_EDIT_STOPWORDS"):
+            self.assertFalse(hasattr(webapp, name), name)
 
     def test_basis_chat_edit_request_allows_arrow_shorthand_replacement(self):
         payload = valid_payload()
@@ -14462,16 +14398,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "unit": "sqm",
             "quantity_label": "36 sqm",
         }
-        parsed = {
-            "intent": "proposal",
-            "proposal": {
-                "replacement_line": {
-                    "tag": "Confirm",
-                    "text": "Needle punch carpet in Brazil red colour zones.",
-                    "confidence_pct": 70,
-                },
-            },
-        }
+        parsed = revise_line_reply(text="Needle punch carpet in Brazil red colour zones.")
 
         result = webapp.normalize_basis_chat_result(parsed, payload, "openai")
 
@@ -14481,6 +14408,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(line["unit"], "sqm")
 
     def test_basis_chat_edit_request_rejects_replacement_missing_requested_phrase(self):
+        # Was a word-list refusal (#430 R2). The guard that stays: no number nobody stated.
         payload = valid_payload()
         payload["quote_basis_sections"] = [
             {
@@ -14501,20 +14429,14 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "line_index": 0,
             "line": "Custom: BRASIL graphics on the front low wall cladding panels, printed and mounted as shown in the render.",
         }
-        parsed = {
-            "intent": "proposal",
-            "proposal": {
-                "replacement_line": {
-                    "tag": "Custom",
-                    "text": "BRASIL graphics on the front low wall cladding panels, printed and mounted as shown in the render, including full wrap/edges for a seamless finish.",
-                },
-            },
-        }
+        parsed = revise_line_reply(
+            text="BRASIL graphics on the front low wall cladding panels, 3m wide, printed and mounted as shown in the render.")
 
-        with self.assertRaises(webapp.OpenAIAnalysisError) as context:
+        with self.assertRaises(webapp.AIModelOutputError) as context:
             webapp.normalize_basis_chat_result(parsed, payload, "openai")
 
-        self.assertIn("gay", str(context.exception).lower())
+        self.assertEqual(context.exception.diagnostics["response_contract_reason"], "number_unstated")
+        self.assertNotIn("brasil", str(context.exception).lower())
 
     def test_basis_chat_edit_request_allows_remove_prompt_without_requested_phrase(self):
         payload = valid_payload()
@@ -14537,20 +14459,14 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "line_index": 0,
             "line": "Confirm: 100mm raised platform with aluminium edging visible around the booth.",
         }
-        parsed = {
-            "intent": "proposal",
-            "proposal": {
-                "replacement_line": {
-                    "text": "100mm raised platform visible around the booth.",
-                },
-            },
-        }
+        parsed = revise_line_reply(text="100mm raised platform visible around the booth.")
 
         result = webapp.normalize_basis_chat_result(parsed, payload, "openai")
 
         self.assertEqual(result["proposal"]["quote_basis_sections"][0]["lines"][0]["text"], "100mm raised platform visible around the booth.")
 
     def test_basis_chat_edit_request_rejects_remove_prompt_that_keeps_removed_detail(self):
+        # Was a word-list refusal (#430 R2): the reply is shown as a preview and nothing changes before Apply.
         payload = valid_payload()
         payload["quote_basis_sections"] = [
             {
@@ -14571,34 +14487,38 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "line_index": 0,
             "line": "Confirm: 100mm raised platform with aluminium edging visible around the booth.",
         }
-        parsed = {
-            "intent": "proposal",
-            "proposal": {
-                "replacement_line": {
-                    "text": "100mm raised platform without aluminium edging visible around the booth.",
-                },
-            },
-        }
+        before = copy.deepcopy(payload)
+        text = "100mm raised platform without aluminium edging visible around the booth."
 
-        with self.assertRaises(webapp.OpenAIAnalysisError):
-            webapp.normalize_basis_chat_result(parsed, payload, "openai")
+        result = webapp.normalize_basis_chat_result(revise_line_reply(text=text), payload, "openai")
+
+        self.assertEqual(result["proposal"]["quote_basis_sections"][0]["lines"][0]["text"], text)
+        self.assertEqual(payload, before)
 
     def test_basis_chat_question_rejects_proposal_response(self):
+        # Was a word-list refusal (#430 R2): the AI decides; a preview changes nothing before Apply.
         payload = valid_payload()
+        payload["quote_basis_sections"] = [{"id": "flooring", "title": "Flooring", "lines": [
+            {"tag": "Confirm", "text": "Green needle-punch carpet covering primary floor area."}]}]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "is this included?",
             "field": "flooring",
             "line_index": 0,
             "line": "Confirm: Green needle-punch carpet covering primary floor area.",
         }
+        before = copy.deepcopy(payload)
 
-        with self.assertRaises(webapp.OpenAIAnalysisError):
-            webapp.normalize_basis_chat_result({
-                "intent": "proposal",
-                "proposal": {
-                    "replacement_line": {"tag": "Include", "text": "Green needle-punch carpet covering primary floor area."}
-                },
-            }, payload, "openai")
+        result = webapp.normalize_basis_chat_result(revise_line_reply(
+            text="Green needle-punch carpet covering primary floor area.", tag="Include"), payload, "openai")
+
+        self.assertEqual(result["type"], "proposal")
+        self.assertEqual(payload, before)
+        # The other two outcomes are plain replies.
+        answer = webapp.normalize_basis_chat_result(revise_line_reply("answer", answer="Not yet."), payload, "openai")
+        question = webapp.normalize_basis_chat_result(revise_line_reply("clarification", question="Include it?"), payload, "openai")
+        self.assertEqual((answer["type"], answer["answer"]), ("answer", "Not yet."))
+        self.assertEqual((question["type"], question["question"]), ("clarification", "Include it?"))
 
     def test_basis_chat_edit_request_preserves_custom_pricing_flag(self):
         payload = valid_payload()
@@ -14622,15 +14542,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "line_index": 0,
             "line": "Custom: BRASIL graphics on the front low wall cladding panels, printed and mounted as shown in the render.",
         }
-        parsed = {
-            "intent": "proposal",
-            "proposal": {
-                "replacement_line": {
-                    "tag": "Custom",
-                    "text": "GAY graphics on the front low wall cladding panels, printed and mounted as shown in the render.",
-                },
-            },
-        }
+        parsed = revise_line_reply(
+            text="GAY graphics on the front low wall cladding panels, printed and mounted as shown in the render.")
 
         result = webapp.normalize_basis_chat_result(parsed, payload, "openai")
 
@@ -14682,7 +14595,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         with self.assertRaises(webapp.OpenAIAnalysisError) as context:
             webapp.normalize_basis_chat_result(parsed, payload, "openai")
 
-        self.assertIn("selected quote-basis line", str(context.exception))
+        self.assertNotIn("{", str(context.exception))
 
     def _gateway_chat_payload(self, *, line=False, question="What does this mean?"):
         payload=valid_payload()
@@ -14698,29 +14611,37 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "category_order": 1, "item_order": 1, "source_row_index": None, "warning": None, "status": None,
         }]}
 
-    def test_gateway_answer_and_quote_edit_use_explicit_answer_route(self):
-        for question in ("What does this mean?", "Include all lighting and electrical lines"):
-            payload=self._gateway_chat_payload(question=question)
-            answer="Select a specific quote-basis line and use Re to edit it."
-            response=json_response(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_BASIS_ANSWER_MODEL"], {"intent":"answer", "answer":answer})
-            with self.subTest(question=question), mock.patch.object(webapp.urllib.request,"urlopen",return_value=response) as send:
-                result=webapp.request_configured_basis_chat(payload)
-            send.assert_called_once()
-            request=send.call_args.args[0]; body=json.loads(request.data)
-            self.assertEqual(request.full_url,OPENROUTER_RESPONSES_URL)
-            self.assertEqual(body["model"],SYNTHETIC_DRAFT_CONFIG["OPENROUTER_BASIS_ANSWER_MODEL"])
-            self.assertEqual(body["reasoning"],{"effort":"high"})
-            self.assertEqual(body["max_output_tokens"],1200)
-            self.assertEqual(result["type"],"answer"); self.assertEqual(result["answer"],answer)
+    def test_gateway_question_on_a_line_is_answered_by_the_one_line_route(self):
+        payload=self._gateway_chat_payload(line=True, question="What does this mean?")
+        answer="The platform raises the floor by 100mm."
+        response=json_response(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_BASIS_LINE_MODEL"], revise_line_reply("answer", answer=answer))
+        with mock.patch.object(webapp.urllib.request,"urlopen",return_value=response) as send:
+            result=webapp.request_configured_basis_chat(payload)
+        send.assert_called_once()
+        request=send.call_args.args[0]; body=json.loads(request.data)
+        self.assertEqual(request.full_url,OPENROUTER_RESPONSES_URL)
+        self.assertEqual(body["model"],SYNTHETIC_DRAFT_CONFIG["OPENROUTER_BASIS_LINE_MODEL"])
+        self.assertEqual(body["reasoning"],{"effort":SYNTHETIC_DRAFT_CONFIG["OPENROUTER_BASIS_LINE_REASONING_EFFORT"]})
+        self.assertEqual(body["max_output_tokens"],4000)
+        self.assertEqual(result["type"],"answer"); self.assertEqual(result["answer"],answer)
+        # The effort is read from the route setting only (owner: medium is tested later in agent UAT).
+        values=synthetic_configuration(credential="synthetic-key",overrides={"OPENROUTER_BASIS_LINE_REASONING_EFFORT":"medium"})
+        with mock.patch.object(webapp,"read_dotenv_value",side_effect=values.get), \
+                mock.patch.object(webapp.urllib.request,"urlopen",return_value=json_response(values["OPENROUTER_BASIS_LINE_MODEL"], revise_line_reply("answer", answer=answer))) as send:
+            webapp.request_configured_basis_chat(self._gateway_chat_payload(line=True, question="What does this mean?"))
+        self.assertEqual(json.loads(send.call_args.args[0].data)["reasoning"],{"effort":"medium"})
 
     def test_gateway_selected_line_preserves_proposal_and_json_prompt(self):
         payload=self._gateway_chat_payload(line=True,question="change 100mm to 150mm")
-        parsed={"intent":"proposal","proposal":{"message":"Change the platform height to 150mm?", "replacement_line":{"tag":"Confirm", "text":"150mm raised platform with needle punch carpet.", "confidence_pct":90}}}
+        parsed=revise_line_reply(text="150mm raised platform with needle punch carpet.", message="Change the platform height to 150mm?")
         response=json_response(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_BASIS_LINE_MODEL"],parsed)
         with mock.patch.object(webapp.urllib.request,"urlopen",return_value=response) as send:
-            result=webapp.answer_basis_chat(payload)
+            result=webapp.request_configured_basis_chat(payload)
         send.assert_called_once(); body=json.loads(send.call_args.args[0].data)
         self.assertEqual(body["model"],SYNTHETIC_DRAFT_CONFIG["OPENROUTER_BASIS_LINE_MODEL"])
+        self.assertEqual(body["text"]["format"]["name"],"revise_line_v1")
+        self.assertIs(body["text"]["format"]["strict"],True)
+        self.assertEqual(body["max_output_tokens"],4000)
         self.assertEqual(body["input"][0]["role"],"user")
         self.assertIn("JSON",body["input"][0]["content"][0]["text"])
         self.assertEqual(result["type"],"proposal")
@@ -14800,7 +14721,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         error=webapp.urllib.error.HTTPError(OPENROUTER_RESPONSES_URL,401,"PRIVATE_HTTP",{},io.BytesIO(b'{"error":{"message":"PRIVATE_BODY"}}'))
         for response in (FixtureHttpResponse(responses_envelope(model,"not valid json")),error):
             with self.subTest(kind=type(response).__name__),mock.patch.object(webapp.urllib.request,"urlopen",side_effect=[response]) as send,mock.patch.object(webapp,"write_local_log") as logs,mock.patch.object(webapp.time,"sleep") as sleep:
-                with self.assertRaises(webapp.OpenAIAnalysisError) as caught:webapp.answer_basis_chat(payload)
+                with self.assertRaises(webapp.OpenAIAnalysisError) as caught:webapp.request_configured_basis_chat(payload)
             send.assert_called_once();sleep.assert_not_called()
             body=json.loads(send.call_args.args[0].data)
             self.assertEqual(body["model"],model);self.assertEqual(body["reasoning"],{"effort":"high"})
@@ -14809,9 +14730,9 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             self.assertNotIn("PRIVATE",str(caught.exception)+json.dumps([call.args for call in logs.call_args_list],default=str))
 
     def test_gateway_basis_facade_validation_keeps_zero_send_and_model_privacy(self):
-        values=synthetic_configuration(credential="synthetic-key",overrides={"OPENROUTER_BASIS_ANSWER_MODEL":"PRIVATE_CANARY/model.invalid"})
+        values=synthetic_configuration(credential="synthetic-key",overrides={"OPENROUTER_BASIS_LINE_MODEL":"PRIVATE_CANARY/model.invalid"})
         with mock.patch.object(webapp,"read_dotenv_value",side_effect=values.get),mock.patch.object(webapp.urllib.request,"urlopen") as send,mock.patch.object(webapp,"write_local_log") as logs:
-            with self.assertRaises(webapp.OpenAIAnalysisError) as caught:webapp.answer_basis_chat(self._gateway_chat_payload())
+            with self.assertRaises(webapp.OpenAIAnalysisError) as caught:webapp.request_configured_basis_chat(self._gateway_chat_payload(line=True))
         send.assert_not_called()
         self.assertEqual(caught.exception.diagnostics["failure_boundary"],"request_validation")
         self.assertEqual(caught.exception.diagnostics["attempt_number"],0)
@@ -14827,7 +14748,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
     def test_basis_chat_without_provider_does_not_use_local_fallback(self):
         with mock.patch.object(webapp,"read_dotenv_value",side_effect=synthetic_configuration().get),mock.patch.object(webapp.urllib.request,"urlopen") as send:
-            with self.assertRaises(webapp.OpenAIAnalysisError):webapp.answer_basis_chat(self._gateway_chat_payload())
+            with self.assertRaises(webapp.OpenAIAnalysisError):webapp.request_configured_basis_chat(self._gateway_chat_payload(line=True))
         send.assert_not_called()
 
     def test_safe_error_messages_redacts_keys_headers_and_env_assignments(self):
@@ -15146,6 +15067,9 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
     def test_queued_ai_job_logs_keep_user_tracking_context(self):
         payload = valid_payload()
+        payload["quote_basis_sections"] = [{"id": "platform", "title": "Platform", "lines": [
+            {"tag": "Confirm", "text": "100mm raised platform with needle punch carpet."}]}]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
         payload["basis_chat"] = {
             "question": "what does this mean?",
             "scope": "line",
@@ -31996,7 +31920,9 @@ const helperNames = [
   "basisChatFriendlyError",
 ];
 const GENERIC_FAILURE_MESSAGE = "Failed. Please try again. Contact support if this keeps happening.";
-eval(helperNames.map(extractFunction).join("\n"));
+const reTexts = source.match(/const BASIS_CHAT_REPLY_UNUSABLE_CODE[\s\S]*?\]\);/);
+assert.ok(reTexts, "fixed Re texts are declared");
+eval(reTexts[0] + "\n" + helperNames.map(extractFunction).join("\n"));
 
 assert.strictEqual(basisDisplayTitle("Flooring & Platform - Quote Basis To Confirm"), "Flooring & Platform");
 assert.strictEqual(basisDisplayTitle("Graphics / Signage"), "Graphics / Signage");
@@ -32044,6 +31970,25 @@ assert.strictEqual(
   "Failed. Please try again. Contact support if this keeps happening. Reference: ERR-1234ABCD."
 );
 assert.ok(!/AI basis chat|JSON|replacement line/i.test(friendlyError));
+// #430 R2: a reply the app could not use says so in plain words, with its reference.
+assert.strictEqual(
+  basisChatFriendlyError({ status: "failed", failure_code: "basis_chat_reply_unusable", error_reference: "ERR-1234ABCD",
+    errors: ["The AI reply could not be used, so the line was not changed. Please say the change another way. Reference: ERR-1234ABCD."] }),
+  "The AI reply could not be used, so the line was not changed. Please say the change another way. Reference: ERR-1234ABCD."
+);
+// Only the server's fixed admission texts show; any other server text stays generic.
+assert.strictEqual(
+  basisChatFriendlyError({ status: "blocked", errors: ["Please keep the message to 1,000 characters or fewer."] }),
+  "Please keep the message to 1,000 characters or fewer."
+);
+assert.strictEqual(
+  basisChatFriendlyError({ status: "blocked", errors: ["Traceback: secret detail"] }),
+  "Failed. Please try again. Contact support if this keeps happening."
+);
+assert.strictEqual(
+  basisChatFriendlyError({ status: "failed", failure_code: "something_else", error_reference: "ERR-1234ABCD" }),
+  "Failed. Please try again. Contact support if this keeps happening. Reference: ERR-1234ABCD."
+);
 assert.ok(source.includes("line_index: state.basisChat.lineIndex"));
 assert.ok(source.includes("const requestPayload = basisChatPayload(text);"));
 assert.ok(source.includes('startJob("basis_chat", requestPayload, { jobId: operation.lineage.requestedJobId })'));
@@ -32238,10 +32183,10 @@ const lineage = canonicalBasisChatLineage({
   _lineageVersion: BASIS_CHAT_LINEAGE_VERSION,
   lineageId: "lineage-static-apply",
   clientOperationId: "operation-static-apply",
-  source: "local_fragment",
-  jobType: null,
-  requestedJobId: null,
-  serverJobId: null,
+  source: "server",
+  jobType: "basis_chat",
+  requestedJobId: "job-static-apply",
+  serverJobId: "job-static-apply",
 });
 const runtimeToken = mintBasisChatRuntimeAuthority("running", proposalOrigin, lineage);
 state.basisChat.authorityOwner = canonicalBasisChatAuthorityOwner({ status: "running", origin: proposalOrigin, lineage });
@@ -32340,317 +32285,29 @@ assert.strictEqual(state.basisChat.proposal, null);
 
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
 
-    def test_static_short_fragment_edit_updates_bracket_reference_only(self):
-        node = require_node(self)
-        script = r"""
-const fs = require("fs");
-const assert = require("assert");
-const source = fs.readFileSync("webapp/static/app.js", "utf8");
-
-function extractFunction(name) {
-  const marker = `function ${name}`;
-  const start = source.indexOf(marker);
-  if (start < 0) throw new Error(`Missing function ${name}`);
-  const bodyStart = source.indexOf(") {", start) + 2;
-  if (bodyStart < 2) throw new Error(`Missing body for function ${name}`);
-  let depth = 0;
-  for (let index = bodyStart; index < source.length; index += 1) {
-    const char = source[index];
-    if (char === "{") depth += 1;
-    if (char === "}") {
-      depth -= 1;
-      if (depth === 0) return source.slice(start, index + 1);
-    }
-  }
-  throw new Error(`Unclosed function ${name}`);
-}
-
-const state = {
-  quoteBasis: {},
-  quoteSessionId: "quote-fragment-test",
-  outputRevision: 0,
-  quoteBasisSections: [{
-    id: "counters-and-cabinets",
-    title: "COUNTERS AND CABINETS",
-    lines: [{
-      id: "engineer-endorsement",
-      tag: "Include",
-      text: "[ Professional Engineer Endorsement for structure above 4m ] - Custom curved coffee/service counter with Kent branding and teal/blue trim.",
-      quantity: 1,
-      unit: "lot",
-      confidence: 82,
-      pricing_keyword: "counters-and-cabinets-professional-engineer-endorsement-for-structure-above-4m",
-      catalog_description: "Professional Engineer Endorsement for structure above 4m",
-      pricing_reference_description: "Professional Engineer Endorsement for structure above 4m",
-      catalog_unit_price: 1200,
-    }],
-  }],
-  basisChat: {
-    scope: "line",
-    sectionId: "counters-and-cabinets",
-    field: "counters-and-cabinets",
-    lineIndex: 0,
-    line: "Include: [ Professional Engineer Endorsement for structure above 4m ] - Custom curved coffee/service counter with Kent branding and teal/blue trim.",
-  },
-  lineItems: [],
-  outputRows: [],
-};
-const BASIS_CHAT_PROPOSAL_ORIGIN_VERSION = 1;
-const BASIS_CHAT_AUTHORITY_MAX_DEPTH = 40;
-const BASIS_CHAT_AUTHORITY_MAX_NODES = 20000;
-function safeQuoteSessionId(value) { return String(value || ""); }
-function revisionNumber(value, fallback = 0) { return Number.isInteger(Number(value)) ? Number(value) : fallback; }
-function cleanCustomerQuoteLineText(value = "") { return String(value || "").trim().replace(/\s+/g, " "); }
-function normalizeUnit(value = "") { return String(value || "").trim(); }
-function basisDisplayTitle(value = "") { return String(value || "").trim(); }
-function normalizeCategoryTitle(value = "") { return basisDisplayTitle(value) || "General"; }
-function exactPricingReferenceSectionTitle() { return ""; }
-function sectionTitleKey(value = "") { return String(value || "").toLowerCase().trim(); }
-function referenceSectionTitleAliases(value = "") { return [String(value || "").trim()].filter(Boolean); }
-const QUOTE_BASIS_LEGACY_ORDER = ["surfaces", "counters", "platform", "graphics", "furniture", "electrical"];
-const QUOTE_BASIS_KEY_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
-const QUOTE_BASIS_UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
-
-eval(source.slice(source.indexOf("function canonicalBasisSectionText"), source.indexOf("function pythonWhitespaceText")));
-eval([
-  "isPlainObject",
-  "safeId",
-  "pricingReferenceLineText",
-  "bracketedCatalogReferenceParts",
-  "leadingNumber",
-  "formatQuantityNumber",
-  "normalizeQuantityPrefixUnit",
-  "leadingQuantityPrefix",
-  "quantityUnitAliases",
-  "startsWithQuantityUnit",
-  "stripLeadingQuantityCountFromLineText",
-  "normalizedLineTextQuantityParts",
-  "normalizeBasisTag",
-  "isCustomPricingBasisLine",
-  "normalizeConfidence",
-  "normalizePossiblePricingMatches",
-  "numberOrNull",
-  "orderNumber",
-  "splitBasisDecisionText",
-  "normalizedQuantityEstimate",
-  "normalizeBasisLines",
-  "parseBasisLine",
-  "normalizeQuoteBasisTitle",
-  "pythonWhitespaceText",
-  "normalizeQuoteBasisSections",
-  "quoteBasisFromSections",
-  "canonicalPrimaryOrderValue",
-  "canonicalizeOrderFields",
-  "canonicalizePrimaryOrderFields",
-  "canonicalBasisSectionText",
-  "canonicalBasisSectionLine",
-  "canonicalQuoteBasisSections",
-  "canonicalQuoteBasis",
-  "cloneQuoteBasisSections",
-  "canonicalQuoteBasisForPersistence",
-  "quoteCommercialStrictDataEqual",
-  "basisChatAuthorityRecordKeys",
-  "basisChatAuthorityStrictEqual",
-  "basisChatRequireExactKeys",
-  "admittedBasisChatSections",
-  "admittedBasisChatMap",
-  "canonicalBasisChatSelector",
-  "rawBasisChatTarget",
-  "detachedBasisChatAuthorityValue",
-  "recursivelyFreezeBasisChatAuthority",
-  "canonicalBasisChatProposalOrigin",
-  "currentBasisChatAuthority",
-  "basisChatProposalOrigin",
-  "selectedBasisLine",
-  "replaceLiteralText",
-  "replaceBasisLineReferenceText",
-  "buildLiteralReplacementProposal",
-  "unbracketedCatalogReferenceText",
-  "simpleBasisEditFragment",
-  "replaceReferenceDimensionToken",
-  "basisChatRequestedQuantityValue",
-  "basisLineTextHasLiteralQuantityWord",
-  "markBasisLineAsManualPricing",
-  "buildSelectedLineFragmentReplacementProposal",
-].map(extractFunction).join("\n"));
-
-state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
-const proposal = buildSelectedLineFragmentReplacementProposal("5m");
-assert.ok(proposal, "expected a deterministic proposal");
-const line = proposal.quoteBasisSections[0].lines[0];
-assert.strictEqual(line.text, "Professional Engineer Endorsement for structure above 5m - Custom curved coffee/service counter with Kent branding and teal/blue trim.");
-assert.strictEqual(line.tag, "Include");
-assert.strictEqual(line.custom_pricing, true);
-assert.strictEqual(line.custom_confirmed, true);
-assert.strictEqual(line.pricing_keyword, undefined);
-assert.strictEqual(line.catalog_description, undefined);
-assert.strictEqual(line.pricing_reference_description, undefined);
-assert.strictEqual(line.catalog_unit_price, undefined);
-assert.strictEqual(line.text.startsWith("["), false);
-assert.strictEqual(line.text.includes("above 4m"), false);
-assert.strictEqual(line.quantity, 1);
-assert.strictEqual(line.unit, "lot");
-assert.strictEqual(line.confidence, 82);
-assert.strictEqual(proposal.quoteBasis["counters-and-cabinets"].includes("above 5m"), true);
-const literalProposal = buildLiteralReplacementProposal({ from: "4m", to: "5m" });
-assert.ok(literalProposal, "expected literal replacement proposal");
-const literalLine = literalProposal.quoteBasisSections[0].lines[0];
-assert.strictEqual(literalLine.text, "Professional Engineer Endorsement for structure above 5m - Custom curved coffee/service counter with Kent branding and teal/blue trim.");
-assert.strictEqual(literalLine.custom_pricing, true);
-assert.strictEqual(literalLine.custom_confirmed, true);
-assert.strictEqual(literalLine.pricing_keyword, undefined);
-"""
-        completed = subprocess.run(
-            [node, "-e", script],
-            cwd=str(ROOT),
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-
-        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
-
-    def test_static_line_revise_qty_shorthand_updates_quantity_without_ai(self):
-        node = require_node(self)
-        script = r"""
-const fs = require("fs");
-const assert = require("assert");
-const source = fs.readFileSync("webapp/static/app.js", "utf8");
-
-function extractFunction(name) {
-  const marker = `function ${name}`;
-  const start = source.indexOf(marker);
-  if (start < 0) throw new Error(`Missing function ${name}`);
-  const bodyStart = source.indexOf(") {", start) + 2;
-  if (bodyStart < 2) throw new Error(`Missing body for function ${name}`);
-  let depth = 0;
-  for (let index = bodyStart; index < source.length; index += 1) {
-    const char = source[index];
-    if (char === "{") depth += 1;
-    if (char === "}") {
-      depth -= 1;
-      if (depth === 0) return source.slice(start, index + 1);
-    }
-  }
-  throw new Error(`Unclosed function ${name}`);
-}
-
-const state = {
-  quoteBasis: {},
-  quoteSessionId: "quote-quantity-test",
-  outputRevision: 0,
-  quoteBasisSections: [{
-    id: "furniture-rental",
-    title: "Furniture Rental",
-    lines: [{
-      tag: "Include",
-      text: "[ nos. Bistro Chairs ] - Loose seating for lounge area.",
-      quantity: 12,
-      unit: "nos",
-      confidence: 90,
-    }],
-  }],
-  lineItems: [],
-  basisChat: {
-    scope: "line",
-    sectionId: "furniture-rental",
-    field: "furniture-rental",
-    lineIndex: 0,
-    line: "Include: [ nos. Bistro Chairs ] - Loose seating for lounge area.",
-  },
-};
-const BASIS_CHAT_PROPOSAL_ORIGIN_VERSION = 1;
-const BASIS_CHAT_AUTHORITY_MAX_DEPTH = 40;
-const BASIS_CHAT_AUTHORITY_MAX_NODES = 20000;
-function safeQuoteSessionId(value) { return String(value || ""); }
-function revisionNumber(value, fallback = 0) { return Number.isInteger(Number(value)) ? Number(value) : fallback; }
-function normalizeUnit(value = "") { return String(value || "").trim(); }
-function basisDisplayTitle(value = "") { return String(value || "").trim(); }
-function normalizeCategoryTitle(value = "") { return basisDisplayTitle(value) || "General"; }
-function exactPricingReferenceSectionTitle() { return ""; }
-function sectionTitleKey(value = "") { return String(value || "").toLowerCase().trim(); }
-function referenceSectionTitleAliases(value = "") { return [String(value || "").trim()].filter(Boolean); }
-const QUOTE_BASIS_LEGACY_ORDER = ["surfaces", "counters", "platform", "graphics", "furniture", "electrical"];
-const QUOTE_BASIS_KEY_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
-const QUOTE_BASIS_UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
-
-eval(source.slice(source.indexOf("function canonicalBasisSectionText"), source.indexOf("function pythonWhitespaceText")));
-eval([
-  "isPlainObject",
-  "safeId",
-  "normalizeQuoteBasisTitle",
-  "cleanCustomerQuoteLineText",
-  "bracketedCatalogReferenceParts",
-  "leadingNumber",
-  "formatQuantityNumber",
-  "normalizeQuantityPrefixUnit",
-  "leadingQuantityPrefix",
-  "quantityUnitAliases",
-  "startsWithQuantityUnit",
-  "stripLeadingQuantityCountFromLineText",
-  "normalizedLineTextQuantityParts",
-  "normalizeBasisTag",
-  "isCustomPricingBasisLine",
-  "normalizeConfidence",
-  "normalizePossiblePricingMatches",
-  "numberOrNull",
-  "orderNumber",
-  "splitBasisDecisionText",
-  "normalizedQuantityEstimate",
-  "normalizeBasisLines",
-  "pythonWhitespaceText",
-  "normalizeQuoteBasisSections",
-  "quoteBasisFromSections",
-  "canonicalPrimaryOrderValue",
-  "canonicalizeOrderFields",
-  "canonicalizePrimaryOrderFields",
-  "canonicalBasisSectionText",
-  "canonicalBasisSectionLine",
-  "canonicalQuoteBasisSections",
-  "canonicalQuoteBasis",
-  "cloneQuoteBasisSections",
-  "canonicalQuoteBasisForPersistence",
-  "quoteCommercialStrictDataEqual",
-  "basisChatAuthorityRecordKeys",
-  "basisChatAuthorityStrictEqual",
-  "basisChatRequireExactKeys",
-  "admittedBasisChatSections",
-  "admittedBasisChatMap",
-  "canonicalBasisChatSelector",
-  "selectedBasisLine",
-  "rawBasisChatTarget",
-  "detachedBasisChatAuthorityValue",
-  "recursivelyFreezeBasisChatAuthority",
-  "canonicalBasisChatProposalOrigin",
-  "currentBasisChatAuthority",
-  "basisChatProposalOrigin",
-  "unbracketedCatalogReferenceText",
-  "markBasisLineAsManualPricing",
-  "replaceLiteralText",
-  "simpleBasisEditFragment",
-  "replaceReferenceDimensionToken",
-  "basisChatRequestedQuantityValue",
-  "basisLineTextHasLiteralQuantityWord",
-  "buildSelectedLineFragmentReplacementProposal",
-].map(extractFunction).join("\n"));
-
-state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
-const proposal = buildSelectedLineFragmentReplacementProposal("60 qty");
-assert.ok(proposal);
-const line = proposal.quoteBasisSections[0].lines[0];
-assert.strictEqual(line.text, "[ nos. Bistro Chairs ] - Loose seating for lounge area.");
-assert.strictEqual(line.quantity, 60);
-assert.strictEqual(line.unit, "nos");
-"""
-        completed = subprocess.run(
-            [node, "-e", script],
-            cwd=str(ROOT),
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-
-        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+    def test_static_re_sends_every_message_to_the_ai_route(self):
+        # #430 R2: the local literal and fragment shortcuts are gone; every Re message is one AI job.
+        js = (ROOT / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
+        for removed in ("parseLiteralReplacementCommand", "buildLiteralReplacementProposal", "replaceBasisLineReferenceText",
+                        "buildSelectedLineFragmentReplacementProposal", "simpleBasisEditFragment", "replaceReferenceDimensionToken",
+                        "basisChatRequestedQuantityValue", "basisLineTextHasLiteralQuantityWord", "renderLiteralReplacementPreview",
+                        "beginLocalBasisChatAuthority", "local_literal", "local_fragment", "No exact matches for",
+                        "Literal replacement: changed the selected basis line.", "Changed lines:", "Affected sections:",
+                        # G2 F2: the local word list that answered "secret", "token" and the like without the AI.
+                        "isSensitiveChatRequest", "I cannot access or reveal"):
+            self.assertNotIn(removed, js)
+        submit = js.split("async function handleBasisChatSubmit(event) {", 1)[1].split("\nfunction applyBasisChatProposal", 1)[0]
+        self.assertIn("const aiPromise = buildAiBasisChatResponse(text);", submit)
+        self.assertEqual(len(re.findall(r"(?<!re)setBasisChatProposal\(", submit)), 1)
+        # A clarification shows as the AI's question; Apply stays off because no proposal is set.
+        self.assertIn('const replyText = result.type === "clarification" ? result.question : result.answer;', js)
+        html = (ROOT / "webapp" / "static" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('<textarea id="basisChatPrompt" rows="3" maxlength="1000"', html)
+        # The page shows only these fixed server texts, so both copies must stay the same.
+        for text in (webapp.REVISE_LINE_MESSAGE_EMPTY, webapp.REVISE_LINE_MESSAGE_TOO_LONG, webapp.REVISE_LINE_STALE_MESSAGE,
+                     webapp.BASIS_CHAT_REPLY_UNUSABLE_MESSAGE, webapp.BASIS_CHAT_REPLY_UNUSABLE_CODE):
+            self.assertIn(json.dumps(text), js)
+        self.assertIn(f'maxlength="{webapp.REVISE_LINE_MESSAGE_MAX_CHARS}"', html)
 
     def test_basis_chat_strict_authority_identity_and_operation_lineage(self):
         node = require_node(self)
@@ -32785,9 +32442,16 @@ assert.strictEqual(basisChatOriginIsCurrent(origin), false);
 state.quoteBasisSections = JSON.parse(JSON.stringify(origin.quoteBasisSections));
 state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
 
+// #430 R2: no local shortcut lineage exists any more; a saved one is refused like any invalid state.
+for (const localSource of ["local_fragment", "local_literal"]) {
+  assert.throws(() => canonicalBasisChatLineage({
+    _lineageVersion: 1, lineageId: "lineage-local-proof", clientOperationId: "operation-local-proof",
+    source: localSource, jobType: null, requestedJobId: null, serverJobId: null,
+  }), TypeError);
+}
 const lineage = canonicalBasisChatLineage({
   _lineageVersion: 1, lineageId: "lineage-local-proof", clientOperationId: "operation-local-proof",
-  source: "local_fragment", jobType: null, requestedJobId: null, serverJobId: null,
+  source: "server", jobType: "basis_chat", requestedJobId: "job-local-proof", serverJobId: null,
 });
 const localToken = mintBasisChatRuntimeAuthority("running", origin, lineage);
 installBasisChatOwner("running", origin, lineage, localToken);
@@ -32962,17 +32626,10 @@ assert.strictEqual(state.basisChat.completionNotice, null);
         self.assertIn("margin: 0 0 12px;", css)
         self.assertIn(".quote-basis-title-row h3", css)
 
-    def test_static_chat_blocks_secret_and_internal_prompt_requests(self):
+    def test_static_page_names_no_server_secret(self):
         static_dir = ROOT / "webapp" / "static"
         js = (static_dir / "app.js").read_text(encoding="utf-8")
 
-        for expected in (
-            "isSensitiveChatRequest",
-            "api key",
-            "system prompt",
-            "I cannot access or reveal secrets",
-        ):
-            self.assertIn(expected, js)
         for forbidden_secret_name in (
             "OPENROUTER_API_KEY",
             "DEEPSEEK_API_KEY",
@@ -45308,11 +44965,6 @@ run().catch(error => { console.error(error.stack); process.exitCode = 1; });
     def test_static_literal_replacement_and_clarification_contracts_exist(self):
         static_dir = ROOT / "webapp" / "static"
         js = (static_dir / "app.js").read_text(encoding="utf-8")
-        self.assertIn("parseLiteralReplacementCommand", js)
-        self.assertIn("buildLiteralReplacementProposal", js)
-        self.assertIn("replaceBasisLineReferenceText", js)
-        self.assertIn("markBasisLineAsManualPricing", js)
-        self.assertIn('tag: bracketedCatalogReferenceParts(currentLine.text || "") ? normalizeBasisTag(currentLine.tag) : "Confirm"', js)
         self.assertIn("openBlockingClarifications", js)
         self.assertIn("Generate final Quote Basis", js)
         self.assertIn('state.basisConfirmed = false', js)
@@ -46518,7 +46170,7 @@ process.stdout.write("ok");
             "line": "Include: Duplicate words",
         }
         before = webapp.canonical_quote_basis_sections(payload)
-        changed = webapp.replacement_line_sections(payload, {"text": "Blue panel", "confidence": 93})
+        changed = webapp.normalize_basis_chat_result(revise_line_reply(text="Blue panel"), payload, "openai")["proposal"]["quote_basis_sections"]
         self.assertEqual(changed[0]["lines"][1]["text"], "Blue panel")
         self.assertEqual(changed[0]["lines"][1]["meta"], {"slot": 1})
         self.assertEqual(changed[0]["lines"][0], before[0]["lines"][0])
@@ -46537,7 +46189,7 @@ process.stdout.write("ok");
             candidate = copy.deepcopy(payload)
             mutate(candidate)
             with self.subTest(label=label), self.assertRaises(webapp.OpenAIAnalysisError):
-                webapp.replacement_line_sections(candidate, {"text": "Blue panel"})
+                webapp.normalize_basis_chat_result(revise_line_reply(text="Blue panel"), candidate, "openai")
 
     def test_run593_openai_and_deepseek_provider_expansion_is_rejected(self):
         payload = valid_payload()
@@ -46553,7 +46205,7 @@ process.stdout.write("ok");
             "line_index": 0,
             "line": "Confirm: Original",
         }
-        valid = {"intent": "proposal", "proposal": {"message": "Update", "replacement_line": {"text": "Replacement"}}}
+        valid = revise_line_reply(text="Replacement", message="Update")
         for provider in ("openai", "deepseek"):
             result = webapp.normalize_basis_chat_result(copy.deepcopy(valid), payload, provider)
             self.assertEqual(result["proposal"]["quote_basis_sections"][0]["lines"][0]["text"], "Replacement")
@@ -46570,12 +46222,15 @@ process.stdout.write("ok");
                 expanded["proposal"][key] = value
                 with self.subTest(provider=provider, key=key), self.assertRaises(webapp.OpenAIAnalysisError):
                     webapp.normalize_basis_chat_result(expanded, payload, provider)
+            row = valid["proposal"]["replacement_line"]
             for replacement in (
-                [{"text": "One"}, {"text": "Two"}],
-                {"text": "Replacement", "pricing_keyword": "forbidden"},
-                {"text": "Replacement", "custom_pricing": False},
-                {"text": "Replacement", "catalog_unit_price": 17.5},
-                {"text": "Replacement", "arbitrary_metadata": True},
+                [{**row, "text": "One"}, {**row, "text": "Two"}],
+                {**row, "pricing_keyword": "forbidden"},
+                {**row, "custom_pricing": False},
+                {**row, "catalog_unit_price": 17.5},
+                {**row, "arbitrary_metadata": True},
+                {**row, "tag": "Custom"},
+                {**row, "confidence_pct": 90},
             ):
                 expanded = copy.deepcopy(valid)
                 expanded["proposal"]["replacement_line"] = replacement

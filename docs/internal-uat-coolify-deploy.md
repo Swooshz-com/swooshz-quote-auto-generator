@@ -227,7 +227,11 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      the `shared` values in `deploy/internal/release-settings.json`, generated
      secrets, the credential-store entries the map names (the R2 token, the R2
      endpoint and the AI key) and the run values. Set `REHEARSAL_IMAGE_ID` to
-     the image live runs now. Give it the host
+     the image live runs now. **Retired names:** an image from before the
+     one-route Re change (Re on `BASIS_LINE` only) needs every AI route set, or all its AI
+     stops. While live runs such an image, also set `OPENROUTER_BASIS_ANSWER_MODEL` = `openai/gpt-5.4-nano`, `OPENROUTER_BASIS_ANSWER_REASONING_EFFORT` = `high` and `OPENROUTER_BASIS_ANSWER_PROVIDER_ONLY` = `["openai"]` on the
+     rehearsal service for steps 4, 5 and 7, which run the current image;
+     the candidate ignores them. Give it the host
      `quote-rehearsal.<server-ip>.sslip.io`. Coolify services have no basic
      auth, so access control is the app's own sign-in with the run's test-only
      logins.
@@ -551,7 +555,11 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      ```
 
      Fix a missing or unexpected name only with the owner's approval for that
-     env change.
+     env change. The first deploy of the one-route Re change reports
+     the three `OPENROUTER_BASIS_ANSWER_*` names as must-be-unset: removing
+     them from live is an env change for the owner's own OK, and the deploy
+     summary asks for it together with putting them back on a rollback
+     (8.5).
    - Commit the one-line image pin and its source comment on the
      `deployment/internal` branch and deploy in Coolify. Record the UTC time
      the deployment finished as `$switchedAt` (for example
@@ -593,6 +601,14 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
    ```powershell
    node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names COOLIFY_SWOOSHZ_API_URL,COOLIFY_SWOOSHZ_API_TOKEN -- python scripts\live_rollback.py --pass-b-result "$out\live-readonly.json" --live-url https://<live host> --switched-at $switchedAt --candidate-image <candidate image id> --candidate-source <candidate commit> --previous-image <current image id from step 1> --previous-source <its source commit> --deploy-checkout <deployment/internal checkout> --live-app-uuid <live app uuid> --record "$out\rollback.json" --execute
    ```
+
+   **Retired names on rollback:** when the previous image is from before the
+   one-route Re change and the three `OPENROUTER_BASIS_ANSWER_*`
+   names were removed in 8.3, put them back on live first, with `OPENROUTER_BASIS_ANSWER_MODEL` = `openai/gpt-5.4-nano`, `OPENROUTER_BASIS_ANSWER_REASONING_EFFORT` = `high` and `OPENROUTER_BASIS_ANSWER_PROVIDER_ONLY` = `["openai"]`
+   (the owner's OK from the deploy summary), then run the rollback. Without
+   them that image stops every AI call: draft, High Quality, Re and pricing.
+   The candidate ignores them. Pass B and the rollback record make no AI
+   call, so they would not show it. The same applies to a rollback by hand.
 
    It keeps the candidate only for a passing Pass B result that walked live's
    host (compared by hash), started after `$switchedAt`, downloaded nothing
