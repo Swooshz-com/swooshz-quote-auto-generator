@@ -23578,6 +23578,19 @@ eval([
   assert.strictEqual(state.companyProfiles.length, 1);
   assert.strictEqual(state.companyProfiles[0].defaults.company.name, "Imported Co");
   assert.deepStrictEqual(importDefaultsApplied.company, { name: "Imported Co" });
+
+  // G2 Low 449-3: a name with no ASCII letters must not match by the imported file's id.
+  // The exported file still carries the original's id; the typed name is new, so this is a new copy.
+  await saveNamedCompanyProfile("展台公司", { mode: "import", profile: { ...imported, id: "legacy-profile-id" } });
+  assert.strictEqual(elements.profileOverwriteModal.hidden, true, "A new non-ASCII name matched a profile by the file's id");
+  assert.strictEqual(posted.length, 3);
+  assert.strictEqual(posted[2].payload.operation, "create");
+  assert.strictEqual(posted[2].payload.revision, 0);
+  // The same non-ASCII name typed again matches by name and asks first.
+  await saveNamedCompanyProfile("展台公司", { mode: "import", profile: imported });
+  assert.strictEqual(elements.profileOverwriteModal.hidden, false);
+  assert.strictEqual(posted.length, 3);
+  assert.strictEqual(overwriteStrong.textContent, 'A profile named "展台公司" already exists.');
 })().catch((error) => {
   console.error(error);
   process.exit(1);

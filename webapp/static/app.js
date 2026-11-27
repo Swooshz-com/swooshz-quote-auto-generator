@@ -5818,7 +5818,9 @@ function profilePayloadForLabel(label = "", options = {}) {
 
 function existingCompanyProfileForLabel(label = "", options = {}) {
   const safeLabel = safeProfileLabel(label, "");
-  const candidateId = safeProfileId(safeLabel, options.profile?.id || "");
+  // An import matches by the typed name only: the imported file's id must never pick which
+  // profile the overwrite question replaces (a name with no ASCII letters would fall back to it).
+  const candidateId = options.mode === "import" ? "" : safeProfileId(safeLabel, options.profile?.id || "");
   const candidateLabel = safeLabel.toLowerCase();
   return state.companyProfiles.find((profile) => {
     if (profile?.permissions?.canUpdate === false) return false;
