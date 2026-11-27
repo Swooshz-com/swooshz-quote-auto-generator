@@ -98,19 +98,38 @@ try {
   await expectErrorStaysUntilClosed(page, "Excel refusal");
   result.exportRefusal = refused.text;
 
-  // 4. Next on Customer while offline says why it cannot go on.
+  // 4. Next on Customer while offline says why once, in the step's "Quote not saved" dialog (no second popup).
   await run.openPanel(page, "customer");
   await page.locator("#clientNameEditor").fill("Synthetic Customer Renamed");
   await idle(page);
   await page.context().setOffline(true);
   await page.locator("#sideNextButton").click();
-  await waitForPopup(page);
-  const offline = await popup(page);
+  await page.locator("#excelGeneratingModal.is-open.is-ready").waitFor({ state: "visible", timeout: 30000 });
+  const offline = { dialog: (await page.locator("#excelGeneratingModal").innerText()).replace(/\s+/g, " ").trim(), popup: await popup(page) };
   await page.context().setOffline(false);
-  assert(offline.shown && offline.error && offline.inView && offline.text.startsWith("Quote could not be saved because the connection was interrupted."),
-    "Next while offline did not say why", offline);
+  assert(offline.dialog.includes("Quote could not be saved because the connection was interrupted.") && !offline.popup.shown,
+    "Next while offline did not say why once", offline);
+  await page.locator("#excelGeneratingCloseButton").click();
+  await page.locator("#excelGeneratingModal").waitFor({ state: "hidden", timeout: 10000 });
+  result.offlineNext = offline.dialog;
+
+  // 4b. Start Analysis whose request cannot reach the server says so in the popup, in view (it used to fill a banner on
+  // Quote Basis only).
+  await page.locator("#backToDashboardButton").click();
+  await page.waitForFunction(() => state.activeAppView === "dashboard" && !appIsBusy(), null, { timeout: 30000 });
+  const cutOff = (route) => (route.request().method() === "POST" ? route.abort("internetdisconnected") : route.continue());
+  await page.route("**/api/jobs", cutOff);
+  run.basisReady = async () => {};
+  await run.buildToBasis(page);
+  run.basisReady = realBasisReady;
+  await waitForPopup(page);
+  await page.unroute("**/api/jobs", cutOff);
+  await page.waitForFunction(() => !appIsBusy(), null, { timeout: 60000 });
+  const startFailed = await popup(page);
+  assert(startFailed.shown && startFailed.error && startFailed.inView && !startFailed.banner && startFailed.text.startsWith("AI analysis failed."),
+    "Start Analysis without a connection did not say so in view", startFailed);
   await page.locator("#stepMessagePopupClose").click();
-  result.offlineNext = offline.text;
+  result.offlineAnalysis = startFailed.text;
 
   // 5. A save refused for its exchange rate names the rate, not a general failure.
   await page.evaluate(() => {
@@ -122,6 +141,13 @@ try {
   assert(rate.text === "Quote could not be saved. Enter an exchange rate above 0 on the Customer step.", "a rate refusal reads as a general failure", rate);
   await page.locator("#stepMessagePopupClose").click();
   result.rateRefusal = rate.text;
+
+  // 6. Step messages belong to the steps: leaving for the Dashboard closes an open error, so it never covers the Dashboard.
+  await page.evaluate(() => renderMessages(["Synthetic step error."], "error"));
+  await page.locator("#backToDashboardButton").click();
+  await page.waitForFunction(() => state.activeAppView === "dashboard" && !appIsBusy(), null, { timeout: 30000 });
+  assert(!(await popup(page)).shown, "a step error stayed open over the Dashboard");
+  result.closesOnDashboard = true;
   run.finish(result);
 } catch (error) {
   run.fail(error);

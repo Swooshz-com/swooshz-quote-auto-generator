@@ -9895,6 +9895,8 @@ function setResultStatus(label, tone = "") {
 function renderMessages(messages = [], tone = "") {
   // The page is already leaving for sign-in; a failure here would only flash.
   if (tone === "error" && authenticationRecoveryNavigating()) return;
+  // Step messages belong to the quote's steps; the Dashboard shows its own errors.
+  if (state.activeAppView !== "quote") return;
   stepMessagePopup.show(messages, tone);
 }
 
@@ -16435,6 +16437,8 @@ function showDashboard(options = {}) {
   if (commitActiveOutputEditor() === "blocked") return false;
   if (state.activeSidePanel === "customer") resetPendingPricingReferenceSelection();
   state.activeAppView = "dashboard";
+  // Step messages belong to the quote's steps; the Dashboard shows its own errors.
+  stepMessagePopup.close();
   elements.quoteFlowPanel?.classList.remove("is-active");
   elements.quoteDashboardPanel?.classList.add("is-active");
   if (elements.backToDashboardButton) elements.backToDashboardButton.hidden = true;
@@ -19245,12 +19249,8 @@ async function advanceCustomerStep() {
       draftState,
       saveFailure,
     });
-    if (!saved || safeQuoteSessionId(saved.session_id) !== checkpoint.sessionId) {
-      if (saveFailure.failure) {
-        renderMessages([quoteSessionDraftSynchronizationFailureMessage(saveFailure.failure)], "error");
-      }
-      return false;
-    }
+    // A failed save shows once, in the step's own "Quote not saved" dialog (withQuoteStepLoading).
+    if (!saved || safeQuoteSessionId(saved.session_id) !== checkpoint.sessionId) return false;
     // An acknowledgement for old Customer inputs must not unlock their replacement.
     if (!quoteCommercialStrictDataEqual(checkpoint, customerStepCheckpointForCurrent())
       || pendingPricingReferenceSelectionChanged()) return false;
