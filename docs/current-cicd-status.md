@@ -162,12 +162,19 @@ or deployment behaviour changes accompany this test.
   misplaced, alternate or Apt-substituted converter/font bindings fail closed.
 - `Release UAT checklist controls`: runs `python scripts/check_uat_checklist_controls.py`
   (Python only, no dependencies, no other job needed first). It reads every
-  button, link, input, select, text area and editable area in
-  `webapp/static/index.html` and in the HTML templates in `webapp/static/app.js`,
-  and fails when one has no line in the Controls column of `docs/internal-uat.md`,
-  when a line names an id, data attribute or class the app no longer has, or when
-  an entry in `docs/internal-uat-controls-allowlist.json` has no reason or is no
-  longer needed. Not a required check; its tests run in `Validate app`'s unit step.
+  button, link, input, select, text area, editable area and focusable element in
+  `webapp/static/index.html` and in `webapp/static/app.js` (HTML templates,
+  `qtNode(...)` calls and `document.createElement(...)`), and fails when one has
+  no line naming it by its most specific name in the Controls column of
+  `docs/internal-uat.md`, when a line names an id, data attribute or class the
+  app no longer has or a name the check cannot read, or when
+  `docs/internal-uat-controls-allowlist.json` is out of date. Controls it cannot
+  name (made with `document.createElement`, with attributes joined from a string
+  variable, or with no id, data attribute or own class) are listed there by kind
+  with their exact count and a reason, so a new one fails. Messages and the
+  testing plan are not read. Not a required check. Its unit tests
+  (`tests.test_uat_checklist_controls`, synthetic pages only) run in
+  `Validate app`'s unit step; the repository itself is checked only here.
 - Before the readiness check, `Validate app` provisions the hosted Ubuntu
   runtime with `libreoffice-calc`, `fontconfig`, `fonts-liberation`, and
   `fonts-crosextra-carlito` using the runner's package manager.
