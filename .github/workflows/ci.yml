@@ -95,6 +95,24 @@ jobs:
       - name: Run Nixpacks Python contract tests
         run: python -m unittest tests.test_nixpacks_python_contract
 
+  uat-checklist-controls:
+    name: Release UAT checklist controls
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12.13"
+
+      - name: Check every app control has a release UAT checklist line
+        run: python scripts/check_uat_checklist_controls.py
+
   quote-basis-click-budget:
     name: Quote Basis click budget
     runs-on: ubuntu-24.04

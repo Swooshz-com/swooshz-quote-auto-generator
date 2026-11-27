@@ -1,6 +1,6 @@
 # Current CI/CD Status
 
-Last updated: 2026-11-25
+Last updated: 2026-11-27
 
 Sources of truth: `.github/workflows/ci.yml`, `.github/workflows/plain-text.yml`,
 and the two Toolkit Programme Sweep workflows
@@ -160,6 +160,14 @@ or deployment behaviour changes accompany this test.
   `[phases.setup].nixPkgs = ["...", "libreoffice", "fontconfig", "carlito",
   "liberation_ttf"]`; missing entries, wrong order, malformed arrays, duplicate,
   misplaced, alternate or Apt-substituted converter/font bindings fail closed.
+- `Release UAT checklist controls`: runs `python scripts/check_uat_checklist_controls.py`
+  (Python only, no dependencies, no other job needed first). It reads every
+  button, link, input, select, text area and editable area in
+  `webapp/static/index.html` and in the HTML templates in `webapp/static/app.js`,
+  and fails when one has no line in the Controls column of `docs/internal-uat.md`,
+  when a line names an id, data attribute or class the app no longer has, or when
+  an entry in `docs/internal-uat-controls-allowlist.json` has no reason or is no
+  longer needed. Not a required check; its tests run in `Validate app`'s unit step.
 - Before the readiness check, `Validate app` provisions the hosted Ubuntu
   runtime with `libreoffice-calc`, `fontconfig`, `fonts-liberation`, and
   `fonts-crosextra-carlito` using the runner's package manager.
