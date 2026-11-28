@@ -9922,7 +9922,8 @@ class StepMessagePopup {
     this.text = "";
     this.source = "";
     this.key = "";
-    // Errors staff closed, by source and key: the same cause stays closed until it changes or goes.
+    // Errors staff closed that name a source (a cause the app clears), by source and key: the same cause stays closed
+    // until it changes or goes. An error without a source is not remembered, so it shows again on the next failure.
     this.dismissed = new Set();
     this.timers = [];
   }
@@ -9972,7 +9973,7 @@ class StepMessagePopup {
 
   // Staff closed it (the X or Escape): an error stays closed until its cause changes.
   dismiss() {
-    if (this.tone === "error" && this.key) this.dismissed.add(this.key);
+    if (this.tone === "error" && this.source && this.key) this.dismissed.add(this.key);
     this.close();
   }
 
@@ -20056,8 +20057,9 @@ function wireEvents() {
         }
       } else if (!elements.analysisConfirmModal.hidden) {
         closeAnalysisConfirmModal();
-      } else if (stepMessagePopup.isOpen() && !event.target?.closest?.("input, textarea, select, [contenteditable='true']")) {
-        // Escape closes a step message as its X does, unless it is leaving a field being edited.
+      } else if (stepMessagePopup.isOpen() && !event.target?.closest?.("input, textarea, select, [contenteditable='true']")
+        && ![...document.querySelectorAll('[aria-modal="true"]')].some((dialog) => !dialog.hidden && dialog.getClientRects().length)) {
+        // Escape closes a step message as its X does, unless it is leaving a field being edited or a dialog is open.
         stepMessagePopup.dismiss();
       }
     }

@@ -68,6 +68,15 @@ class AnalysisFailureRuleTest(unittest.TestCase):
                 self.assertEqual(detail.get("normalization_rule"), "keyerror")
         self.assertNotIn("PRIVATE_NORMALISATION_KEY", json.dumps(records))
 
+    def test_basis_lines_without_confidence_name_their_rule(self):
+        sections = [{"id": "floors", "title": "Floors", "lines": [
+            {"id": "carpet", "tag": "Include", "text": "sqm synthetic carpet tile", "quantity": 36, "unit": "sqm"}]}]
+        with self.assertRaises(webapp.OpenAIAnalysisError) as raised:
+            webapp.require_basis_confidence(sections)
+        self.assertEqual(raised.exception.diagnostics.get("normalization_rule"), "missing_basis_confidence")
+        self.assertEqual(webapp.safe_ai_output_diagnostics(raised.exception.diagnostics).get("normalization_rule"),
+                         "missing_basis_confidence")
+
     def test_the_rule_is_a_kept_diagnostic_and_only_plain_names_pass(self):
         self.assertEqual(webapp.safe_ai_output_diagnostics({"normalization_rule": "no_usable_quote_basis"}),
                          {"normalization_rule": "no_usable_quote_basis"})

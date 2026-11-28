@@ -32685,6 +32685,8 @@ assert.strictEqual(state.basisChat.completionNotice, null);
         # Step messages left Output's body for the shared bottom-right popup (owner, #250).
         self.assertNotIn('id="messageList"', html)
         self.assertIn('id="stepMessagePopup"', html)
+        # Output's own warning list keeps its layout, hidden when empty.
+        self.assertIn(".side-workspace .assistant-output .message-list:empty", css)
         self.assertIn("width: min(100%, var(--workspace-content-width));", css)
         self.assertIn("width: auto;", css)
         self.assertIn(".output-col-description { width: 20%; }", css)

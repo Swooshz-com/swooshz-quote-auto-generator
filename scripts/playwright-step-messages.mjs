@@ -150,6 +150,16 @@ try {
     "the Excel refusal after a profile delete is not visible", refused);
   await expectErrorStaysUntilClosed(page, "Excel refusal");
   result.exportRefusal = refused.text;
+  // Closed, the refusal still shows on the next press: an error with no cause the app clears is never silenced.
+  for (const press of [2, 3]) {
+    await page.locator("#sideDownloadButton").click();
+    await page.waitForFunction(() => !document.querySelector("#stepMessagePopup").hidden, null, { timeout: 20000 }).catch(() => {});
+    await page.waitForFunction(() => !appIsBusy(), null, { timeout: 60000 });
+    const again = await popup(page);
+    check(again.shown && again.error && again.text.includes("Select a valid company profile before generating a quote."),
+      "the Excel refusal stayed silent on press " + press + " after its X", again);
+    if (again.shown) await page.locator("#stepMessagePopupClose").click();
+  }
 
   // 4. Next on Customer while offline says why once, in the step's "Quote not saved" dialog (no second popup).
   await run.openPanel(page, "customer");
@@ -162,7 +172,12 @@ try {
   await page.context().setOffline(false);
   assert(offline.dialog.includes("Quote could not be saved because the connection was interrupted.") && !offline.popup.shown,
     "Next while offline did not say why once", offline);
-  await page.locator("#excelGeneratingCloseButton").click();
+  // With that dialog open, Escape does not close a step error behind it.
+  await page.evaluate(() => renderMessages(["Synthetic error behind a dialog."], "error"));
+  await page.keyboard.press("Escape");
+  check((await popup(page)).shown, "Escape closed a step error behind the Quote not saved dialog");
+  if ((await popup(page)).shown) await page.locator("#stepMessagePopupClose").click({ force: true });
+  if (await page.locator("#excelGeneratingModal.is-open").count()) await page.locator("#excelGeneratingCloseButton").click();
   await page.locator("#excelGeneratingModal").waitFor({ state: "hidden", timeout: 10000 });
   result.offlineNext = offline.dialog;
 
