@@ -11,7 +11,7 @@
     "branch": "main",
     "path": "state/Swooshz-com/swooshz-quote-auto-generator/"
   },
-  "required_checks": [],
+  "required_checks": ["Quote Basis click budget", "plain-text"],
   "task_prs": { "auto_merge": "after-gates" },
-  "min_toolkit": "3.137.0"
+  "min_toolkit": "3.208.0"
 }
