@@ -3474,6 +3474,81 @@ h3 {
   white-space: nowrap;
 }
 
+/* One bottom-right popup for step messages (owner, #250): a warning fades by itself, an error stays until its X is
+   pressed. It sits above the step footer so it never covers Back or Next. */
+.step-message-popup {
+  position: fixed;
+  right: 24px;
+  bottom: 96px;
+  z-index: 110;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: start;
+  width: min(420px, calc(100vw - 32px));
+  padding: 14px 14px 14px 17px;
+  border: 1px solid var(--amber-border);
+  border-left: 5px solid var(--amber);
+  border-radius: var(--radius-md);
+  background: var(--amber-soft);
+  color: #7c3f00;
+  box-shadow: var(--shadow-lg);
+  transition: opacity var(--duration-slow) var(--ease-out), transform var(--duration-slow) var(--ease-out);
+}
+
+.step-message-popup.is-error {
+  border-color: var(--red-border);
+  border-left-color: var(--red);
+  background: var(--red-soft);
+  color: #7f1d1d;
+}
+
+.step-message-popup.is-fading {
+  opacity: 0;
+  transform: translateY(8px);
+}
+
+.step-message-popup-messages {
+  display: grid;
+  gap: 8px;
+  padding-top: 6px;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.step-message-popup-messages p {
+  margin: 0;
+}
+
+.step-message-popup-close svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+}
+
+.step-message-popup-close:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 2px;
+}
+
+@media (max-width: 640px) {
+  .step-message-popup {
+    right: 16px;
+    left: 16px;
+    width: auto;
+  }
+
+  .step-message-popup .step-message-popup-close {
+    width: 44px;
+    height: 44px;
+  }
+}
+
 .ai-failure-banner .ai-elapsed {
   margin-left: 10px;
 }
@@ -8214,6 +8289,11 @@ body.privacy-page {
    RESPONSIVE — 880px (mobile)
    ============================================================ */
 @media (max-width: 880px) {
+  /* Where the step footer stacks Back over Next, the step message popup sits above both. */
+  .step-message-popup {
+    bottom: 136px;
+  }
+
   :root {
     --rail-width: 100%;
     --workspace-width: 100%;

@@ -7,9 +7,11 @@ const inputText = fs.readFileSync(0, "utf8");
 const funcs = [...source.matchAll(/^(?:async )?function ([A-Za-z0-9_]+)\([^]*?^}/gm)].map((m) => m[0]);
 // Every top-level constant and counter of the page, in source order, except the state object (built below)
 // and the DOM element table (a stand-in that ignores every screen update).
-const declarations = [...source.matchAll(/^(?:const|let) ([A-Za-z0-9_]+)[^]*?(?=^(?:async function|function|const|let|boot\(\))\b)/gm)]
+const declarations = [...source.matchAll(/^(?:const|let) ([A-Za-z0-9_]+)[^]*?(?=^(?:async function|function|const|let|class|boot\(\))\b)/gm)]
   .filter((m) => m[1] !== "state" && m[1] !== "elements").map((m) => m[0]);
-const constants = declarations.join("\n");
+// Top-level classes come first: some constants are instances of them (the page's owner objects).
+const classes = [...source.matchAll(/^class [A-Za-z0-9_]+ [^]*?^}/gm)].map((m) => m[0]);
+const constants = [...classes, ...declarations].join("\n");
 // Parsed inside the VM so the drafts are plain objects of its own realm, as in the page.
 const ignored = new Proxy(function () {}, {
   get: (target, key) => (key === Symbol.toPrimitive ? () => "" : key === "length" ? 0 : ignored),

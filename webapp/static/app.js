@@ -551,7 +551,9 @@ const elements = {
   outputSourceLabel: qs("#outputSourceLabel"),
   outputTotalLines: qs("#outputTotalLines"),
   outputQuoteExchangeRate: qs("#outputQuoteExchangeRate"),
-  messageList: qs("#messageList"),
+  stepMessagePopup: qs("#stepMessagePopup"),
+  stepMessagePopupMessages: qs("#stepMessagePopupMessages"),
+  stepMessagePopupClose: qs("#stepMessagePopupClose"),
   matchSummary: qs("#matchSummary"),
   pricingMatchesBody: qs("#pricingMatchesBody"),
   pricingTableWrap: qs("#pricingTableWrap"),
@@ -1623,6 +1625,8 @@ function startAnalysisElapsedTimer(startedAt = activeJobStartedAt()) {
 }
 
 const GENERIC_FAILURE_MESSAGE = "Failed. Please try again. Contact support if this keeps happening.";
+// An analysis that found nothing quotable in the uploads (owner, #250): AGENTS.md's request for booth renders.
+const NO_QUOTE_BASIS_MESSAGE = "Please upload the booth render images first so I can analyze the design and prepare the quote. This analysis was still charged.";
 // Fixed Re texts the server may send; any other server text is never shown (#430 R2).
 const BASIS_CHAT_REPLY_UNUSABLE_CODE = "basis_chat_reply_unusable";
 const BASIS_CHAT_REPLY_UNUSABLE_MESSAGE = "The AI reply could not be used, so the line was not changed. Please say the change another way.";
@@ -1690,6 +1694,10 @@ function aiAnalysisInvalidReferenceMessage(data = {}) {
 
 // A failed analysis that hit a reference limit (such as PDF pages) says which limit; else the generic failure.
 function analysisJobFailureMessage(data = {}) {
+  if (data && typeof data === "object" && data.reason_code === "no_quote_basis") {
+    const reference = errorReferenceFrom(data);
+    return reference ? `${NO_QUOTE_BASIS_MESSAGE} Reference: ${reference}.` : NO_QUOTE_BASIS_MESSAGE;
+  }
   const limitMessage = data && typeof data === "object" && typeof data.limit_message === "string" ? data.limit_message.trim() : "";
   if (!limitMessage) return genericFailureMessage(data);
   const reference = errorReferenceFrom(data);
@@ -1725,13 +1733,18 @@ function setAiStatusBanner(tone, title, message, options = {}) {
 }
 
 function showAiRunningBanner(message = ANALYSIS_WAIT_ESTIMATE, startedAt = activeJobStartedAt()) {
+  // A new analysis replaces the last one's error.
+  renderMessages([], "", { source: "analysis" });
   setAiStatusBanner("running", "AI analysis running.", message, { elapsed: true });
   startAnalysisElapsedTimer(startedAt);
 }
 
+// A failed analysis is an error in the step message popup, not a banner in the page (owner, #250).
 function showAiFailureBanner(message = GENERIC_FAILURE_MESSAGE) {
   const detail = String(message || "").replace(/^AI analysis failed\.?\s*/i, "").trim() || GENERIC_FAILURE_MESSAGE;
-  setAiStatusBanner("failure", "AI analysis failed.", detail);
+  clearAiFailureBanner();
+  const text = detail.startsWith(NO_QUOTE_BASIS_MESSAGE) ? detail : `AI analysis failed. ${detail.replace(/^Failed\.\s*/, "")}`;
+  renderMessages([text], "error", { source: "analysis" });
 }
 
 function showAiBlockedBanner(message = "Complete the required details, then retry analysis.", title = "AI analysis blocked.") {
@@ -3121,8 +3134,14 @@ function setQuoteCommercialReview(reason = "invalid_snapshot", id = state.pricin
 }
 
 function renderQuoteCommercialReviewState() {
-  if (!quoteCommercialReviewRequired()) return false;
-  renderMessages([QUOTE_COMMERCIAL_REVIEW_MESSAGE], "error");
+  if (!quoteCommercialReviewRequired()) {
+    renderMessages([], "", { source: "commercial_review" });
+    return false;
+  }
+  const review = state.quoteCommercialReview || {};
+  renderMessages([QUOTE_COMMERCIAL_REVIEW_MESSAGE], "error", {
+    source: "commercial_review", key: JSON.stringify([review.reason_code, review.blocked_identity]),
+  });
   setResultStatus("Pricing review required", "is-warn");
   return true;
 }
@@ -9880,13 +9899,115 @@ function setResultStatus(label, tone = "") {
   if (tone) elements.resultStatus.classList.add(tone);
 }
 
-function renderMessages(messages = [], tone = "") {
+// Step messages show in the shared bottom-right popup (owner, #250): an error stays until its X is pressed, anything
+// else fades by itself. A message may name its source (a cause such as "analysis" or "commercial_review") and a key
+// for that cause's current state: an empty list for a source clears that source's message (its cause is gone).
+function renderMessages(messages = [], tone = "", options = {}) {
   // The page is already leaving for sign-in; a failure here would only flash.
   if (tone === "error" && authenticationRecoveryNavigating()) return;
-  elements.messageList.innerHTML = messages
-    .map((message) => `<div class="message ${tone}">${escapeHtml(message)}</div>`)
-    .join("");
+  // Step messages belong to the quote's steps; the Dashboard shows its own errors.
+  if (state.activeAppView !== "quote" && (messages.length || !options.source)) return;
+  stepMessagePopup.show(messages, tone, options);
 }
+
+class StepMessagePopup {
+  static FADE_AFTER_MS = 6000;
+  static FADE_OUT_MS = 300;
+
+  constructor({ popup, list, closeButton }) {
+    this.popup = popup;
+    this.list = list;
+    this.closeButton = closeButton;
+    this.tone = "";
+    this.text = "";
+    this.source = "";
+    this.key = "";
+    // Errors staff closed that name a source (a cause the app clears), by source and key: the same cause stays closed
+    // until it changes or goes. An error without a source is not remembered, so it shows again on the next failure.
+    this.dismissed = new Set();
+    this.timers = [];
+  }
+
+  bind() {
+    this.closeButton?.addEventListener("click", () => this.dismiss());
+  }
+
+  isOpen() {
+    return Boolean(this.popup && !this.popup.hidden);
+  }
+
+  show(messages = [], tone = "", { source = "", key = "" } = {}) {
+    const texts = (Array.isArray(messages) ? messages : [messages]).map((message) => String(message || "").trim()).filter(Boolean);
+    const error = tone === "error";
+    if (!texts.length) {
+      if (source) this.clear(source);
+      else if (this.tone !== "error") this.close();
+      return;
+    }
+    const text = texts.join("\n");
+    const identity = `${source}\u0000${key || text}`;
+    // A closed error does not come back for the same cause, and an open one is not written (or announced) again.
+    if (error && this.dismissed.has(identity)) return;
+    if (this.isOpen() && this.tone === (error ? "error" : "warn") && this.text === text && this.source === source) return;
+    // A newer warning never hides an error staff have not closed.
+    if (this.tone === "error" && !error) return;
+    if (!this.popup || !this.list) return;
+    this.clearTimers();
+    this.tone = error ? "error" : "warn";
+    this.text = text;
+    this.source = source;
+    this.key = identity;
+    this.list.innerHTML = texts.map((message) => `<p>${escapeHtml(message)}</p>`).join("");
+    this.popup.classList.toggle("is-error", error);
+    this.popup.classList.remove("is-fading");
+    this.popup.setAttribute("role", error ? "alert" : "status");
+    this.popup.setAttribute("aria-live", error ? "assertive" : "polite");
+    this.popup.hidden = false;
+    if (!error) {
+      this.timers.push(window.setTimeout(() => {
+        this.popup.classList.add("is-fading");
+        this.timers.push(window.setTimeout(() => this.close(), StepMessagePopup.FADE_OUT_MS));
+      }, StepMessagePopup.FADE_AFTER_MS));
+    }
+  }
+
+  // Staff closed it (the X or Escape): an error stays closed until its cause changes.
+  dismiss() {
+    if (this.tone === "error" && this.source && this.key) this.dismissed.add(this.key);
+    this.close();
+  }
+
+  // The cause is gone: its message closes, and a later message from the same source shows again.
+  clear(source) {
+    for (const identity of [...this.dismissed]) {
+      if (identity.startsWith(`${source}\u0000`)) this.dismissed.delete(identity);
+    }
+    if (this.source === source) this.close();
+  }
+
+  close() {
+    this.clearTimers();
+    this.tone = "";
+    this.text = "";
+    this.source = "";
+    this.key = "";
+    if (!this.popup) return;
+    this.popup.hidden = true;
+    this.popup.classList.remove("is-error", "is-fading");
+    if (this.list) this.list.innerHTML = "";
+  }
+
+  clearTimers() {
+    this.timers.forEach((timer) => window.clearTimeout(timer));
+    this.timers = [];
+  }
+}
+
+const stepMessagePopup = new StepMessagePopup({
+  popup: elements.stepMessagePopup,
+  list: elements.stepMessagePopupMessages,
+  closeButton: elements.stepMessagePopupClose,
+});
 
 function postCommitProjectionWarningFrom(data = {}) {
   const warning = data?.post_commit_projection;
@@ -16147,6 +16268,7 @@ function quoteSessionSaveFailureFrom(result = {}) {
     page_unloading: data.page_unloading === true,
     review_reason: review?.reason_code || "",
     draft_stale: data.status === "conflict" && data.reason_code === "quote_draft_stale",
+    exchange_rate_invalid: data.reason_code === "exchange_rate_invalid",
   };
 }
 
@@ -16158,6 +16280,8 @@ function quoteSessionDraftSynchronizationFailureMessage(failure = null) {
     message = "Quote could not be saved with a verified acknowledgement. Reopen the saved quote before trying again.";
   } else if (QUOTE_COMMERCIAL_REVIEW_REASONS.has(failure?.review_reason)) {
     message = QUOTE_COMMERCIAL_REVIEW_MESSAGE;
+  } else if (failure?.exchange_rate_invalid) {
+    message = "Quote could not be saved. Enter an exchange rate above 0 on the Customer step.";
   } else if (failure?.fetch_failed) {
     message = "Quote could not be saved because the connection was interrupted. Please try again.";
   } else if (failure?.status === 400) {
@@ -16359,6 +16483,8 @@ function showDashboard(options = {}) {
   if (commitActiveOutputEditor() === "blocked") return false;
   if (state.activeSidePanel === "customer") resetPendingPricingReferenceSelection();
   state.activeAppView = "dashboard";
+  // Step messages belong to the quote's steps; the Dashboard shows its own errors.
+  stepMessagePopup.close();
   elements.quoteFlowPanel?.classList.remove("is-active");
   elements.quoteDashboardPanel?.classList.add("is-active");
   if (elements.backToDashboardButton) elements.backToDashboardButton.hidden = true;
@@ -16410,9 +16536,8 @@ async function returnToDashboard() {
     });
     if (!saved) {
       const message = quoteSessionDraftSynchronizationFailureMessage(saveFailure.failure);
-      renderMessages([message], "error");
       syncControlStates();
-      // The message list belongs to Output; staff leave from any step.
+      // Said once, in the "Quote not saved" dialog, from whichever step staff leave.
       if (!saveFailure.failure?.page_unloading && !authenticationRecoveryNavigating()) showQuoteNotSavedModal(message);
       return;
     }
@@ -18188,7 +18313,8 @@ function syncControlStates() {
   }
   updatePresetButtons();
   updateSidePanelNav();
-  if (quoteCommercialReviewRequired()) renderQuoteCommercialReviewState();
+  // Shows the review error once while a review is required, and clears it when the review goes.
+  renderQuoteCommercialReviewState();
   saveSessionState();
 }
 
@@ -18328,8 +18454,12 @@ async function handleDraftBasis(options = {}) {
     applyDraftPricingReferenceReview(polled.data.result || polled.data);
     const errors = polled.data.errors || polled.data.result?.errors || ["Draft failed."];
     const wasBlocked = polled.data.status === "blocked";
-    setWorkflowStage(wasBlocked ? "details_review" : "ready_to_analyze");
-    if (wasBlocked) {
+    // An analysis that found nothing quotable asks for booth renders, as an error in the popup (#250).
+    const noQuoteBasis = (polled.data.result || polled.data).reason_code === "no_quote_basis";
+    // A refusal with a support reference is an analysis error (popup); one without (missing details) keeps the banner.
+    const analysisError = noQuoteBasis || Boolean(errorReferenceFrom(polled.data.result || polled.data));
+    setWorkflowStage(wasBlocked && !analysisError ? "details_review" : "ready_to_analyze");
+    if (wasBlocked && !analysisError) {
       showAiBlockedBanner(errors.join(" "));
     } else {
       showAiFailureBanner(analysisJobFailureMessage(polled.data.result || polled.data));
@@ -19167,12 +19297,8 @@ async function advanceCustomerStep() {
       draftState,
       saveFailure,
     });
-    if (!saved || safeQuoteSessionId(saved.session_id) !== checkpoint.sessionId) {
-      if (saveFailure.failure) {
-        renderMessages([quoteSessionDraftSynchronizationFailureMessage(saveFailure.failure)], "warn");
-      }
-      return false;
-    }
+    // A failed save shows once, in the step's own "Quote not saved" dialog (withQuoteStepLoading).
+    if (!saved || safeQuoteSessionId(saved.session_id) !== checkpoint.sessionId) return false;
     // An acknowledgement for old Customer inputs must not unlock their replacement.
     if (!quoteCommercialStrictDataEqual(checkpoint, customerStepCheckpointForCurrent())
       || pendingPricingReferenceSelectionChanged()) return false;
@@ -19711,6 +19837,7 @@ function handleBeforeUnload(event) {
 function wireEvents() {
   quoteTemplatesSettings.bind();
   viewOnlyQuoteGuard.bind();
+  stepMessagePopup.bind();
   if (elements.topbarLogoutLink) {
     elements.topbarLogoutLink.addEventListener("click", async (event) => {
       event.preventDefault();
@@ -19930,6 +20057,10 @@ function wireEvents() {
         }
       } else if (!elements.analysisConfirmModal.hidden) {
         closeAnalysisConfirmModal();
+      } else if (stepMessagePopup.isOpen() && !event.target?.closest?.("input, textarea, select, [contenteditable='true']")
+        && ![...document.querySelectorAll('[aria-modal="true"]')].some((dialog) => !dialog.hidden && dialog.getClientRects().length)) {
+        // Escape closes a step message as its X does, unless it is leaving a field being edited or a dialog is open.
+        stepMessagePopup.dismiss();
       }
     }
   });

@@ -4515,7 +4515,7 @@ async function run573LoadedAppOnce(runIndex) {
       setSidePanel("output", { force: true });
       await handleGenerate();
       if (!state.downloadFile || !downloadFileIsFresh(state.downloadFile)) {
-        throw new Error(`Genuine handleGenerate() did not publish a current XLSX: ${JSON.stringify({ status: state.workflowStage, file: state.downloadFile, review: state.quoteCommercialReview, missing: missingDetailFields(), messages: elements.messageList?.textContent, result: elements.resultStatus?.textContent, rows: state.outputRows })}.`);
+        throw new Error(`Genuine handleGenerate() did not publish a current XLSX: ${JSON.stringify({ status: state.workflowStage, file: state.downloadFile, review: state.quoteCommercialReview, missing: missingDetailFields(), messages: elements.stepMessagePopupMessages?.textContent, result: elements.resultStatus?.textContent, rows: state.outputRows })}.`);
       }
       const sessionId = state.quoteSessionId;
       const sessionResponse = await fetch(`/api/quote-sessions/${encodeURIComponent(sessionId)}`);

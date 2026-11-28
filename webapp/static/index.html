@@ -812,7 +812,6 @@
                       </span>
                     </div>
                   </div>
-                  <div class="message-list" id="messageList"></div>
                   <div class="side-empty-state" id="pricingEmptyState">
                     <strong>No output rows yet</strong>
                     <p>Confirm the quotation basis to review pricing rows before Excel download.</p>
@@ -1441,6 +1440,12 @@
         </section>
       </div>
     </div>
+    <section class="step-message-popup" id="stepMessagePopup" aria-live="polite" aria-atomic="true" hidden>
+      <div class="step-message-popup-messages" id="stepMessagePopupMessages"></div>
+      <button class="icon-button step-message-popup-close" type="button" id="stepMessagePopupClose" aria-label="Close message">
+        <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"></path></svg>
+      </button>
+    </section>
     <script src="/static/app.js?v=79"></script>
   </body>
 </html>

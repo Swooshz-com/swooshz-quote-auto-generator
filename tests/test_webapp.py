@@ -29032,6 +29032,8 @@ const showQuoteNotSavedModal = message => notSavedDialogs.push(message);
 const clearDashboardOperation = () => { state.dashboardOperation = null; };
 const renderQuoteDashboard = () => {};
 const scrollDashboardSessionIntoView = () => {};
+// The step message popup is a screen effect (its own browser test covers it).
+const stepMessagePopup = { show() {}, close() {} };
 const required = ["isPlainObject", "objectHasExactKeys", "safeQuoteSessionId", "quoteCommercialReviewIdentity",
   "normalizeQuoteCommercialReview", "quoteCommercialReviewRequired", "serverQuoteCommercialReviewFromResponse",
   "adoptServerQuoteCommercialReview", "errorReferenceFrom", "genericFailureMessage", "genericFailureMessages",
@@ -29219,7 +29221,8 @@ async function act() {
     await settle(listeners.get("click")()); await tick();
     assert.strictEqual(state.activeAppView, "quote", "Failed save navigated to dashboard");
     assert.strictEqual(calls.filter(c => c.method === "GET" && c.url === "/api/quote-sessions").length, 0, "Failed save started list chain");
-    assert(messages.join(" ").includes("Quote could not be saved"), "Persistence failure hidden");
+    // Said once, in the "Quote not saved" dialog (the popup no longer repeats it).
+    assert(notSavedDialogs.join(" ").includes("Quote could not be saved"), "Persistence failure hidden");
     assert(state.quoteSessionLoadError.includes("ERR-")); assert.strictEqual(state.quoteSessionDashboardBusy, false);
     assert.deepStrictEqual(currentQuoteSessionDraftState(), before); assert.deepStrictEqual(sessionFileRecordsFromDraft(), files);
     assert(!quoteSessionDraftIsConfirmed(state.quoteSessionId, quoteSessionDraftComparisonKey(), quoteSessionDraftFileComparisonKey()));
@@ -32679,6 +32682,10 @@ assert.strictEqual(state.basisChat.completionNotice, null);
         self.assertNotIn(".output-page-header {", css)
         self.assertIn(".output-status-pill.is-ok", css)
         self.assertIn(".quote-basis-title-row .output-status-pill", css)
+        # Step messages left Output's body for the shared bottom-right popup (owner, #250).
+        self.assertNotIn('id="messageList"', html)
+        self.assertIn('id="stepMessagePopup"', html)
+        # Output's own warning list keeps its layout, hidden when empty.
         self.assertIn(".side-workspace .assistant-output .message-list:empty", css)
         self.assertIn("width: min(100%, var(--workspace-content-width));", css)
         self.assertIn("width: auto;", css)

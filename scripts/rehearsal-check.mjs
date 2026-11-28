@@ -688,7 +688,7 @@ async function dashboardBlockReason(run, before) {
   const saves = run.trace.saves.filter((item) => item.sequence > before).map((item) => item.status);
   const app = await run.page.evaluate(() => ({
     busy: appBusyTitle(), view: state.activeAppView,
-    errors: document.querySelectorAll("#messageList .message.error").length,
+    errors: document.querySelectorAll("#stepMessagePopup.is-error:not([hidden]) #stepMessagePopupMessages p").length,
   })).catch(() => ({}));
   return `Saves since the click: ${saves.join(", ") || "none"}. App busy: ${app.busy || "no"}; view: ${app.view || "unknown"}; error messages: ${app.errors ?? "unknown"}. Refused requests: ${run.trace.refused.join("; ") || "none"}.`;
 }
