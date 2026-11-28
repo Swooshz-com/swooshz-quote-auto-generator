@@ -12,6 +12,7 @@ import math
 from pathlib import Path
 import struct
 import time
+import tracemalloc
 import unittest
 from unittest import mock
 import zipfile
@@ -90,6 +91,14 @@ def booth_glb_document(up="y"):
     return doc
 
 
+def plan_document(up, boxes):
+    """A model of named parts, each a plan box (width, depth, height) low..high, in the model's own axes."""
+    doc = {"asset": {"version": "2.0"}, "scenes": [{"nodes": list(range(len(boxes)))}], "nodes": []}
+    for name, low, high in boxes:
+        doc["nodes"].append({"name": name, "mesh": plan_box(doc, up, low, high)})
+    return doc
+
+
 def spec_json():
     return {"booth": {"width": 6, "depth": 6, "height_limit": 4.0, "open_sides": ["front"]},
             "components": [
@@ -151,8 +160,10 @@ class UpAxisTest(unittest.TestCase):
         platform, wall = part(evidence, "platform"), part(evidence, "wall")
         self.assertEqual((platform.width, platform.depth, platform.height), (6, 6, 0.1))
         self.assertEqual((wall.width, wall.height), (6, 3))
-        self.assertEqual([n for n in evidence.notes if "measures differently" in n],
-                         [f"Part {counter_id} (counter) measures differently in the 3D model; the parts list was used."])
+        # The counter is turned 90 degrees in the model; a footprint compares either way round, so it agrees.
+        self.assertEqual([n for n in evidence.notes if "measures differently" in n], [])
+        self.assertEqual((part(evidence, "counter").width, part(evidence, "counter").depth), (2, 0.6))
+        self.assertEqual(part(evidence, "counter").id, counter_id)
         self.assertNotIn("The booth size in the 3D model differs from the parts list; the parts list was used.",
                          evidence.notes)
 
@@ -191,6 +202,274 @@ class UpAxisTest(unittest.TestCase):
         reply = {"project": {"booth_width": 6, "booth_depth": 6}, "quote_basis_sections": [{"lines": [
             {"id": "floor", "quantity": 0.6, "unit": "sqm", "model_part_ids": ["P1"]}]}]}
         self.assertFalse([n for n in intake.check_basis(reply, evidence) if "quantity" in n or "booth size" in n])
+
+
+class FollowUpTest(unittest.TestCase):
+    """PR 456 round 2 review: Mediums N1 to N6 and Lows 4 to 8 (#447 M1 follow-up)."""
+
+    def n1_package(self):
+        # Parts list: a 6 m x 3 m booth. The Z-up model's counter overhangs 0.4 m into the aisle, so the true axis
+        # misses the footprint while the wrong one (its 3 m height read as depth) fits it.
+        spec = {"booth": {"width": 6, "depth": 3}, "components": [
+            {"type": "platform", "height": 0.1}, {"type": "wall", "x0": 0, "x1": 6, "y": 2.9, "height": 3},
+            {"type": "counter", "x": 3, "y": 0, "width": 2, "depth": 1, "height": 1.05}]}
+        model = plan_document("z", [("comp__0__platform", (0, 0, 0), (6, 3, 0.1)),
+                                    ("comp__1__wall", (0, 2.9, 0), (6, 3, 3)),
+                                    ("comp__2__counter", (2, -0.4, 0), (4, 0.6, 1.05))])
+        return package({"spec.json": json.dumps(spec).encode(), "booth.glb": glb(model)})
+
+    def test_n1_a_footprint_that_fits_the_wrong_way_up_is_not_trusted_or_used(self):
+        evidence = intake.read_design(self.n1_package())
+        platform, wall = part(evidence, "platform"), part(evidence, "wall")
+        self.assertEqual((platform.width, platform.depth, platform.source), (None, None, "parts list"))
+        self.assertEqual(wall.depth, None)
+        self.assertIn("The 3D model's parts do not match the parts list, so its sizes were not used.", evidence.notes)
+        reply = {"project": {"booth_width": 6, "booth_depth": 3}, "quote_basis_sections": [{"lines": [
+            {"id": "floor", "quantity": 18, "unit": "sqm", "model_part_ids": ["P1"]}]}]}
+        self.assertFalse([n for n in intake.check_basis(reply, evidence) if n.startswith("Line floor")])
+
+    def test_n4_a_model_part_of_another_type_fills_nothing(self):
+        model = booth_glb_document("z")
+        model["nodes"][1]["name"], model["nodes"][2]["name"] = "comp__1__platform", "comp__0__wall"
+        evidence = intake.read_design(full_package(**{"design/booth.glb": glb(model)}))
+        platform = part(evidence, "platform")
+        self.assertEqual((platform.width, platform.depth, platform.source), (None, None, "parts list"))
+        self.assertIn("Part obj_platform_01 (platform) measures differently in the 3D model; the parts list was used.",
+                      evidence.notes)
+
+    def test_n2_estimated_note_only_when_the_measure_is_confirmed_or_a_count(self):
+        evidence = intake.read_design(glb(booth_glb_document("z")))
+
+        def notes(unit):
+            reply = {"project": {}, "quote_basis_sections": [{"lines": [
+                {"id": "line", "quantity": 1, "unit": unit, "quantity_estimated": True, "model_part_ids": ["P1"]}]}]}
+            return [n for n in intake.check_basis(reply, evidence) if "marked estimated" in n]
+
+        self.assertEqual(notes("sqm"), [])
+        self.assertEqual(notes("nos"), ["Line line uses measured design model parts but is marked estimated."])
+
+    def test_n6_json_cost_is_bounded_before_parsing(self):
+        tracemalloc.start()
+        try:
+            for data in (package({"spec.json": b"[" + b"[]," * (700 * 1024) + b"[]]"}),
+                         glb(b'{"asset": {"version": "2.0"}, "x": [' + b"[]," * (1300 * 1024) + b"[]]}"),
+                         package({"spec.json": b"{" * 5000 + b"}" * 5000})):
+                started = time.perf_counter()
+                with self.assertRaises(intake.IntakeRefused) as caught:
+                    intake.read_design(data)
+                self.assertLess(time.perf_counter() - started, 1.0)
+                self.assertIn(caught.exception.code, {"package_too_large", "model_too_large", "package_unreadable"})
+            # The largest record this reader accepts stays cheap: at the size cap, with the most containers allowed.
+            record = {"booth": {"width": 6, "depth": 6}, "components": [],
+                      "extra": [[] for _ in range(intake.LIMITS["record_json_containers"] - 4)], "note": ""}
+            room = intake.LIMITS["record_json_bytes"] - len(json.dumps(record, separators=(",", ":")).encode())
+            record["note"] = "x" * room
+            largest = json.dumps(record, separators=(",", ":")).encode()
+            self.assertLessEqual(len(largest), intake.LIMITS["record_json_bytes"])
+            tracemalloc.reset_peak()
+            started = time.perf_counter()
+            intake.read_design(package({"spec.json": largest}))
+            self.assertLess(time.perf_counter() - started, 1.0)
+            self.assertLess(tracemalloc.get_traced_memory()[1], 64 * 1024 * 1024)
+        finally:
+            tracemalloc.stop()
+
+    def test_l4_a_false_member_count_is_caught_by_the_directory_size(self):
+        data = bytearray(package({f"{i}.txt": b"" for i in range(100)}))
+        position = data.rfind(b"PK\x05\x06")
+        struct.pack_into("<HH", data, position + 8, 1, 1)
+        with mock.patch.dict(intake.LIMITS, {"package_members": 3}), \
+                mock.patch.object(intake.zipfile, "ZipFile", side_effect=AssertionError("parsed")):
+            refused(self, bytes(data), "package_too_large")
+
+    def test_l5_notes_say_why_a_model_was_not_used(self):
+        tall = plan_document("z", [("comp__0__platform", (0, 0, 0), (6, 6, 0.1)),
+                                   ("comp__1__hanging_sign", (2, 2, 0), (4, 4, 6))])
+        spec = json.dumps({"booth": {"width": 6, "depth": 6}, "components": []}).encode()
+        both = intake.read_design(package({"spec.json": spec, "booth.glb": glb(tall)}))
+        self.assertIn("The 3D model's size matches the parts list either way up, so its sizes were not used.",
+                      both.notes)
+        empty = intake.read_design(package({"spec.json": spec, "booth.glb": glb({"asset": {"version": "2.0"}})}))
+        self.assertIn("The 3D model has no measurable shapes.", empty.notes)
+
+    def test_l6_a_model_in_the_wrong_unit_is_dropped_and_the_package_kept(self):
+        millimetres = plan_document("z", [("comp__0__platform", (0, 0, 0), (12000, 6000, 100))])
+        evidence = intake.read_design(full_package(**{"design/booth.glb": glb(millimetres)}))
+        self.assertEqual(evidence.booth.width, 6)
+        self.assertIn("The 3D model's sizes are too large to be a booth in metres, so it was not used.",
+                      evidence.notes)
+        refused(self, glb(millimetres), "model_scale")
+        error = refused(self, package({"a/hero.png": png(shade=1), "b/hero.png": png(shade=2)}),
+                        "package_duplicate_pictures")
+        self.assertEqual(error.message, "The design package has two pictures with the same file name.")
+
+    def test_l7_a_thin_part_is_measured_by_its_large_face(self):
+        evidence = intake.read_design(full_package())
+
+        def notes(quantity, ids):
+            reply = {"project": {"booth_width": 6, "booth_depth": 6}, "quote_basis_sections": [{"lines": [
+                {"id": "line", "quantity": quantity, "unit": "sqm", "model_part_ids": list(ids)}]}]}
+            return [n for n in intake.check_basis(reply, evidence) if n.startswith("Line line quantity")]
+
+        self.assertEqual(notes(36, ["obj_platform_01"]), [])
+        self.assertTrue(notes(0.6, ["obj_platform_01"]))
+        self.assertEqual(notes(18, ["obj_wall_01"]), [])
+        self.assertTrue(notes(0.3, ["obj_wall_01"]))
+
+    def test_l8_unconfirmed_sizes_are_not_sent_to_the_ai(self):
+        facts = intake.prompt_facts({intake.EVIDENCE_KEY: intake.read_design(glb(booth_glb_document("z")))})
+        self.assertFalse(facts["sizes_trusted"])
+        self.assertEqual((facts["booth"]["width"], facts["booth"]["depth"], facts["booth"]["height"]), (None, None, None))
+        self.assertTrue(all(p["width"] is None and p["depth"] is None and p["height"] is None for p in facts["parts"]))
+        self.assertEqual([p["type"] for p in facts["parts"]], ["platform", "wall", "counter", "product_plinth"])
+        trusted = intake.prompt_facts({intake.EVIDENCE_KEY: intake.read_design(full_package())})
+        self.assertEqual(trusted["booth"]["width"], 6)
+
+
+def fill(prefix, item, suffix, cap):
+    """prefix + item,item,...,item + suffix, as long as fits within cap bytes (the PR 458 review's builder)."""
+    count = (cap - len(prefix) - len(suffix) + 1) // (len(item) + 1)
+    return prefix + b",".join([item] * count) + suffix
+
+
+def raw_glb(text):
+    text += b" " * (-len(text) % 4)
+    body = struct.pack("<I", len(text)) + b"JSON" + text
+    return b"glTF" + struct.pack("<II", 2, 12 + len(body)) + body
+
+
+def capped_nodes_model(extra_roots=0):
+    """The node and primitive caps reached from a tiny upload: every node draws one 5-primitive mesh, turned."""
+    nodes = intake.LIMITS["nodes"]
+    head = {"asset": {"version": "2.0"},
+            "accessors": [{"componentType": FLOAT, "type": "VEC3", "count": 8, "min": [0, 0, 0], "max": [1, 1, 1]}],
+            "meshes": [{"primitives": [{"attributes": {"POSITION": 0}}] * 5}],
+            "nodes": [{"mesh": 0, "rotation": [0, 0.3826834, 0, 0.9238795]} for _ in range(nodes)]}
+    prefix = json.dumps(head, separators=(",", ":")).encode()[:-1] + b',"scenes":[{"nodes":['
+    prefix += b",".join(b"%d" % i for i in range(nodes))
+    if not extra_roots:
+        return raw_glb(prefix + b"]}]}")
+    return raw_glb(fill(prefix + b",", b"0", b"]}]}", intake.LIMITS["json_bytes"] - 4))
+
+
+class ReviewRoundOneTest(unittest.TestCase):
+    """PR 458 round 1 review (store 670ba62): the reviewer's probes A1, A2, E2, the N1 floor line, the package at
+    every cap, Z1 and the no-booth-size note."""
+
+    def a_package(self, components, model_parts):
+        spec = {"booth": {"width": 6, "depth": 3}, "components": components}
+        model = plan_document("z", [(f"comp__{i}__{kind}", low, high) for i, (kind, low, high) in enumerate(model_parts)])
+        return intake.read_design(package({"spec.json": json.dumps(spec).encode(), "booth.glb": glb(model)}))
+
+    def assert_model_unused(self, evidence):
+        wall = part(evidence, "wall")
+        self.assertNotEqual((wall.depth, wall.height), (3, 0.1), "wrong-axis sizes filled and marked trusted")
+        self.assertEqual(wall.source, "parts list")
+        self.assertIn("The 3D model's parts read the same either way up, so its sizes were not used.", evidence.notes)
+
+    def test_a1_plan_widths_only_give_no_margin(self):
+        self.assert_model_unused(self.a_package(
+            [{"type": "wall", "x0": 0, "x1": 6, "y": 2.9}, {"type": "counter", "x0": 2, "x1": 4}],
+            [("wall", (0, 2.9, 0), (6, 3, 3)), ("counter", (2, -0.4, 0), (4, 0.6, 1.05))]))
+
+    def test_a2_a_part_whose_depth_equals_its_height_gives_no_margin(self):
+        self.assert_model_unused(self.a_package(
+            [{"type": "wall", "x0": 0, "x1": 6}, {"type": "product_plinth", "width": 0.5, "depth": 0.5, "height": 0.5}],
+            [("wall", (0, 2.9, 0), (6, 3, 3)), ("product_plinth", (2, -0.4, 0), (2.5, 0.1, 0.5))]))
+
+    def estimated(self, evidence, part_id, quantity, unit):
+        reply = {"project": {"booth_width": 6, "booth_depth": 6}, "quote_basis_sections": [{"lines": [
+            {"id": "line", "quantity": quantity, "unit": unit, "quantity_estimated": True,
+             "model_part_ids": [part_id]}]}]}
+        return [n for n in intake.check_basis(reply, evidence) if "marked estimated" in n]
+
+    def test_e2_no_estimated_note_where_nothing_measures_the_line(self):
+        spec = {"booth": {"width": 6, "depth": 6}, "components": [
+            {"type": "platform", "height": 0.1}, {"type": "counter", "label": "Reception counter"}]}
+        evidence = intake.read_design(package({"spec.json": json.dumps(spec).encode()}))
+        self.assertTrue(evidence.sizes_trusted)
+        for quantity, unit in ((2.4, "lm"), (1.5, "sqm"), (1, "lot")):
+            with self.subTest(unit=unit):
+                self.assertEqual(self.estimated(evidence, "P2", quantity, unit), [])
+        self.assertTrue(self.estimated(evidence, "P2", 1, "nos"))
+
+    def test_n1_floor_line_on_a_part_the_model_did_not_size(self):
+        spec = {"booth": {"width": 6, "depth": 3}, "components": [
+            {"type": "platform", "height": 0.1}, {"type": "wall", "x0": 0, "x1": 6, "y": 2.9, "height": 3},
+            {"type": "counter", "x": 3, "y": 0, "width": 2, "depth": 1, "height": 1.05}]}
+        model = plan_document("z", [("comp__0__platform", (0, 0, 0), (6, 3, 0.1)),
+                                    ("comp__1__wall", (0, 2.9, 0), (6, 3, 3)),
+                                    ("comp__2__counter", (2, -0.4, 0), (4, 0.6, 1.05))])
+        evidence = intake.read_design(package({"spec.json": json.dumps(spec).encode(), "booth.glb": glb(model)}))
+        self.assertIn("The 3D model's parts do not match the parts list, so its sizes were not used.", evidence.notes)
+        self.assertEqual(self.estimated(evidence, "P1", 18, "sqm"), [])
+
+    @staticmethod
+    def read(data):
+        try:
+            return intake.read_design(data)
+        except intake.IntakeRefused as error:
+            return error.code
+
+    def timed(self, data):
+        """Time without tracing (tracemalloc slows Python code several times over), then trace memory."""
+        started = time.perf_counter()
+        outcome = self.read(data)
+        elapsed = time.perf_counter() - started
+        tracemalloc.start()
+        try:
+            self.read(data)
+            return outcome, elapsed, tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    def test_package_at_every_cap_stays_within_the_stated_bound(self):
+        # Stated bound: any upload within the caps is read or refused in under 2 s and 128 MiB traced
+        # (under 1 s on the review machine). The review's worst package took 6.25 s and about 194 MiB.
+        record = intake.LIMITS["record_json_bytes"]
+        scene = fill(b'{"schema":"swooshz.scene/1.0","units":{"length":"m","up":"+Z"},"booth":{"width":6,"depth":6},'
+                     b'"objects":[{"type":"wall","heights":[', b"1", b"]}]}", record)
+        spec = fill(b'{"booth":{"width":6,"depth":6},"components":[],"x":[', b"0", b"]}", record)
+        cases = {
+            "review worst package": package({"scene.json": scene, "spec.json": spec,
+                                             "booth.glb": capped_nodes_model(extra_roots=True)}),
+            "nodes at the cap": package({"spec.json": b'{"booth":{"width":6,"depth":6},"components":[]}',
+                                         "booth.glb": capped_nodes_model()}),
+            "heights filling a record": package({"spec.json": fill(
+                b'{"booth":{"width":6,"depth":6},"components":[{"type":"wall","heights":[', b"1", b"]}]}", record)}),
+            "scalars filling the model JSON": raw_glb(fill(b'{"asset":{"version":"2.0"},"extras":[', b"0", b"]}",
+                                                           intake.LIMITS["json_bytes"] - 4)),
+            "root list filling the model JSON": raw_glb(fill(b'{"asset":{"version":"2.0"},"nodes":[{}],"scenes":[{"nodes":[',
+                                                             b"0", b"]}]}", intake.LIMITS["json_bytes"] - 4)),
+            "keys filling the model JSON": raw_glb(b'{"asset":{"version":"2.0"},"extras":{' + b",".join(
+                b'"%x":0' % n for n in range(400_000)) + b"}}"),
+        }
+        for label, data in cases.items():
+            with self.subTest(case=label):
+                self.assertLess(len(data), 5 * 1024 * 1024)
+                outcome, elapsed, peak = self.timed(data)
+                self.assertLess(elapsed, 2.0, outcome)
+                self.assertLess(peak, 128 * 1024 * 1024, outcome)
+
+    def test_z1_a_zip64_record_cannot_hide_the_directory_size(self):
+        entries = 5_000
+        local = b"PK\x03\x04" + struct.pack("<HHHHHIIIHH", 20, 0, 0, 0, 0, 0, 0, 0, 1, 0) + b"a"
+        names = [f"{i:x}".encode() for i in range(entries)]
+        directory = b"".join(b"PK\x01\x02" + struct.pack("<HHHHHHIIIHHHHHII", 20, 20, 0, 0, 0, 0, 0, 0, 0,
+                                                           len(name), 0, 0, 0, 0, 0, 0) + name for name in names)
+        zip64_at = len(local) + len(directory)
+        zip64 = b"PK\x06\x06" + struct.pack("<QHHIIQQQQ", 44, 45, 45, 0, 0, entries, entries, len(directory),
+                                               len(local))
+        locator = b"PK\x06\x07" + struct.pack("<IQI", 0, zip64_at, 1)
+        end = b"PK\x05\x06" + struct.pack("<HHHHIIH", 0, 0, 1, 1, 100, len(local), 0)
+        with mock.patch.object(intake.zipfile, "ZipFile", side_effect=AssertionError("parsed")):
+            refused(self, local + directory + zip64 + locator + end, "package_too_large")
+
+    def test_a_parts_list_without_a_booth_size_says_so(self):
+        spec = json.dumps({"components": [{"type": "wall", "x0": 0, "x1": 6, "height": 3}]}).encode()
+        evidence = intake.read_design(package({"spec.json": spec, "booth.glb": glb(booth_glb_document("z"))}))
+        self.assertIn("The parts list gives no booth size to check the 3D model against, so its sizes were not used.",
+                      evidence.notes)
 
 
 class GlbReaderTest(unittest.TestCase):
@@ -325,13 +604,16 @@ class HostileGlbTest(unittest.TestCase):
         cases = {
             "huge bound": with_change(lambda d: d["accessors"][1].update(max=[6, 3, "HUGE"])),
             "huge translation": with_change(lambda d: d["nodes"][2].update(translation=[0, "HUGE", 0])),
-            "overflowing scale": with_change(lambda d: d["nodes"][4].update(scale=[1e300, 1e300, 1e300])),
             "overflowing bounds": with_change(lambda d: d["accessors"][0].update(min=[-1e308, 0, -1e308],
                                                                                  max=[1e308, 0.1, 1e308])),
         }
         for label, data in cases.items():
             with self.subTest(case=label):
                 refused(self, data, "model_unreadable")
+        # Finite but far beyond a booth: not a booth in metres.
+        scaled = booth_glb_document()
+        scaled["nodes"][4]["scale"] = [1e300, 1e300, 1e300]
+        refused(self, glb(scaled), "model_scale")
 
     def test_chunk_count_is_bounded(self):
         data = bytearray(glb(booth_glb_document()))
@@ -369,9 +651,8 @@ class PackageReaderTest(unittest.TestCase):
                          (6, 6, 0.1, "parts list + 3D model"))
         self.assertEqual([view.name for view in evidence.views], ["hero.png", "top.png"])
         self.assertTrue(all(view.mime == "image/png" for view in evidence.views))
-        # The counter is 2 m wide in the parts list but drawn 0.6 m wide (rotated) in the model.
-        self.assertIn("Part obj_counter_01 (counter) measures differently in the 3D model; the parts list was used.",
-                      evidence.notes)
+        # The counter is 2 m wide in the parts list and drawn turned (0.6 m wide) in the model: the same footprint.
+        self.assertFalse([n for n in evidence.notes if "measures differently" in n])
 
     def test_any_subset_works(self):
         renders = {"a.png": png(shade=1), "b.jpg": b"\xff\xd8\xff\xe0" + b"\x00" * 64}
@@ -460,7 +741,7 @@ class HostilePackageTest(unittest.TestCase):
             "missing height in heights": (package({"spec.json": json.dumps({"booth": {"width": 6, "depth": 6},
                 "components": [{"type": "curved_wall", "heights": [None, 2.5]}]}).encode()}), "package_unreadable"),
             "two pictures with one name": (package({"a/hero.png": png(shade=1), "b/hero.png": png(shade=2)}),
-                                           "package_ambiguous"),
+                                           "package_duplicate_pictures"),
             "negative size": (package({"spec.json": json.dumps(
                 {"booth": {"width": 6, "depth": 6}, "components": [{"type": "wall", "width": -1}]}).encode()}),
                 "package_unreadable"),
