@@ -1,0 +1,47 @@
+# AI-AGENT-TOOLKIT:secure-ci-cd:WORKFLOW personal-data-guard sha256=802e35311876
+name: Personal data guard
+
+# Fails when a pull request or a push adds an email address, a phone number or a WhatsApp number
+# link: in file content, file names, commit and tag messages, branch names, or the pull request
+# title and body. The pull request title and body are also checked for real home-folder paths and
+# AI attribution, and the check runs again when they are edited. Every commit is checked, not only
+# the last one. The output names the place and
+# class only, never the value. Local hooks can be skipped with --no-verify; this check cannot.
+#
+# The pull request title and body are read from the event file by the guard, never written into
+# this script. Any error that stops a complete scan fails the job.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+  push:
+    branches: ['**']
+    tags: ['**']
+
+permissions:
+  contents: read
+
+# A newer run for the same pull request cancels the older one; every push keeps its own run,
+# because each push run checks only the commits that push added.
+concurrency:
+  group: personal-data-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  personal-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Check for personal data
+        run: node .github/scripts/personal-data-guard.cjs ci
